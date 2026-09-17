@@ -42,10 +42,6 @@ Complete API documentation for `multiloop`: a multi-event-loop engine and concur
   - [`AsyncWaitGroup`](#asyncwaitgroup)
   - [`AsyncOnce`](#asynconce)
   - [`AsyncRWMutex`](#asyncrwmutex)
-- [Networking & ASGI Workers](#networking--asgi-workers)
-  - [`ConnectionPinningServer`](#connectionpinningserver)
-  - [`MultiloopASGIWorker`](#multiloopasgiworker)
-  - [`MultiloopWSGIWorker`](#multiloopwsgiworker)
 - [Exceptions](#exceptions)
   - [`MultiloopError`](#multilooperror)
   - [`ChannelClosedError`](#channelclosederror)
@@ -361,6 +357,13 @@ Submits a coroutine function, coroutine object, or callable to the shared work q
 - **`cancel_scope`**: Optionally binds the task to a `CancelScope`; cancelled scopes suppress the task result.
 - **Raises**: `ThreadPoolClosedError` if the pool is closed, `ValueError` for an invalid `pin_to` index, `TypeError` if `target` is an `asyncio.Future` (raw futures are loop-bound) or if arguments are passed to a coroutine object.
 
+##### `submit_many(targets: Iterable[Callable[..., Any] | Any], cancel_scope: CancelScope | None = None)` -> `list[asyncio.Future]`
+Submits a batch of tasks to the shared global work queue in a single scheduling cycle, maximizing throughput across worker threads. Returns a list of `asyncio.Future` instances corresponding to each submitted task.
+
+- **`targets`**: An iterable of coroutine objects, coroutine functions, or callables.
+- **`cancel_scope`**: Optional `CancelScope` shared across the batch.
+- **Raises**: `ThreadPoolClosedError` if the pool is closed.
+
 ##### `get_metrics()` -> `dict[str, Any]`
 Returns a JSON-serializable dictionary containing health metrics:
 ```json
@@ -574,11 +577,40 @@ Returns the number of items currently buffered in the channel.
 ##### `close()` -> `None`
 Closes the channel. All pending senders/receivers are woken up with `ChannelClosedError`.
 
-##### `is_closed` -> `bool`
-Returns `True` if closed.
+##### `split()` -> `tuple[SendChannel, ReceiveChannel]`
+Splits this channel into a `(SendChannel, ReceiveChannel)` pair for interface segregation.
 
 ##### `__aiter__()` & `__anext__()`
 Supports `async for item in ch:` iteration. Automatically terminates when the channel is closed and empty.
+
+---
+
+### `SendChannel`
+
+A send-only view of a `Channel` for interface segregation (Go `chan<- T` style).
+
+- **`send(item)`**: Sends an item into the channel.
+- **`send_sync(item, timeout=None)`**: Synchronous blocking send.
+- **`try_send(item)` -> `bool`**: Non-blocking send.
+- **`close()`**: Closes the underlying channel.
+- **`is_closed`** -> `bool`: True if closed.
+- **`maxsize`** -> `int`: Maximum capacity.
+- **`full()`** -> `bool`: True if buffer is full.
+
+---
+
+### `ReceiveChannel`
+
+A receive-only view of a `Channel` for interface segregation (Go `<-chan T` style).
+
+- **`recv(timeout=None)`**: Receives an item from the channel.
+- **`recv_sync(timeout=None)`**: Synchronous blocking receive from a worker thread.
+- **`try_recv()`**: Non-blocking receive.
+- **`close()`**: Closes the underlying channel.
+- **`is_closed`** -> `bool`: True if closed.
+- **`empty()`** -> `bool`: True if empty.
+- **`qsize()`** -> `int`: Number of buffered items.
+- **`__aiter__()` & `__anext__()`**: Async iteration support.
 
 ---
 
@@ -614,15 +646,22 @@ selected_ch, val = await select_channel(ch1, ch2, timeout=2.0)
 
 ### `TaskGroup`
 
-An async context manager that spawns and manages child tasks, backed by `CancelScope` for cancellation propagation. Inspired by trio's nursery and anyio's `TaskGroup`.
+An async context manager that spawns and manages child tasks, backed by `CancelScope` for cancellation propagation. Inspired by trio's nursery and anyio's `TaskGroup`. Supports optional structured concurrency throttling via `max_concurrency` or a shared `CapacityLimiter`.
 
 ```python
-async with TaskGroup(name=None) as tg:
-    h1 = tg.start_soon(worker, "a")
-    h2 = tg.start_soon(worker, "b")
-# Both tasks are guaranteed finished here.
+async with TaskGroup(max_concurrency=10) as tg:
+    for url in urls:
+        tg.start_soon(fetch_url, url)
+# All child tasks are guaranteed finished here, with at most 10 running concurrently.
 ```
 
+#### Constructor
+- **`name`** (*str | None*): Optional group identifier.
+- **`max_concurrency`** (*int | None*): Optional maximum concurrent active child tasks. Automatically creates an internal `CapacityLimiter(max_concurrency)`.
+- **`limiter`** (*CapacityLimiter | None*): Optional external `CapacityLimiter` to share concurrency budgets across task groups.
+- **`pool`** (*EventLoopThreadPool | None*): Optional thread pool to schedule child tasks across worker event loops while retaining structured concurrency guarantees (cascading cancellation, barrier drain on exit, and exception group aggregation).
+
+#### Methods
 - **`start_soon(coro_fn, *args)` -> `TaskHandle`**: Spawns a child task and returns its handle immediately without blocking. Children spawned before the group is entered are tracked by the first entry.
   - **Raises**: `RuntimeError` if called after the group has exited or called from a foreign event loop/thread (TaskGroup is physically scoped to a single loop); the orphan is cancelled and its exception consumed.
 - **`start(coro_fn, *args)` -> `TaskHandle`**: Spawns a child task, blocking until it calls `task_status.started()`.
@@ -710,6 +749,7 @@ async with lock:
 
 > **Diagnostic properties** (`locked`/`owner`/`Semaphore.value`/`qsize`/`Event.is_set`/`TaskHandle.status`) are consistent snapshots taken under the relevant internal lock — they are **not** atomic across each other and not a substitute for the actual acquire/wait operations under concurrency.
 - **`acquire()`**: Acquires the lock, suspending until it is free.
+- **`try_acquire()` -> `bool`**: Non-blocking atomic attempt to acquire the lock immediately. Returns `True` if acquired, `False` otherwise.
 - **`release()`**: Releases the lock. Must be called by the owner.
 
 ### `Semaphore`
@@ -723,6 +763,7 @@ Semaphore(max_value: int)
 - **`value`** -> `int`: Number of tokens currently available.
 - **`max_value`** -> `int`: Maximum number of tokens.
 - **`acquire()`**: Acquires a token, suspending until one is available.
+- **`try_acquire()` -> `bool`**: Non-blocking atomic attempt to acquire a permit immediately. Returns `True` if acquired, `False` otherwise.
 - **`release()`**: Releases a token back to the semaphore.
 
 ### `CapacityLimiter`
@@ -744,6 +785,7 @@ CapacityLimiter(total_tokens: float)
   `total_tokens` concurrently — separate reads can mix values computed
   against different totals.
 - **`acquire()`**: Acquires one token, suspending until available.
+- **`try_acquire()` -> `bool`**: Non-blocking atomic attempt to borrow one token immediately. Returns `True` if acquired, `False` otherwise.
 - **`release()`**: Returns one token.
 
 ### `Event`
@@ -800,6 +842,7 @@ ctx = AsyncContext(parent: AsyncContext | None = None)
 
 - **`ctx.cancel()`**: Cancels this context and cascades cancellation thread-safely to all child contexts and submitted futures.
 - **`ctx.submit(pool, target, *args, **kwargs)`**: Submits a task to the pool bound to this context.
+- **`ctx.task_group(pool=None, name=None, max_concurrency=None)`**: Creates a `TaskGroup` linked to this context whose tasks cascade cancellation when the context is cancelled.
 - **`ctx.parent`**: The parent context, or `None` for a root context (read-only, fixed at construction).
 - **`ctx.is_cancelled`**: Returns `True` if cancelled.
 
@@ -849,64 +892,6 @@ async with rw.reader():
 # Exclusive write access
 async with rw.writer():
     write_data()
-```
-
----
-
-## Networking & ASGI Workers
-
-### `ConnectionPinningServer`
-
-Pins each incoming client TCP connection to a specific Worker Event Loop thread for zero cross-thread syscall overhead.
-
-```python
-async with ConnectionPinningServer(pool, host="127.0.0.1", port=8080) as server:
-    await server.start(handler_coro)
-```
-
----
-
-### `MultiloopASGIWorker`
-
-Mounts FastAPI / Starlette / ASGI 3.0 applications directly onto `EventLoopThreadPool`. Supports HTTP/1.1 chunked streaming, RFC 6455 Full-Duplex WebSockets, and Keep-Alive multiplexing over single TCP connections.
-
-```python
-from fastapi import FastAPI
-from multiloop import EventLoopThreadPool, MultiloopASGIWorker
-
-app = FastAPI()
-
-
-async def main():
-    async with EventLoopThreadPool(num_threads=4) as pool:
-        async with MultiloopASGIWorker(app, pool, port=8000):
-            print("FastAPI (HTTP/1.1, WebSocket) running on multi-threaded multiloop pool...")
-            await asyncio.sleep(3600)
-```
-
----
-
-### `MultiloopWSGIWorker`
-
-Mounts synchronous Django / Flask / WSGI 1.0.1 (PEP 3333) applications onto `EventLoopThreadPool`.
-
-```python
-from flask import Flask
-from multiloop import EventLoopThreadPool, MultiloopWSGIWorker
-
-app = Flask(__name__)
-
-
-@app.route("/")
-def index():
-    return "Hello from Flask on multiloop!"
-
-
-async def main():
-    async with EventLoopThreadPool(num_threads=4) as pool:
-        async with MultiloopWSGIWorker(app, pool, port=8000):
-            print("Flask WSGI running on multi-threaded multiloop pool...")
-            await asyncio.sleep(3600)
 ```
 
 ---

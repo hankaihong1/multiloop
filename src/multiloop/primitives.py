@@ -11,16 +11,12 @@ import builtins
 import collections
 import threading
 import time
-from collections.abc import AsyncGenerator, Callable, Coroutine, Generator
+import warnings
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Generator
 from contextlib import asynccontextmanager
-from typing import Any, Protocol
+from typing import Any, Protocol, Self
 
-from multiloop._channel_base import (
-    _CHANNEL_CLOSED_MSG,
-    _BaseChannel,
-    _discard_waiter,
-    _wake_all,
-)
+from multiloop._channel_base import _CHANNEL_CLOSED_MSG, _discard_waiter, _wake_all
 from multiloop._rust import _try_import_rust_class
 from multiloop.exceptions import ChannelClosedError, TimeoutError, WouldBlock
 
@@ -28,19 +24,10 @@ __all__ = [
     "AsyncOnce",
     "AsyncWaitGroup",
     "Channel",
+    "ReceiveChannel",
+    "SendChannel",
     "select_channel",
 ]
-
-
-class _ChannelProtocol(Protocol):
-    """Protocol for the native Rust Channel class."""
-
-    def __init__(self, maxsize: int) -> None: ...
-    def try_send(self, item: Any) -> bool: ...
-    def try_recv(self) -> tuple[bool, Any]: ...
-    def is_closed(self) -> bool: ...
-    def close(self) -> None: ...
-    def qsize(self) -> int: ...
 
 
 class _RawAsyncChannelProtocol(Protocol):
@@ -65,9 +52,12 @@ class _RawAsyncChannelProtocol(Protocol):
     def unregister_getter(self, fut: Any) -> bool: ...
     def register_putter(self, loop: Any, fut: Any) -> bool: ...
     def unregister_putter(self, fut: Any) -> bool: ...
+    def claim_put(self, item: Any) -> bool: ...
     def register_select_watcher(self, loop: Any, arbiter_fut: Any, channel_token: Any) -> bool: ...
     def unregister_select_watcher(self, fut: Any) -> bool: ...
     def forward_select_wakeup(self) -> None: ...
+    def send_sync(self, item: Any, timeout: float | None = ...) -> None: ...
+    def recv_sync(self, timeout: float | None = ...) -> Any: ...
 
 
 class _WaitGroupProtocol(Protocol):
@@ -80,9 +70,6 @@ class _WaitGroupProtocol(Protocol):
     def unregister_waiter(self, fut: Any) -> bool: ...
 
 
-_RustChannel: type[_ChannelProtocol] | None = _try_import_rust_class(
-    "multiloop._multiloop_core", "Channel"
-)
 _RustRawAsyncChannel: type[_RawAsyncChannelProtocol] | None = _try_import_rust_class(
     "multiloop._multiloop_core", "RawAsyncChannel"
 )
@@ -148,7 +135,7 @@ class _LenShim:
         return int(self._len_fn())
 
 
-class Channel(_BaseChannel):
+class Channel:
     """High-performance cross-thread channel backed by native Rust state machines.
 
     Eliminates Python-level lock contention by delegating buffer queueing, FIFO waiting
@@ -159,24 +146,13 @@ class Channel(_BaseChannel):
 
     def __init__(self, maxsize: int = 0) -> None:
         self._maxsize = max(0, int(maxsize))
-        if _RustRawAsyncChannel is not None:
-            self._inner: Any = _RustRawAsyncChannel(self._maxsize, _wake_fut, _select_wake)
-            self._use_raw = True
-        elif _RustChannel is not None:
-            super().__init__()
-            self._inner = _RustChannel(self._maxsize)
-            self._use_raw = False
-        else:
+        if _RustRawAsyncChannel is None:
             raise RuntimeError("_multiloop_core Rust extension is not compiled.")
+        self._inner: Any = _RustRawAsyncChannel(self._maxsize, _wake_fut, _select_wake)
 
     def close(self) -> None:
         """Close the channel, waking all pending senders and receivers with ChannelClosedError."""
-        if self._use_raw:
-            self._inner.close()
-        else:
-            self._inner.close()
-            with self._lock:
-                self._close_waiters()
+        self._inner.close()
 
     def __repr__(self) -> str:
         return f"<Channel is_closed={self.is_closed}>"
@@ -193,21 +169,8 @@ class Channel(_BaseChannel):
         :returns: ``True`` if sent immediately, ``False`` if the buffer was full.
         :raises ChannelClosedError: If the channel is closed.
         """
-        if self._use_raw:
-            try:
-                return bool(self._inner.try_send(item))
-            except RuntimeError as e:
-                raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
         try:
-            result = self._inner.try_send(item)
-            if result:
-                with self._lock:
-                    if self._getters:
-                        self._wakeup_next(self._getters)
-                    else:
-                        self._wakeup_notifiers(all_notifiers=False)
-                return True
-            return False
+            return bool(self._inner.try_send(item))
         except RuntimeError as e:
             raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
@@ -218,21 +181,11 @@ class Channel(_BaseChannel):
         :raises WouldBlock: If the channel is empty.
         :raises ChannelClosedError: If the channel is closed and completely drained.
         """
-        if self._use_raw:
-            try:
-                has_item, item = self._inner.try_recv()
-            except RuntimeError as e:
-                raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
-            if has_item:
-                return item
-            raise WouldBlock("Channel is empty")
         try:
             has_item, item = self._inner.try_recv()
         except RuntimeError as e:
             raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
         if has_item:
-            with self._lock:
-                self._wakeup_next(self._putters)
             return item
         raise WouldBlock("Channel is empty")
 
@@ -247,47 +200,54 @@ class Channel(_BaseChannel):
 
     def empty(self) -> bool:
         """Return True if the channel buffer is currently empty."""
-        if self._use_raw:
-            return bool(self._inner.empty())
-        return self.qsize() == 0
+        return bool(self._inner.empty())
 
     def full(self) -> bool:
         """Return True if the channel buffer is currently full."""
-        if self._use_raw:
-            return bool(self._inner.full())
-        if self._maxsize <= 0:
-            return False
-        return self.qsize() >= self._maxsize
+        return bool(self._inner.full())
 
-    async def send(self, item: Any) -> None:
+    async def send(self, item: Any, timeout: float | None = None) -> None:
         """Send an item, suspending if the buffer is full until capacity is available.
 
         :param item: The item to send.
+        :param timeout: Optional maximum seconds to wait before raising TimeoutError.
         :raises ChannelClosedError: If the channel is closed.
+        :raises TimeoutError: If timeout expires before buffer space becomes available.
         """
-        if self._use_raw:
-            loop = asyncio.get_running_loop()
-            while True:
-                try:
+        if timeout is not None:
+            await asyncio.wait_for(self._send_impl(item), timeout=timeout)
+        else:
+            await self._send_impl(item)
+
+    async def _send_impl(self, item: Any) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                if self._inner.try_send(item):
+                    return
+            except RuntimeError as e:
+                raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
+
+            fut: asyncio.Future[Any] = loop.create_future()
+            try:
+                if self._inner.register_putter(loop, fut):
                     if self._inner.try_send(item):
                         return
-                except RuntimeError as e:
-                    raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
+                    continue
+            except RuntimeError as e:
+                raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
-                fut: asyncio.Future[Any] = loop.create_future()
-                try:
-                    if self._inner.register_putter(loop, fut) and self._inner.try_send(item):
-                        return
-                except RuntimeError as e:
-                    raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
+            try:
+                await fut
+            except BaseException:
+                self._inner.unregister_putter(fut)
+                raise
 
-                try:
-                    await fut
-                except BaseException:
-                    self._inner.unregister_putter(fut)
-                    raise
-        else:
-            await self._wait_and_send(item, self._inner.try_send)
+            try:
+                self._inner.claim_put(item)
+                return
+            except RuntimeError as e:
+                raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
     def send_sync(self, item: Any, timeout: float | None = None) -> None:
         """Synchronously send an item into the channel from a worker or background OS thread.
@@ -297,13 +257,24 @@ class Channel(_BaseChannel):
         :raises TimeoutError: If timeout expired before buffer space became available.
         :raises ChannelClosedError: If the channel is closed.
         """
-        deadline = (time.monotonic() + timeout) if timeout is not None else None
-        while True:
-            if self.try_send(item):
-                return
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("send_sync timed out")
-            time.sleep(0.0005)
+        try:
+            self._inner.send_sync(item, timeout)
+        except builtins.TimeoutError as e:
+            raise TimeoutError("send_sync timed out") from e
+        except RuntimeError as e:
+            raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
+
+    async def recv(self, timeout: float | None = None) -> Any:
+        """Receive an item, suspending until one is available or the channel is closed.
+
+        :param timeout: Optional maximum seconds to wait before raising TimeoutError.
+        :returns: The received item.
+        :raises ChannelClosedError: If the channel is closed and empty.
+        :raises TimeoutError: If timeout expires before an item is received.
+        """
+        if timeout is not None:
+            return await asyncio.wait_for(self._recv_impl(), timeout=timeout)
+        return await self._recv_impl()
 
     def recv_sync(self, timeout: float | None = None) -> Any:
         """Synchronously receive an item from the channel from a worker or background OS thread.
@@ -313,120 +284,200 @@ class Channel(_BaseChannel):
         :raises TimeoutError: If timeout expired before an item became available.
         :raises ChannelClosedError: If the channel is closed and drained.
         """
-        deadline = (time.monotonic() + timeout) if timeout is not None else None
-        while True:
-            try:
-                return self.try_recv()
-            except WouldBlock:
-                pass
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("recv_sync timed out")
-            time.sleep(0.0005)
+        try:
+            return self._inner.recv_sync(timeout)
+        except builtins.TimeoutError as e:
+            raise TimeoutError("recv_sync timed out") from e
+        except RuntimeError as e:
+            raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
     async def _recv_impl(self) -> Any:
-        if self._use_raw:
-            loop = asyncio.get_running_loop()
-            while True:
-                try:
-                    has_item, item = self._inner.try_recv()
-                    if has_item:
-                        return item
-                except RuntimeError as e:
-                    raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                has_item, item = self._inner.try_recv()
+                if has_item:
+                    return item
+            except RuntimeError as e:
+                raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
-                fut: asyncio.Future[Any] = loop.create_future()
-                fut._ch = self  # type: ignore[attr-defined]
-                try:
-                    has_item, item = self._inner.register_getter(loop, fut)
-                    if has_item:
-                        return item
-                except RuntimeError as e:
-                    raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
+            fut: asyncio.Future[Any] = loop.create_future()
+            fut._ch = self  # type: ignore[attr-defined]
+            try:
+                has_item, item = self._inner.register_getter(loop, fut)
+                if has_item:
+                    return item
+            except RuntimeError as e:
+                raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
-                try:
-                    return await fut
-                except BaseException:
-                    self._inner.unregister_getter(fut)
-                    raise
-        else:
-            loop = asyncio.get_running_loop()
-            while True:
-                try:
-                    has_item, item = self._inner.try_recv()
-                    if has_item:
-                        with self._lock:
-                            self._wakeup_next(self._putters)
-                        return item
-                except RuntimeError as e:
-                    raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
-
-                with self._lock:
-                    try:
-                        has_item, item = self._inner.try_recv()
-                        if has_item:
-                            self._wakeup_next(self._putters)
-                            return item
-                    except RuntimeError as e:
-                        raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
-
-                    if self.is_closed:
-                        raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
-                    fut = loop.create_future()
-                    self._getters[fut] = loop
-
-                try:
-                    await fut
-                except BaseException:
-                    with self._lock:
-                        was_present = self._discard_waiter(self._getters, fut)
-                        if not was_present:
-                            self._wakeup_next(self._getters)
-                    raise
+            try:
+                return await fut
+            except BaseException:
+                self._inner.unregister_getter(fut)
+                raise
 
     def _register_select_watcher(
         self, loop: asyncio.AbstractEventLoop, arbiter_fut: asyncio.Future[Any]
     ) -> Any | None:
-        if self._use_raw:
-            try:
-                registered = self._inner.register_select_watcher(loop, arbiter_fut, self)
-                if registered:
-                    return arbiter_fut
-                return None
-            except RuntimeError:
-                return None
-        return super()._register_select_watcher(loop, arbiter_fut)
+        try:
+            registered = self._inner.register_select_watcher(loop, arbiter_fut, self)
+            if registered:
+                return arbiter_fut
+            return None
+        except RuntimeError:
+            return None
 
     def _unregister_select_watcher(self, token: Any) -> None:
-        if self._use_raw:
-            if token is not None:
-                self._inner.unregister_select_watcher(token)
-        else:
-            super()._unregister_select_watcher(token)
+        if token is not None:
+            self._inner.unregister_select_watcher(token)
 
     def _forward_select_wakeup(self) -> None:
-        if self._use_raw:
-            self._inner.forward_select_wakeup()
-        else:
-            with self._lock:
-                self._wakeup_notifiers(all_notifiers=False)
+        self._inner.forward_select_wakeup()
 
     @property
     def _getters(self) -> Any:
-        if self._use_raw:
-            return _LenShim(self._inner.getters_len)
-        return super()._getters
+        return _LenShim(self._inner.getters_len)
 
     @property
     def _putters(self) -> Any:
-        if self._use_raw:
-            return _LenShim(self._inner.putters_len)
-        return super()._putters
+        return _LenShim(self._inner.putters_len)
 
     @property
     def _notifiers(self) -> Any:
-        if self._use_raw:
-            return _LenShim(self._inner.notifiers_len)
-        return super()._notifiers
+        return _LenShim(self._inner.notifiers_len)
+
+    def __aiter__(self) -> AsyncIterator[Any]:
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            return await self.recv()
+        except ChannelClosedError:
+            raise StopAsyncIteration from None
+
+    def split(self) -> tuple[SendChannel, ReceiveChannel]:
+        """Split this channel into a (SendChannel, ReceiveChannel) pair for interface segregation."""
+        return SendChannel(self), ReceiveChannel(self)
+
+
+class SendChannel:
+    """A send-only view of a :class:`Channel` for interface segregation (Go ``chan<- T`` style)."""
+
+    __slots__ = ("_ch",)
+
+    def __init__(self, ch: Channel) -> None:
+        self._ch = ch
+
+    def __repr__(self) -> str:
+        return f"<SendChannel is_closed={self.is_closed}>"
+
+    async def send(self, item: Any, timeout: float | None = None) -> None:
+        """Send an item into the channel."""
+        await self._ch.send(item, timeout=timeout)
+
+    def send_sync(self, item: Any, timeout: float | None = None) -> None:
+        """Synchronous blocking send."""
+        self._ch.send_sync(item, timeout=timeout)
+
+    def try_send(self, item: Any) -> bool:
+        """Non-blocking send."""
+        return self._ch.try_send(item)
+
+    def close(self) -> None:
+        """Close the underlying channel."""
+        self._ch.close()
+
+    @property
+    def is_closed(self) -> bool:
+        """Return True if the underlying channel is closed."""
+        return self._ch.is_closed
+
+    @property
+    def maxsize(self) -> int:
+        """Maximum capacity of the underlying channel."""
+        return self._ch.maxsize
+
+    def full(self) -> bool:
+        """Return True if the underlying channel buffer is full."""
+        return self._ch.full()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        self.close()
+
+
+class ReceiveChannel:
+    """A receive-only view of a :class:`Channel` for interface segregation (Go ``<-chan T`` style)."""
+
+    __slots__ = ("_ch",)
+
+    def __init__(self, ch: Channel) -> None:
+        self._ch = ch
+
+    def __repr__(self) -> str:
+        return f"<ReceiveChannel is_closed={self.is_closed}>"
+
+    async def recv(self, timeout: float | None = None) -> Any:
+        """Receive an item from the channel."""
+        return await self._ch.recv(timeout=timeout)
+
+    def recv_sync(self, timeout: float | None = None) -> Any:
+        """Synchronously receive an item from the channel from a worker or background OS thread.
+
+        :param timeout: Maximum seconds to block before raising TimeoutError.
+        :returns: The dequeued item.
+        :raises TimeoutError: If timeout expired before an item became available.
+        :raises ChannelClosedError: If the channel is closed and drained.
+        """
+        return self._ch.recv_sync(timeout=timeout)
+
+    def try_recv(self) -> Any:
+        """Non-blocking receive."""
+        return self._ch.try_recv()
+
+    def close(self) -> None:
+        """Close the underlying channel."""
+        self._ch.close()
+
+    @property
+    def is_closed(self) -> bool:
+        """Return True if the underlying channel is closed."""
+        return self._ch.is_closed
+
+    def empty(self) -> bool:
+        """Return True if the underlying channel is empty."""
+        return self._ch.empty()
+
+    def qsize(self) -> int:
+        """Number of items currently buffered in the underlying channel."""
+        return self._ch.qsize()
+
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            return await self._ch.recv()
+        except ChannelClosedError:
+            raise StopAsyncIteration from None
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        self.close()
 
 
 _UNSET: Any = object()
@@ -490,6 +541,7 @@ async def select_channel(
             start_reg = (
                 (time.perf_counter_ns() ^ id(loop)) % num_channels if num_channels > 1 else 0
             )
+            stolen = False
             for i in range(num_channels):
                 ch = channels[(start_reg + i) % num_channels]
                 token = ch._register_select_watcher(loop, arbiter_fut)
@@ -498,8 +550,14 @@ async def select_channel(
                 elif not arbiter_fut.done():
                     try:
                         return ch, ch.try_recv()
-                    except (ChannelClosedError, WouldBlock):
+                    except WouldBlock:
+                        stolen = True
+                        break
+                    except ChannelClosedError:
                         pass
+
+            if stolen:
+                continue
 
             if all(ch.is_closed and ch.qsize() == 0 for ch in channels):
                 raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
@@ -573,12 +631,16 @@ class _TrackedCoroutine(Coroutine[Any, Any, Any]):
         return self._ensure_gen()
 
     def __del__(self) -> None:
+        # Under Python 3.14t (free-threaded), __del__ runs in an arbitrary GC finalizer thread.
+        # Calling self._wg.done() here would risk unpredictable cross-thread re-entrancy and
+        # deadlock under PyO3 lock acquisitions. Instead, emit RuntimeWarning to report the leak.
         if not self._stepped:
             self._stepped = True
-            try:
-                self._wg.done()
-            except Exception:
-                pass
+            warnings.warn(
+                "Tracked coroutine was never awaited; AsyncWaitGroup counter leaked",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             if self._gen is not None:
                 self._gen.close()
             if hasattr(self, "_target") and asyncio.iscoroutine(self._target):
@@ -632,7 +694,10 @@ class AsyncWaitGroup:
 
         :param fn: Synchronous or asynchronous callable to wrap.
         :returns: Wrapped callable that decrements counter upon completion.
+        :raises TypeError: If fn is not callable.
         """
+        if not callable(fn):
+            raise TypeError(f"Expected callable, got {type(fn).__name__}")
 
         async def _wrapped(*args: Any, **kwargs: Any) -> Any:
             self.add(1)
@@ -651,7 +716,10 @@ class AsyncWaitGroup:
 
         :param coro: Coroutine object or callable to track.
         :returns: Tracked coroutine object that decrements counter upon completion.
+        :raises TypeError: If coro is not a coroutine, Future, or callable.
         """
+        if not (asyncio.iscoroutine(coro) or asyncio.isfuture(coro) or callable(coro)):
+            raise TypeError(f"Expected coroutine, Future, or callable, got {type(coro).__name__}")
         self.add(1)
         return _TrackedCoroutine(coro, self)
 

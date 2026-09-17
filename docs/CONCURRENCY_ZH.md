@@ -25,20 +25,19 @@ multiloop 借用了 AnyIO 和 Trio 的顶层 API 命名与人体工程学接口�
 2. **跨线程 EventLoop 物理隔离公理**：`asyncio.Task`、`Future` 与 `Event` 严格物理绑定于单一 OS 线程及其 EventLoop。跨线程通信与唤醒绝对只能通过 `loop.call_soon_threadsafe(...)` 或 Rust `Channel` 派发。
 3. **ContextVar 线程/任务局部性公理**：`contextvars.ContextVar` 严格归属于当前 OS 线程与当前 Task。跨线程取消（`scope.cancel()`）严禁跨线程读取 ContextVar 栈，仅依赖线程互斥锁与 `call_soon_threadsafe`。
 4. **asyncio 原生取消与单账本对称记账公理**：完全基于 Python 3.11+/3.14t 原生 `task.cancelling()` 与 `task.uncancel()` 机制。Scope 仅对其显式注入的取消（`_injected == True`）执行对称的 `task.uncancel()` 冲销，绝不误吞外部第三方取消。Shield 严格采用快照-恢复（Snapshot-and-Restore）模型。
-5. **数据面与等待面物理分离公理**：数据流由 Rust 核心无锁承载（`flume` + 64 字节对齐原子计数器），异步等待队列由 Python `threading.Lock` 保护并执行双检锁协议。
+5. **统一 Rust 原生 Channel 核心与防插队 FIFO 公理**：通道全量收敛至 Rust `RawAsyncChannel`（`parking_lot::Mutex<ChannelInner>`），通过 `in_flight_putters` 预留名额机制严格维护 FIFO 防插队不变量与令牌守恒，彻底消除 Python 锁双轨制与脑裂。
 6. **结构化并发物理作用域公理**：`TaskGroup` 物理限定于单个 `asyncio.AbstractEventLoop` 内部。跨 Loop、跨线程并发由 `EventLoopThreadPool`、`Channel` 与 `AsyncContext` 协同编排。
 
 ### 1.1 通道类（Channel）
 
 | 组件 | 锁/原语 | waiter 结构 | 关键不变量 |
 |---|---|---|---|
-| Rust `Channel` | flume channel（有界/无界）+ `AtomicBool is_closed` | 无 | `try_send` 返回 `false` 仅表示满；**关闭后先排空再报错**——与 `close()` 竞争的 send 可能仍短暂入队（flume 侧惰性关闭），因此"已关闭"通道可能先短暂接收再排空，之后所有操作才报错（`src/lib.rs:387-418`；R4 决议：比 Go 的关闭后 send panic 更宽容） |
-| Python `_BaseChannel` | `threading.Lock`（`_lock`） | `_getters` / `_putters` 两个 `deque[(loop, future)]` | waiter 注册与唤醒必须在 `_lock` 下完成（`src/multiloop/_channel_base.py:75-78`） |
-| 唤醒协议 | — | — | `_wake_all` 从 deque **左侧消费式**唤醒：唤醒一个就弹出，stale future 自然丢弃（`_channel_base.py:29-50`） |
+| Rust `RawAsyncChannel` | `parking_lot::Mutex<ChannelInner>` | `getters` / `putters` 两个 `VecDeque<(loop_obj, fut, wake_fn)>` | FIFO 防插队：当存在排队 putter 或缓冲满时 `try_send` 严格拒绝；唤醒的 putter 通过 `in_flight_putters` 持有预留名额直到 `claim_put`。跨 Loop 通过 `call_soon_threadsafe` 安全唤醒（`src/channel.rs`） |
+| Python `Channel` | `RawAsyncChannel` 的极薄门面 | — | 直接透传 Rust 核心，无双轨制分叉；支持 `select_channel` 单仲裁器注册与防插队重试（`src/multiloop/primitives.py`） |
+| 唤醒协议 | — | — | waiter 从 VecDeque 头部 FIFO 弹出并通过 `call_soon_threadsafe(wake_fn, fut, val, is_exc, has_val)` 调度回归属 Loop。被唤醒但随后取消的 waiter 负责令牌向后转发以保证活性 |
 
-**数据面与等待面分离**：flume 管数据（无锁），Python 锁只管"谁在等"。
-`send`/`recv` 都是「锁外快路径尝试 → 锁内双检 → 锁内注册 future → await →
-取消时锁内注销」（`_channel_base.py:136-177`、`primitives.py:165-197`）。
+**全收敛单轨架构**：缓冲数据与异步 waiter 统一由 Rust `RawAsyncChannel` 核心管理。`send`/`recv` 均遵循
+「快路径尝试 → 锁内注册 future → await → 取消时锁内注销 → 消费预留名额入队/出队」。
 
 ### 1.2 锁与信号量
 
@@ -70,13 +69,13 @@ multiloop 借用了 AnyIO 和 Trio 的顶层 API 命名与人体工程学接口�
 | `CancelScope` | 每任务 contextvars 栈 + 单账本 `_injected` | shield 进入时 snapshot 取消计数并清零，退出时恢复；单账本精确跟踪实际注入并对称冲销；严格 RAII 作用域栈生命周期（`_cancel.py`） |
 | `select_channel` | 两阶段仲裁器（Phase 1 伪随机均匀快速 `try_recv`，Phase 2 单播唤醒多通道注册） | 废除 TaskGroup 投机取消，赢家通过 `try_recv()` 消费并在 `finally` 中切除所有通道 watcher 注册（`primitives.py:230-290`） |
 
-### 1.6 HTTP 与 WebSocket 协议并发模型（纯传输邮递员 vs Rust 协议计算器）
+### 1.6 多核调度与线程池并发模型（Multi-Core Scheduling & Pool Concurrency Model）
 
 | 组件 | 架构职责 | 线程 / 状态保护 | 核心不变式 |
 |---|---|---|---|
-| Rust `FastHttpConnection` | 协议状态机与计算器 | 归属于持有它的 Worker EventLoop 局部线程 | 100% 负责 HTTP 头部解析、RFC 9112 Chunked 流式解码、请求走私防御、CRLF 响应注入拦截、单趟 `PyBytes::new_with` 响应序列化与 RFC 6455 WebSocket 融合（`src/http.rs`）。 |
-| Python `Http11Protocol` | 纯传输邮递员 | 绑定至单一 Worker EventLoop | 约 380 行极简协议，仅负责底层的 Socket I/O、`_body_queue` 背压与 `pump_events()` 消除饥饿死锁、以及 ASGI 3.0 协程调度（`src/multiloop/_http11.py`）。 |
-| Python `WebSocketConnection` | 全双工 RFC 6455 会话 | `_send_lock`（Lock） + Rust `Channel`（`_inbound_channel`） | 跨 Loop 广播必须通过 `run_coroutine_threadsafe` 跳板至 `self._home_loop` 执行；`_inbound_channel` 提供物理级跨线程入站排队（`src/multiloop/_websocket.py`）。 |
+| Rust `NativeWorkerPool` | 无锁任务队列与工作窃取 | Flume 全局队列 + 各 Worker 专用通道 | 软 Poller 门禁（`num_polling < max(workers/2, 1)`）限制并发探测；三级消费漏斗（私有缓冲 → 全局批量拉取 → 本地专用通道）保障零任务饥饿（`src/pool.rs`）。 |
+| Python `EventLoopThreadPool` | 多事件循环协调器 | 绑定独立事件循环的 Worker OS 线程 | 未钉选任务通过 `pop_work()` 抢占分发；钉选任务确定性路由至本地通道；安全关闭在退出前验证三源彻底排空（`src/multiloop/pool.py`）。 |
+| Python `AsyncContext` | 跨线程级联取消树 | `threading.Lock` + 注入专属 `CancelScope` | 同时取消调用方 Future 与 Worker 物理线程上正在执行的活动协程（`src/multiloop/context.py`）。 |
 
 ---
 
@@ -242,32 +241,6 @@ if limiter.available_tokens > 0:  # 例如 0.5 > 0
     await limiter.acquire()  # 若整型容量已借满则必然阻塞!
 ```
 - **正确姿势**：统一推荐 `async with limiter:` 上下文管理器；使用 `limiter.available_capacity >= 1`（或 `available_tokens >= 1.0`）确保可立即无阻借出。
-
-**5. ASGI `scope["state"]` 共享字典修改与跨请求污染**：
-- **陷阱**：直接将共享的 Lifespan 状态字典引用传递给 ASGI 请求的 `scope`，会导致业务处理函数在写入 `request.state` 时覆盖共享数据，引发跨用户上下文泄露（如越权访问）以及 Python 3.14t 下的多核字典并发写冲突。
-- **反例**：
-```python
-scope["state"] = self.lifespan_state  # 共享直接引用!
-```
-- **正确姿势**：
-```python
-scope["state"] = self.lifespan_state.copy()  # 单请求隔离的轻量浅拷贝
-```
-
-**6. `asyncio.Transport` 跨线程直接写入未做 Loop 调度跳板**：
-- **陷阱**：从非持有该 Transport 的 OS 线程直接调用 `transport.write()` 会破坏 `_SelectorSocketTransport` 内部缓冲区并引发数据竞态。
-- **反例**：
-```python
-# 在 Worker Thread B 上:
-transport.write(b"data")  # 线程不安全直接写入!
-```
-- **正确姿势**：
-```python
-# 在 Worker Thread B 上:
-if cur_loop is not home_loop:
-    fut = asyncio.run_coroutine_threadsafe(ws.send(message), home_loop)
-    await asyncio.wrap_future(fut)
-```
 
 ---
 

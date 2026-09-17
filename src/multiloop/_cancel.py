@@ -441,10 +441,17 @@ async def checkpoint() -> None:
     Raises :class:`asyncio.CancelledError` if the innermost active cancel scope is cancelled.
     """
     stack = _get_scope_stack()
-    if not stack:
-        return
-    current = stack[-1]
-    if current._effectively_cancelled():
+    if stack and stack[-1]._effectively_cancelled():
+        task = asyncio.current_task()
+        if task is not None:
+            for _ in range(task.cancelling()):
+                task.uncancel()
+        raise asyncio.CancelledError()
+
+    await asyncio.sleep(0)
+
+    stack = _get_scope_stack()
+    if stack and stack[-1]._effectively_cancelled():
         task = asyncio.current_task()
         if task is not None:
             for _ in range(task.cancelling()):

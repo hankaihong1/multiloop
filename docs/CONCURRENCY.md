@@ -29,22 +29,19 @@ In contrast, multiloop operates under **Python 3.14t (free-threaded / no-GIL) tr
 2. **Cross-Thread EventLoop Isolation**: `asyncio.Task`, `Future`, and `Event` are strictly bound to a single thread and its event loop. Cross-thread notifications must strictly go through `loop.call_soon_threadsafe(...)` or Rust `Channel`.
 3. **ContextVar Thread/Task Locality**: `contextvars.ContextVar` is strictly local to the active OS thread and task. Cross-thread cancellation (`scope.cancel()`) must never read or modify `ContextVar` state; it relies exclusively on thread-safe locks and `call_soon_threadsafe`.
 4. **Native asyncio Cancellation & Single-Ledger Symmetric Accounting**: Built upon Python 3.11+/3.14t native `task.cancelling()` / `task.uncancel()`. A scope only compensates (`task.uncancel()`) for cancellations it explicitly injected (`_injected == True`), preventing accidental absorption of foreign cancellations. Shielding is a snapshot-and-restore mechanism.
-5. **Data Plane vs Wait Plane Separation**: Data transfer is carried out lock-free in Rust (`flume` + 64-byte-padded atomic counters), while async waiters are tracked under Python `threading.Lock` using the double-check lock pattern.
+5. **Unified Native Channel Core & Anti-Barging FIFO**: Channels are unified in Rust (`RawAsyncChannel` with `parking_lot::Mutex<ChannelInner>`), enforcing anti-barging FIFO ordering and token conservation (`in_flight_putters` reservations) across event loops without dual-track Python lock split-brain.
 6. **Structured Concurrency Physical Scope**: `TaskGroup` is physically scoped to a single `asyncio.AbstractEventLoop`. Multi-loop concurrency is coordinated via `EventLoopThreadPool`, `Channel`, and `AsyncContext`.
 
 ### 1.1 Channels (Channel)
 
 | Component | Lock / primitive | Waiter structure | Key invariant |
 |---|---|---|---|
-| Rust `Channel` | flume channel (bounded/unbounded) + `AtomicBool is_closed` | none | `try_send` returning `false` means only "full"; **closed ⇒ errors once drained** — a send racing `close()` may still enqueue (the flume side is closed lazily), so a "closed" channel can briefly accept then drain, after which every operation errors (`src/lib.rs:387-418`; R4 decision: tolerant vs Go's panic-on-send-after-close) |
-| Python `_BaseChannel` | `threading.Lock` (`_lock`) | `_getters` / `_putters` deques of `(loop, future)` | waiter registration and wakeup must happen under `_lock` (`src/multiloop/_channel_base.py:75-78`) |
-| Wakeup protocol | — | — | `_wake_all` consumes from the deque **left side**: one wakeup pops one entry, stale futures are dropped naturally (`_channel_base.py:29-50`) |
+| Rust `RawAsyncChannel` | `parking_lot::Mutex<ChannelInner>` | `getters` / `putters` VecDeque of `(loop_obj, fut, wake_fn)` | Anti-barging FIFO ordering: `try_send` rejects if putters are queued or buffer is full; woken putters hold reservations via `in_flight_putters` until `claim_put`. Thread-safe wakeup via `call_soon_threadsafe`. (`src/channel.rs`) |
+| Python `Channel` | Thin facade over `RawAsyncChannel` | — | Direct forwarding to Rust core without split-brain dual tracks; supports `select_channel` arbiter registration. (`src/multiloop/primitives.py`) |
+| Wakeup protocol | — | — | Waiters are popped FIFO and scheduled on their home loops via `call_soon_threadsafe(wake_fn, fut, val, is_exc, has_val)`. Woken waiters cancelled before claim forward tokens to preserve liveness. |
 
-**Data plane and wait plane are separated**: flume carries data (lock-free),
-the Python lock only tracks "who is waiting". `send`/`recv` follow
-「lock-free fast path → re-check under the lock → register future under the
-lock → await → unregister under the lock on cancellation」
-(`_channel_base.py:136-177`, `primitives.py:165-197`).
+**Unified single-track architecture**: All data buffering and waiter queuing are unified in the Rust `RawAsyncChannel` core. `send`/`recv` follow
+「try fast path → register future under lock → await → unregister under lock on cancellation → claim reservation」.
 
 ### 1.2 Locks & Semaphores
 
@@ -76,13 +73,13 @@ lock → await → unregister under the lock on cancellation」
 | `CancelScope` | per-task contextvars stack + single-ledger `_injected` | shield snapshots and clears the cancellation count on entry, restores it on exit; single ledger tracks exact injections and symmetrically uncancels only what was injected; strict RAII scope stack lifetime (`_cancel.py`) |
 | `select_channel` | 2-phase arbiter (Phase 1 fast `try_recv` with pseudo-random uniform start, Phase 2 multi-channel registration with unicast wakeup) | readiness is reported without TaskGroup speculative cancellation; winner consumes via `try_recv()` and unregisters all watcher tokens in `finally` (`primitives.py:230-290`) |
 
-### 1.6 HTTP & WebSocket Protocol Concurrency Model (Pure Messenger vs Rust Protocol Calculator)
+### 1.6 Multi-Core Scheduling & Pool Concurrency Model
 
 | Component | Architecture Role | Threading / State Guard | Key Invariant |
 |---|---|---|---|
-| Rust `FastHttpConnection` | Protocol State Machine & Calculator | Thread-local to owning Worker EventLoop | 100% of HTTP parsing, Chunked stream decoding, RFC 9112 smuggling defense, CRLF injection sanitization, single-pass `PyBytes::new_with` wire serialization, and WebSocket RFC 6455 frame fusion (`src/http.rs`). |
-| Python `Http11Protocol` | Pure Transport Messenger | Pinned to single Worker EventLoop | ~380 lines handling raw Socket I/O, `_body_queue` backpressure with `pump_events()` residue draining, and ASGI 3.0 lifecycle dispatching (`src/multiloop/_http11.py`). |
-| Python `WebSocketConnection` | Full-Duplex RFC 6455 Session | `_send_lock` (Lock) + Rust `Channel` (`_inbound_channel`) | Cross-loop broadcasts must trampoline to `self._home_loop` via `run_coroutine_threadsafe`; `_inbound_channel` provides multi-thread safe queueing (`src/multiloop/_websocket.py`). |
+| Rust `NativeWorkerPool` | Lock-Free Task Queue & Work Stealing | Flume global + per-worker queues | Soft poller gate (`num_polling < max(workers/2, 1)`) limits concurrent global queue pollers; 3-tier consumption (private buffer → global pull → local channel) guarantees zero task starvation (`src/pool.rs`). |
+| Python `EventLoopThreadPool` | Multi-Loop Coordinator | Worker OS threads with isolated event loops | Unpinned tasks pull via `pop_work()`; pinned tasks route deterministically via local flume channel; clean shutdown validates 3-source drain before worker termination (`src/multiloop/pool.py`). |
+| Python `AsyncContext` | Cross-Thread Tree Cancellation | `threading.Lock` + injected `CancelScope`s | Directly cancels both caller Futures and active Worker OS thread coroutines (`src/multiloop/context.py`). |
 
 ---
 
@@ -273,32 +270,6 @@ if limiter.available_tokens > 0:  # e.g. 0.5 > 0
     await limiter.acquire()  # Blocks if integer capacity (2) is already borrowed!
 ```
 - **Correct approach**: Always use `async with limiter:`; require `limiter.available_capacity >= 1` (or `available_tokens >= 1.0`) for non-blocking expectations.
-
-**5. ASGI `scope["state"]` shared dictionary mutation and cross-request pollution**:
-- **Trap**: Passing a shared mutable lifespan state dictionary directly to ASGI request scopes allows endpoints to overwrite shared state, causing cross-request data leaks (e.g. leaking authenticated user context) and multi-thread dictionary write contention under Python 3.14t.
-- **Negative example**:
-```python
-scope["state"] = self.lifespan_state  # Direct shared reference!
-```
-- **Correct approach**:
-```python
-scope["state"] = self.lifespan_state.copy()  # Per-request isolated shallow copy
-```
-
-**6. `asyncio.Transport` cross-thread write without event loop trampoline**:
-- **Trap**: Calling `transport.write()` from an OS thread other than the transport's own event loop corrupts internal `_SelectorSocketTransport` buffers and causes race conditions.
-- **Negative example**:
-```python
-# On Worker Thread B:
-transport.write(b"data")  # Thread-unsafe direct write!
-```
-- **Correct approach**:
-```python
-# On Worker Thread B:
-if cur_loop is not home_loop:
-    fut = asyncio.run_coroutine_threadsafe(ws.send(message), home_loop)
-    await asyncio.wrap_future(fut)
-```
 
 ---
 

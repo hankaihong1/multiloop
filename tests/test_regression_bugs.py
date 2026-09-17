@@ -362,6 +362,62 @@ async def test_rwmutex_cancelled_writer_preserves_holder_state():
             pass
 
 
+@pytest.mark.asyncio
+async def test_rwmutex_writer_cancelled_after_granted() -> None:
+    """A queued writer cancelled after release_write() granted ownership
+    must transfer ownership to the next waiter or reset writer state."""
+    rw = multiloop.AsyncRWMutex()
+    w1_cm = rw.writer()
+    await w1_cm.__aenter__()
+
+    async def queued_writer() -> None:
+        async with rw.writer():
+            pass
+
+    t2 = asyncio.create_task(queued_writer())
+    await asyncio.sleep(0.01)  # t2 enters write_waiters
+
+    t2.cancel()
+    await w1_cm.__aexit__(None, None, None)  # grants lock to t2!
+
+    with pytest.raises(asyncio.CancelledError):
+        await t2
+
+    assert rw._writer is False, f"writer leaked: {rw._writer}"
+    # Must be immediately acquirable by a new writer:
+    async with asyncio.timeout(0.5):
+        async with rw.writer():
+            pass
+
+
+@pytest.mark.asyncio
+async def test_rwmutex_reader_cancelled_after_granted() -> None:
+    """A queued reader cancelled after release_write() granted read permit
+    must decrement readers count and allow subsequent writers to enter."""
+    rw = multiloop.AsyncRWMutex()
+    w1_cm = rw.writer()
+    await w1_cm.__aenter__()
+
+    async def queued_reader() -> None:
+        async with rw.reader():
+            pass
+
+    t2 = asyncio.create_task(queued_reader())
+    await asyncio.sleep(0.01)  # t2 enters read_waiters
+
+    t2.cancel()
+    await w1_cm.__aexit__(None, None, None)  # grants read permit to t2!
+
+    with pytest.raises(asyncio.CancelledError):
+        await t2
+
+    assert rw._readers == 0, f"readers leaked: {rw._readers}"
+    # Must be immediately acquirable by a new writer:
+    async with asyncio.timeout(0.5):
+        async with rw.writer():
+            pass
+
+
 # ── select_channel caller cancellation cleanup ─────────────────────────────
 
 
@@ -384,3 +440,33 @@ async def test_select_channel_caller_cancel_cleans_up() -> None:
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert len(ch._notifiers) == 0, "notifier leaked after caller cancellation"
+
+
+@pytest.mark.asyncio
+async def test_waitgroup_invalid_track_target_raises_and_no_leak() -> None:
+    """AsyncWaitGroup.track and wrap must reject non-callable/non-coro before add()."""
+    wg = multiloop.AsyncWaitGroup()
+    with pytest.raises(TypeError):
+        wg.track(12345)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        wg.wrap("not a callable")  # type: ignore[arg-type]
+
+    # WG counter was never incremented; wait() must complete immediately.
+    async with asyncio.timeout(0.1):
+        await wg.wait()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_yields_control() -> None:
+    """checkpoint() must yield execution to other tasks even without cancel scope."""
+    order: list[str] = []
+
+    async def background() -> None:
+        order.append("bg")
+
+    asyncio.create_task(background())
+    order.append("start")
+    await multiloop.checkpoint()
+    order.append("end")
+
+    assert order == ["start", "bg", "end"]

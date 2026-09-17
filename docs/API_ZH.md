@@ -43,10 +43,6 @@
   - [`AsyncWaitGroup`](#asyncwaitgroup)
   - [`AsyncOnce`](#asynconce)
   - [`AsyncRWMutex`](#asyncrwmutex)
-- [网络与 ASGI Worker](#网络与-asgi-worker-networking--asgi-workers)
-  - [`ConnectionPinningServer`](#connectionpinningserver)
-  - [`MultiloopASGIWorker`](#multiloopasgiworker)
-  - [`MultiloopWSGIWorker`](#multiloopwsgiworker)
 - [异常](#异常-exceptions)
   - [`MultiloopError`](#multilooperror)
   - [`ChannelClosedError`](#channelclosederror)
@@ -373,6 +369,13 @@ EventLoopThreadPool(
 - **抛出**：池已关闭时抛 `ThreadPoolClosedError`，非法 `pin_to` 下标抛
   `ValueError`，传入原生 `asyncio.Future` 或向协程对象传递参数时抛 `TypeError`。
 
+##### `submit_many(targets: Iterable[Callable[..., Any] | Any], cancel_scope: CancelScope | None = None)` -> `list[asyncio.Future]`
+在单次调度周期内将批量任务并发推入共享全局队列，最大化跨 Worker 线程的吞吐分发。返回与每个任务一一对应的 `asyncio.Future` 列表。
+
+- **`targets`**：协程对象、协程函数或可调用任务的可迭代序列。
+- **`cancel_scope`**：批量任务共享的可选 `CancelScope`。
+- **抛出**：池已关闭时抛 `ThreadPoolClosedError`。
+
 ##### `get_metrics()` -> `dict[str, Any]`
 返回可 JSON 序列化的健康指标字典：
 ```json
@@ -605,11 +608,40 @@ Channel(maxsize: int = 0)
 ##### `close()` -> `None`
 关闭通道。所有挂起的发送者/接收者以 `ChannelClosedError` 被唤醒。
 
-##### `is_closed` -> `bool`
-是否已关闭。
+##### `split()` -> `tuple[SendChannel, ReceiveChannel]`
+将通道拆分为 `(SendChannel, ReceiveChannel)` 只发/只收代理对，用于接口隔离设计。
 
 ##### `__aiter__()` & `__anext__()`
 支持 `async for item in ch:` 迭代。通道关闭且为空时自动终止。
+
+---
+
+### `SendChannel`
+
+通道的只发视图（Go `chan<- T` 风格），用于接口隔离。
+
+- **`send(item)`**：向通道发送元素。
+- **`send_sync(item, timeout=None)`**：同步阻塞发送。
+- **`try_send(item)` -> `bool`**：非阻塞发送。
+- **`close()`**：关闭底层通道。
+- **`is_closed`** -> `bool`：是否已关闭。
+- **`maxsize`** -> `int`：最大容量。
+- **`full()`** -> `bool`：缓冲区是否已满。
+
+---
+
+### `ReceiveChannel`
+
+通道的只收视图（Go `<-chan T` 风格），用于接口隔离。
+
+- **`recv(timeout=None)`**：从通道接收元素。
+- **`recv_sync(timeout=None)`**：从工作线程或后台线程同步阻塞接收元素。
+- **`try_recv()`**：非阻塞接收。
+- **`close()`**：关闭底层通道。
+- **`is_closed`** -> `bool`：是否已关闭。
+- **`empty()`** -> `bool`：是否为空。
+- **`qsize()`** -> `int`：缓冲元素数量。
+- **`__aiter__()` & `__anext__()`**：异步迭代器支持。
 
 ---
 
@@ -654,15 +686,22 @@ selected_ch, val = await select_channel(ch1, ch2, timeout=2.0)
 ### `TaskGroup`
 
 派生并管理子任务的异步上下文管理器，底层由 `CancelScope` 驱动取消传播。
-灵感来自 trio 的 nursery 与 anyio 的 `TaskGroup`。
+灵感来自 trio 的 nursery 与 anyio 的 `TaskGroup`。支持通过 `max_concurrency` 或共享 `CapacityLimiter` 进行开箱即用的结构化并发限流。
 
 ```python
-async with TaskGroup(name=None) as tg:
-    h1 = tg.start_soon(worker, "a")
-    h2 = tg.start_soon(worker, "b")
-# Both tasks are guaranteed finished here.
+async with TaskGroup(max_concurrency=10) as tg:
+    for url in urls:
+        tg.start_soon(fetch_url, url)
+# 所有子任务保证在此处执行完成，且并发执行数最多不超过 10 个。
 ```
 
+#### 构造函数
+- **`name`** (*str | None*)：可选的任务组标识名。
+- **`max_concurrency`** (*int | None*)：可选的并发活跃子任务最大数量。内部自动创建并管理一个 `CapacityLimiter(max_concurrency)`。
+- **`limiter`** (*CapacityLimiter | None*)：可选的外部共享 `CapacityLimiter` 实例，用于跨多个任务组共享全局并发预算。
+- **`pool`** (*EventLoopThreadPool | None*)：可选的线程池，用于将派生的子任务调度到多个工作 Loop 上执行，同时完整保留结构化并发保证（级联取消、退出时的排空屏障和异常组聚合）。
+
+#### 方法
 - **`start_soon(coro_fn, *args)` -> `TaskHandle`**：派生子任务并立即返回
   句柄，不阻塞。进入组之前派生的子任务由首次进入纳入追踪。
   - **抛出**：组退出后或从外部 Loop/线程调用时抛 `RuntimeError`（TaskGroup 物理限定于单 Loop）；孤儿任务会被取消并消费其异常。
@@ -760,6 +799,7 @@ async with lock:
 
 > **诊断属性**（`locked`/`owner`/`Semaphore.value`/`qsize`/`Event.is_set`/`TaskHandle.status`）是各自内部锁下的一致快照——彼此之间**不是**原子的，也不能替代并发下的真实 acquire/wait 操作。
 - **`acquire()`**：获取锁，挂起直到空闲。
+- **`try_acquire()` -> `bool`**：非阻塞原子尝试获取锁。获取成功返回 `True`，已被其他任务占用返回 `False`。
 - **`release()`**：释放锁。必须由持有者调用。
 
 ### `Semaphore`
@@ -773,6 +813,7 @@ Semaphore(max_value: int)
 - **`value`** -> `int`：当前可用令牌数。
 - **`max_value`** -> `int`：最大令牌数。
 - **`acquire()`**：获取一个令牌，挂起直到可用。
+- **`try_acquire()` -> `bool`**：非阻塞原子尝试获取一个许可。成功返回 `True`，无可用许可返回 `False`。
 - **`release()`**：归还一个令牌。
 
 ### `CapacityLimiter`
@@ -793,6 +834,7 @@ CapacityLimiter(total_tokens: float)
   请用此方法而不是分别读三个属性——分开读可能混入针对不同总额计算出的
   值。
 - **`acquire()`**：获取一个令牌，挂起直到可用。
+- **`try_acquire()` -> `bool`**：非阻塞原子尝试获取一个令牌。成功返回 `True`，达到容量上限返回 `False`。
 - **`release()`**：归还一个令牌。
 
 ### `Event`
@@ -851,6 +893,8 @@ ctx = AsyncContext(parent: AsyncContext | None = None)
   与已提交的 future。
 - **`ctx.submit(pool, target, *args, **kwargs)`**：向池提交绑定到本上下文
   的任务。
+- **`ctx.task_group(pool=None, name=None, max_concurrency=None)`**：创建与本上下文联动的
+  `TaskGroup`，上下文取消时自动级联取消组内任务。
 - **`ctx.parent`**：父上下文，根上下文为 `None`（只读，构造时固定）。
 - **`ctx.is_cancelled`**：已取消则返回 `True`。
 
@@ -902,65 +946,6 @@ async with rw.reader():
 # Exclusive write access
 async with rw.writer():
     write_data()
-```
-
----
-
-## 网络与 ASGI Worker (Networking & ASGI Workers)
-
-### `ConnectionPinningServer`
-
-把每个入站客户端 TCP 连接钉到特定 Worker 事件循环线程，实现零跨线程
-系统调用开销。
-
-```python
-async with ConnectionPinningServer(pool, host="127.0.0.1", port=8080) as server:
-    await server.start(handler_coro)
-```
-
----
-
-### `MultiloopASGIWorker`
-
-把 FastAPI / Starlette / ASGI 3.0 应用直接挂载到 `EventLoopThreadPool` 上。完整支持 HTTP/1.1 分块流式传输、RFC 6455 全双工 WebSocket 以及 Keep-Alive 长连接复用。
-
-```python
-from fastapi import FastAPI
-from multiloop import EventLoopThreadPool, MultiloopASGIWorker
-
-app = FastAPI()
-
-
-async def main():
-    async with EventLoopThreadPool(num_threads=4) as pool:
-        async with MultiloopASGIWorker(app, pool, port=8000):
-            print("FastAPI (HTTP/1.1, WebSocket) running on multi-threaded multiloop pool...")
-            await asyncio.sleep(3600)
-```
-
----
-
-### `MultiloopWSGIWorker`
-
-把同步 Django / Flask / WSGI 1.0.1 (PEP 3333) 应用挂载到 `EventLoopThreadPool` 上。
-
-```python
-from flask import Flask
-from multiloop import EventLoopThreadPool, MultiloopWSGIWorker
-
-app = Flask(__name__)
-
-
-@app.route("/")
-def index():
-    return "Hello from Flask on multiloop!"
-
-
-async def main():
-    async with EventLoopThreadPool(num_threads=4) as pool:
-        async with MultiloopWSGIWorker(app, pool, port=8000):
-            print("Flask WSGI running on multi-threaded multiloop pool...")
-            await asyncio.sleep(3600)
 ```
 
 ---

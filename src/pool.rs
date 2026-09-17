@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use std::collections::VecDeque;
@@ -7,6 +7,17 @@ use std::sync::Arc;
 
 use crate::metrics::AtomicMetrics;
 use crate::ThreadPoolClosedError;
+
+pub(crate) fn pool_closed_err(py: Python<'_>, msg: &str) -> PyErr {
+    if let Ok(module) = py.import("multiloop.exceptions") {
+        if let Ok(cls) = module.getattr("ThreadPoolClosedError") {
+            if let Ok(err) = cls.call1((msg,)) {
+                return PyErr::from_value(err);
+            }
+        }
+    }
+    ThreadPoolClosedError::new_err(msg.to_string())
+}
 
 /// Bounded capacity of each per-worker local queue.
 const _LOCAL_QUEUE_CAPACITY: usize = 256;
@@ -32,7 +43,7 @@ pub struct NativeWorkerPool {
     buffers: Vec<Mutex<VecDeque<Py<PyAny>>>>,
     is_closed: Arc<AtomicBool>,
     num_polling: AtomicUsize,
-    metrics: Mutex<Option<Py<AtomicMetrics>>>,
+    metrics: RwLock<Option<Py<AtomicMetrics>>>,
 }
 
 #[pymethods]
@@ -59,7 +70,7 @@ impl NativeWorkerPool {
             buffers,
             is_closed: Arc::new(AtomicBool::new(false)),
             num_polling: AtomicUsize::new(0),
-            metrics: Mutex::new(None),
+            metrics: RwLock::new(None),
         }
     }
 
@@ -72,7 +83,7 @@ impl NativeWorkerPool {
     }
 
     pub fn set_metrics(&self, metrics: Py<AtomicMetrics>) {
-        *self.metrics.lock() = Some(metrics);
+        *self.metrics.write() = Some(metrics);
     }
 
     pub fn is_closed(&self) -> bool {
@@ -112,17 +123,17 @@ impl NativeWorkerPool {
         }
         // Fast path: check advisory flag before acquiring lock — Acquire observes close store
         if self.is_closed.load(Ordering::Acquire) {
-            return Err(ThreadPoolClosedError::new_err("Pool is closed"));
+            return Err(pool_closed_err(py, "Pool is closed"));
         }
         let guard = self.global_sender.lock();
         match guard.as_ref() {
             Some(sender) => {
                 sender
                     .send(task)
-                    .map_err(|_| ThreadPoolClosedError::new_err("Pool is closed"))?;
+                    .map_err(|_| pool_closed_err(py, "Pool is closed"))?;
                 Ok(())
             }
-            None => Err(ThreadPoolClosedError::new_err("Pool is closed")),
+            None => Err(pool_closed_err(py, "Pool is closed")),
         }
     }
 
@@ -134,7 +145,7 @@ impl NativeWorkerPool {
         }
         // Fast path: check advisory flag before acquiring lock — Acquire observes close store
         if self.is_closed.load(Ordering::Acquire) {
-            return Err(ThreadPoolClosedError::new_err("Pool is closed"));
+            return Err(pool_closed_err(py, "Pool is closed"));
         }
         let guard = self.local_senders.lock();
         // WHY (R10): close() clears the senders before setting the flag, so
@@ -142,7 +153,7 @@ impl NativeWorkerPool {
         // empty sender list IS the closed state — report it as such instead
         // of the misleading "Worker index out of range".
         if guard.is_empty() {
-            return Err(ThreadPoolClosedError::new_err("Pool is closed"));
+            return Err(pool_closed_err(py, "Pool is closed"));
         }
         if index >= guard.len() {
             return Err(PyRuntimeError::new_err("Worker index out of range"));
@@ -150,7 +161,7 @@ impl NativeWorkerPool {
         match guard[index].try_send(task) {
             Ok(_) => {
                 // Track remote schedule: explicit routing to a specific worker.
-                if let Some(ref metrics) = *self.metrics.lock() {
+                if let Some(ref metrics) = *self.metrics.read() {
                     metrics.borrow(py).inc_remote_schedule(index);
                 }
                 Ok(())
@@ -160,9 +171,7 @@ impl NativeWorkerPool {
                 drop(guard);
                 self.push_global(py, task)
             }
-            Err(flume::TrySendError::Disconnected(_)) => {
-                Err(ThreadPoolClosedError::new_err("Pool is closed"))
-            }
+            Err(flume::TrySendError::Disconnected(_)) => Err(pool_closed_err(py, "Pool is closed")),
         }
     }
 
@@ -210,10 +219,8 @@ impl NativeWorkerPool {
                         }
                     }
                     if pulled > 0 {
-                        if let Some(ref metrics) = *self.metrics.lock() {
-                            for _ in 0..pulled {
-                                metrics.borrow(py).inc_global_pull(index);
-                            }
+                        if let Some(ref metrics) = *self.metrics.read() {
+                            metrics.borrow(py).add_global_pull(index, pulled);
                             let new_depth = self.global_receiver.len();
                             sample_depth(metrics, index, new_depth);
                         }
@@ -239,14 +246,14 @@ impl NativeWorkerPool {
             let local_empty =
                 index >= self.local_receivers.len() || self.local_receivers[index].is_empty();
             if self.global_receiver.is_empty() && buffer_empty && local_empty {
-                return Err(ThreadPoolClosedError::new_err("Pool is closed and drained"));
+                return Err(pool_closed_err(py, "Pool is closed and drained"));
             } else {
                 return Ok(None); // Still draining, yield to let other workers/events run
             }
         }
 
         // Worker idle — increment park count.
-        if let Some(ref metrics) = *self.metrics.lock() {
+        if let Some(ref metrics) = *self.metrics.read() {
             metrics.borrow(py).inc_park(index);
             let depth = self.global_receiver.len();
             sample_depth(metrics, index, depth);

@@ -1,26 +1,23 @@
 pub mod channel;
-pub mod http;
 pub mod metrics;
 pub mod pool;
 pub mod rwlock;
 pub mod waitgroup;
-pub mod websocket;
 
 use pyo3::create_exception;
 use pyo3::prelude::*;
 
-pub use channel::{Channel, RawAsyncChannel};
-pub use http::{FastHttpConnection, FastHttpParser};
+pub use channel::RawAsyncChannel;
 pub use metrics::AtomicMetrics;
 pub use pool::NativeWorkerPool;
 pub use rwlock::RawAsyncRWMutex;
 pub use waitgroup::RawAsyncWaitGroup;
-pub use websocket::{fast_websocket_unmask, fast_websocket_unmask_slice, FastWebSocketParser};
 
+// Raised when submitting tasks to a closed or aborted NativeWorkerPool / EventLoopThreadPool.
 create_exception!(
     _multiloop_core,
     ThreadPoolClosedError,
-    pyo3::exceptions::PyException
+    pyo3::exceptions::PyRuntimeError
 );
 
 #[pymodule]
@@ -31,15 +28,10 @@ fn _multiloop_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add_class::<AtomicMetrics>()?;
     m.add_class::<NativeWorkerPool>()?;
-    m.add_class::<Channel>()?;
     m.add_class::<RawAsyncChannel>()?;
+    m.add("Channel", m.getattr("RawAsyncChannel")?)?;
     m.add_class::<RawAsyncWaitGroup>()?;
     m.add_class::<RawAsyncRWMutex>()?;
-    m.add_class::<FastHttpParser>()?;
-    m.add_class::<FastHttpConnection>()?;
-    m.add_class::<FastWebSocketParser>()?;
-    m.add_function(wrap_pyfunction!(fast_websocket_unmask, m)?)?;
-    m.add_function(wrap_pyfunction!(fast_websocket_unmask_slice, m)?)?;
     Ok(())
 }
 
@@ -47,7 +39,6 @@ fn _multiloop_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use parking_lot::Mutex;
-    use pyo3::types::PyBytes;
     use pyo3::{Py, PyAny, Python};
     use waitgroup::Waiter;
 
@@ -142,9 +133,9 @@ mod tests {
     #[test]
     fn test_channel_try_send_recv() {
         Python::attach(|py| {
-            let ch = Channel::new(0); // unbounded channel
+            let ch = RawAsyncChannel::new(0, None, None); // unbounded channel
             let item: Py<PyAny> = py.None();
-            let send_result = ch.try_send(item);
+            let send_result = ch.try_send(py, item);
             assert!(send_result.is_ok(), "try_send should succeed");
             assert!(send_result.unwrap(), "try_send should return Ok(true)");
             let recv_result = ch.try_recv(py);
@@ -158,8 +149,8 @@ mod tests {
     #[test]
     fn test_channel_close_then_recv() {
         Python::attach(|py| {
-            let ch = Channel::new(0); // unbounded channel
-            ch.close();
+            let ch = RawAsyncChannel::new(0, None, None); // unbounded channel
+            ch.close(py).unwrap();
             // After close, try_recv on an empty channel returns Err.
             let result = ch.try_recv(py);
             assert!(
@@ -237,17 +228,17 @@ mod tests {
     #[test]
     fn test_channel_bounded_full_and_fifo() {
         Python::attach(|py| {
-            let ch = Channel::new(2);
+            let ch = RawAsyncChannel::new(2, None, None);
             assert_eq!(ch.qsize(), 0);
             let item1: Py<PyAny> = pyo3::types::PyInt::new(py, 10).into_any().unbind();
             let item2: Py<PyAny> = pyo3::types::PyInt::new(py, 20).into_any().unbind();
             let item3: Py<PyAny> = pyo3::types::PyInt::new(py, 30).into_any().unbind();
 
-            assert_eq!(ch.try_send(item1).unwrap(), true);
-            assert_eq!(ch.try_send(item2).unwrap(), true);
+            assert_eq!(ch.try_send(py, item1).unwrap(), true);
+            assert_eq!(ch.try_send(py, item2).unwrap(), true);
             assert_eq!(ch.qsize(), 2);
             // Channel is full: try_send returns Ok(false)
-            assert_eq!(ch.try_send(item3).unwrap(), false);
+            assert_eq!(ch.try_send(py, item3).unwrap(), false);
 
             // Receive item 1 (FIFO order: 10)
             let (has1, val1) = ch.try_recv(py).unwrap();
@@ -257,7 +248,7 @@ mod tests {
 
             // Now space is available: send item 3
             let item3_new: Py<PyAny> = pyo3::types::PyInt::new(py, 30).into_any().unbind();
-            assert_eq!(ch.try_send(item3_new).unwrap(), true);
+            assert_eq!(ch.try_send(py, item3_new).unwrap(), true);
 
             // Receive item 2 (20)
             let (has2, val2) = ch.try_recv(py).unwrap();
@@ -280,13 +271,13 @@ mod tests {
     #[test]
     fn test_channel_drain_after_close() {
         Python::attach(|py| {
-            let ch = Channel::new(0);
+            let ch = RawAsyncChannel::new(0, None, None);
             let item1: Py<PyAny> = pyo3::types::PyString::new(py, "first").into_any().unbind();
             let item2: Py<PyAny> = pyo3::types::PyString::new(py, "second").into_any().unbind();
-            ch.try_send(item1).unwrap();
-            ch.try_send(item2).unwrap();
+            ch.try_send(py, item1).unwrap();
+            ch.try_send(py, item2).unwrap();
 
-            ch.close();
+            ch.close(py).unwrap();
             assert!(ch.is_closed());
 
             // After close, items remaining in the channel must drain cleanly
@@ -638,52 +629,5 @@ mod tests {
         results.sort();
         let expected: Vec<i64> = (0..total_items as i64).collect();
         assert_eq!(results, expected);
-    }
-
-    #[test]
-    fn test_fast_http_parser_complete_and_partial() {
-        Python::attach(|py| {
-            // Complete request
-            let req_bytes = b"POST /api/v1/resource?query=test&limit=10 HTTP/1.1\r\nHost: localhost:8000\r\nContent-Length: 5\r\n\r\nhello";
-            let py_req = PyBytes::new(py, req_bytes);
-            let parsed = FastHttpParser::parse_request(py, &py_req).unwrap();
-            assert!(parsed.is_some());
-            let (
-                method,
-                path,
-                raw_path,
-                query,
-                version,
-                headers,
-                body_offset,
-                cl,
-                keep_alive,
-                is_chunked,
-                is_upgrade,
-                _upg_p,
-            ) = parsed.unwrap();
-            assert_eq!(method.to_str().unwrap(), "POST");
-            assert_eq!(path.to_str().unwrap(), "/api/v1/resource");
-            assert_eq!(raw_path.as_bytes(), b"/api/v1/resource");
-            assert_eq!(query.as_bytes(), b"query=test&limit=10");
-            assert_eq!(version.to_str().unwrap(), "1.1");
-            assert_eq!(headers.len(), 2);
-            assert_eq!(cl, 5);
-            assert!(keep_alive);
-            assert!(!is_chunked);
-            assert!(!is_upgrade);
-            assert_eq!(&req_bytes[body_offset..], b"hello");
-
-            // Partial request
-            let partial_bytes = b"GET /incomplete HTTP/1.1\r\nHost: localhost\r\n";
-            let py_partial = PyBytes::new(py, partial_bytes);
-            let partial_parsed = FastHttpParser::parse_request(py, &py_partial).unwrap();
-            assert!(partial_parsed.is_none());
-
-            // Malformed request
-            let malformed = b"INVALID HTTP BUFFER WITHOUT PROPER FORMAT";
-            let py_malformed = PyBytes::new(py, malformed);
-            assert!(FastHttpParser::parse_request(py, &py_malformed).is_err());
-        });
     }
 }

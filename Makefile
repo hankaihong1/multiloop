@@ -16,7 +16,7 @@ test-slow:
 	uv run pytest -m slow -o addopts=""
 
 bench:
-	for f in benchmarks/benchmark_pull_model.py benchmarks/bench_asgi_throughput.py benchmarks/bench_multithread_loops.py; do \
+	for f in benchmarks/benchmark_pull_model.py benchmarks/bench_multithread_loops.py; do \
 		uv run python "$$f"; \
 	done
 

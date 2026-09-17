@@ -8,6 +8,7 @@ from collections.abc import Callable
 from typing import Any, Self
 
 from multiloop._cancel import CancelScope
+from multiloop._taskgroup import TaskGroup
 from multiloop.pool import EventLoopThreadPool
 
 __all__ = ["AsyncContext"]
@@ -32,6 +33,8 @@ class AsyncContext:
         # Track pending futures and their per-task cancel scopes
         self._futures: dict[asyncio.Future[Any], asyncio.AbstractEventLoop | None] = {}
         self._scopes: dict[asyncio.Future[Any], CancelScope] = {}
+        self._task_groups: set[TaskGroup] = set()
+        self._cancel_scope: CancelScope = CancelScope()
 
         if parent is not None:
             parent._add_child(self)
@@ -130,13 +133,20 @@ class AsyncContext:
             children = list(self._children)
             futures = list(self._futures.items())
             scopes = list(self._scopes.values())
+            task_groups = list(self._task_groups)
             self._children.clear()
             self._futures.clear()
             self._scopes.clear()
+            self._task_groups.clear()
 
         # Detach from parent to prevent reference cycle leaks
         if self._parent is not None:
             self._parent._remove_child(self)
+
+        self._cancel_scope.cancel()
+
+        for tg in task_groups:
+            tg.cancel_all()
 
         for child in children:
             child.cancel()
@@ -153,6 +163,33 @@ class AsyncContext:
                         pass
                 else:
                     fut.cancel()
+
+    def task_group(
+        self,
+        pool: EventLoopThreadPool | None = None,
+        name: str | None = None,
+        max_concurrency: int | None = None,
+    ) -> TaskGroup:
+        """Create a :class:`~multiloop.TaskGroup` integrated with this cancellation context.
+
+        The created task group is registered with this context. If this context is cancelled
+        (either explicitly via :meth:`cancel` or implicitly by exiting an ``async with ctx:``
+        block), cancellation automatically cascades across thread boundaries to all child tasks
+        and scopes managed by the task group.
+
+        :param pool: Optional :class:`~multiloop.EventLoopThreadPool` to distribute spawned tasks
+                     across worker event loops with structured concurrency guarantees.
+        :param name: Optional identifier for the task group.
+        :param max_concurrency: Optional positive integer constraining maximum concurrent tasks.
+        :returns: A :class:`~multiloop.TaskGroup` instance linked to this context.
+        """
+        tg = TaskGroup(name=name, max_concurrency=max_concurrency, pool=pool)
+        with self._lock:
+            if self._cancelled:
+                tg.cancel_all()
+            else:
+                self._task_groups.add(tg)
+        return tg
 
     async def __aenter__(self) -> Self:
         """Enter the async context manager."""

@@ -95,6 +95,29 @@ class Lock:
                     self._release_locked()
             raise
 
+    def try_acquire(self) -> bool:
+        """Attempt to acquire the lock immediately without blocking.
+
+        :returns: True if the lock was successfully acquired, False otherwise.
+        :raises RuntimeError: If called by an active task that already owns the lock.
+        """
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            raise RuntimeError("try_acquire() must be called from an active asyncio task") from None
+        if task is None:
+            raise RuntimeError("try_acquire() must be called from an active asyncio task")
+
+        with self._lock:
+            if self._owner is task:
+                raise RuntimeError("Lock is not reentrant: already held by the current task")
+            if self._owner is not None and self._owner.done():
+                self._release_locked()
+            if self._owner is None:
+                self._owner = task
+                return True
+            return False
+
     def release(self) -> None:
         """Release the lock, passing ownership to the next queued FIFO waiter.
 
@@ -225,6 +248,17 @@ class Semaphore:
                     except RuntimeError:
                         continue
                 self._value += 1
+
+    def try_acquire(self) -> bool:
+        """Attempt to acquire a permit immediately without blocking.
+
+        :returns: True if a permit was successfully acquired, False otherwise.
+        """
+        with self._lock:
+            if self._value > 0:
+                self._value -= 1
+                return True
+            return False
 
     def release(self) -> None:
         """Release a permit, waking the first FIFO waiter or restoring available count.
@@ -375,6 +409,17 @@ class CapacityLimiter:
                     except RuntimeError:
                         continue
                 self._borrowed -= 1
+
+    def try_acquire(self) -> bool:
+        """Attempt to borrow one token immediately without blocking.
+
+        :returns: True if a token was acquired, False if capacity has been reached.
+        """
+        with self._lock:
+            if self._borrowed < int(self._total_tokens):
+                self._borrowed += 1
+                return True
+            return False
 
     def release(self) -> None:
         """Release one borrowed token.

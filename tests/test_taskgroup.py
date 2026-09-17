@@ -710,3 +710,148 @@ async def test_taskgroup_cross_loop_rejection() -> None:
 
         assert len(errors) == 1
         assert "physically scoped to a single event loop" in str(errors[0])
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_max_concurrency_throttling() -> None:
+    """TaskGroup(max_concurrency=N) strictly caps concurrent active child coroutines."""
+    active = 0
+    max_active = 0
+
+    async def worker(idx: int) -> int:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return idx
+
+    async with TaskGroup(max_concurrency=3) as tg:
+        handles = [tg.start_soon(worker, i) for i in range(15)]
+
+    assert max_active == 3
+    results = [await h for h in handles]
+    assert results == list(range(15))
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_shared_limiter() -> None:
+    """Multiple TaskGroups can share an external CapacityLimiter."""
+    from multiloop import CapacityLimiter
+
+    shared_limiter = CapacityLimiter(2)
+    active = 0
+    max_active = 0
+
+    async def worker():
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+
+    async def run_group():
+        async with TaskGroup(limiter=shared_limiter) as tg:
+            for _ in range(5):
+                tg.start_soon(worker)
+
+    await asyncio.gather(run_group(), run_group())
+    assert max_active == 2
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_cross_loop_pool_dispatch() -> None:
+    """TaskGroup(pool=pool) dispatches tasks across pool worker loops while enforcing structured concurrency."""
+    from multiloop.pool import EventLoopThreadPool
+
+    async def get_worker_tid(x: int) -> tuple[int, int]:
+        tid = threading.get_ident()
+        await asyncio.sleep(0.01)
+        return x, tid
+
+    async with EventLoopThreadPool(num_threads=4) as pool:
+        async with TaskGroup(pool=pool) as tg:
+            handles = [tg.start_soon(get_worker_tid, i) for i in range(8)]
+
+        results = [await h for h in handles]
+        values = [r[0] for r in results]
+        tids = {r[1] for r in results}
+
+        assert values == list(range(8))
+        assert threading.get_ident() not in tids
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_cross_loop_pool_failure_cascading_cancel() -> None:
+    """TaskGroup(pool=pool) cancels cross-loop sibling tasks when one task fails."""
+    from multiloop.pool import EventLoopThreadPool
+
+    async def fast_fail() -> None:
+        await asyncio.sleep(0.01)
+        raise RuntimeError("cross-loop failure")
+
+    cancelled_slow = False
+
+    async def slow_worker() -> None:
+        nonlocal cancelled_slow
+        try:
+            await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            cancelled_slow = True
+            raise
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        with pytest.raises(RuntimeError, match="cross-loop failure"):
+            async with TaskGroup(pool=pool) as tg:
+                tg.start_soon(fast_fail)
+                tg.start_soon(slow_worker)
+
+        assert cancelled_slow is True
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_cross_loop_start_status() -> None:
+    """TaskGroup(pool=pool).start properly syncs task_status across event loops."""
+    from multiloop.pool import EventLoopThreadPool
+
+    async def init_worker(task_status: TaskStatus, value: int) -> int:
+        await asyncio.sleep(0.01)
+        task_status.started()
+        await asyncio.sleep(0.02)
+        return value * 10
+
+    async with (
+        EventLoopThreadPool(num_threads=2) as pool,
+        TaskGroup(pool=pool) as tg,
+    ):
+        handle = await tg.start(init_worker, 5)
+        assert handle.status in (_TaskStatus.STARTED, _TaskStatus.FINISHED)
+        res = await handle
+        assert res == 50
+
+
+@pytest.mark.asyncio
+async def test_async_context_task_group_integration() -> None:
+    """AsyncContext.task_group creates a TaskGroup tied to the context's cancellation."""
+    from multiloop.context import AsyncContext
+    from multiloop.pool import EventLoopThreadPool
+
+    ctx = AsyncContext()
+    cancelled_task = False
+
+    async def worker() -> None:
+        nonlocal cancelled_task
+        try:
+            await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            cancelled_task = True
+            raise
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        with pytest.raises(asyncio.CancelledError):
+            async with ctx.task_group(pool=pool) as tg:
+                tg.start_soon(worker)
+                await asyncio.sleep(0.05)
+                ctx.cancel()
+
+        assert cancelled_task is True

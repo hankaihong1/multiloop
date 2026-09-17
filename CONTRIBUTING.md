@@ -122,8 +122,6 @@ Performance-sensitive changes should be validated against the benchmark suite:
 ```bash
 uv run python benchmarks/bench_multithread_loops.py
 uv run python benchmarks/benchmark_pull_model.py
-uv run python benchmarks/bench_asgi_throughput.py
-uv run python benchmarks/benchmark_winuvloop.py
 ```
 
 ---

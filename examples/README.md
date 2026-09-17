@@ -11,8 +11,7 @@ uv run python examples/01_channels_select.py  # Channels: send/recv / async for 
 uv run python examples/02_waitgroup_once.py   # Group sync: AsyncWaitGroup / AsyncOnce (incl. exception caching)
 uv run python examples/03_taskgroup_timeout.py# Structured concurrency: TaskGroup / fail_after / move_on_after / CancelScope
 uv run python examples/04_sync_primitives.py  # Sync primitives: Lock / Semaphore / Event / Condition / Barrier
-uv run python examples/05_asgi_websocket.py    # ASGI 3.0: Lifespan management / WebSocket full-duplex communication
-uv run python examples/06_wsgi_flask.py         # WSGI 1.0.1: Synchronous Flask/Django apps on worker pool
+uv run python examples/05_multicore_pipeline.py # Multi-core pipeline: multi-producer multi-consumer with Channel & AsyncWaitGroup
 ```
 
 Each script is self-contained (`async def main()` + `asyncio.run`), depends

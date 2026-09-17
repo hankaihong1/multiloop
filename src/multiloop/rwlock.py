@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -23,6 +24,13 @@ class AsyncRWMutex:
     to a single writer. Built upon Rust ``RawAsyncRWMutex`` (or fallback ``Lock``/``Condition``)
     with writer-preference fairness to eliminate writer starvation under heavy read traffic.
 
+    Concurrency & Python 3.14t (Free-Threaded) Safety:
+    - Reader reentrancy depth (:attr:`_reader_depth`) and current writer task (:attr:`_writer_task`)
+      are synchronized via an internal :class:`threading.Lock` (:attr:`_depth_lock`), guaranteeing
+      race-free operations across multiple OS worker threads without GIL protection.
+    - All waiter wakeups (:func:`_wake_all`) are executed strictly outside of critical locks,
+      preventing waiter callbacks from deadlocking inside lock transitions.
+
     Nesting rules:
     - ``reader()`` is re-entrant for the same task.
     - Upgrades from reader to writer or recursive acquisitions of ``writer()`` raise
@@ -31,6 +39,7 @@ class AsyncRWMutex:
 
     def __init__(self) -> None:
         self._raw = _RawAsyncRWMutex() if _RawAsyncRWMutex is not None else None
+        self._depth_lock = threading.Lock()
         self._reader_depth: dict[asyncio.Task[Any], int] = {}
         self._writer_task: asyncio.Task[Any] | None = None
 
@@ -76,16 +85,22 @@ class AsyncRWMutex:
         if task is None:
             raise RuntimeError("reader() must be used inside an active asyncio task")
 
-        if self._writer_task is task:
-            raise RuntimeError(
-                "AsyncRWMutex: reader() cannot be used while the same task holds writer()"
-            )
+        with self._depth_lock:
+            if self._writer_task is task:
+                raise RuntimeError(
+                    "AsyncRWMutex: reader() cannot be used while the same task holds writer()"
+                )
 
         if self._raw is not None:
-            depth = self._reader_depth.get(task, 0)
-            if depth > 0:
-                self._reader_depth[task] = depth + 1
-            else:
+            with self._depth_lock:
+                depth = self._reader_depth.get(task, 0)
+                if depth > 0:
+                    self._reader_depth[task] = depth + 1
+                    is_reentrant = True
+                else:
+                    is_reentrant = False
+
+            if not is_reentrant:
                 if not self._raw.try_acquire_read():
                     loop = asyncio.get_running_loop()
                     fut = loop.create_future()
@@ -97,16 +112,21 @@ class AsyncRWMutex:
                             if wakers:
                                 _wake_all(wakers)
                             raise
-                self._reader_depth[task] = 1
+                with self._depth_lock:
+                    self._reader_depth[task] = 1
 
             try:
                 yield
             finally:
-                depth = self._reader_depth.get(task, 0)
-                if depth > 1:
-                    self._reader_depth[task] = depth - 1
-                else:
-                    self._reader_depth.pop(task, None)
+                release_raw = False
+                with self._depth_lock:
+                    depth = self._reader_depth.get(task, 0)
+                    if depth > 1:
+                        self._reader_depth[task] = depth - 1
+                    else:
+                        self._reader_depth.pop(task, None)
+                        release_raw = True
+                if release_raw:
                     wakers = self._raw.release_read()
                     if wakers:
                         _wake_all(wakers)
@@ -114,15 +134,18 @@ class AsyncRWMutex:
 
         # Pure Python fallback path
         async with self._lock:
-            if self._writer_task is task:
-                raise RuntimeError(
-                    "AsyncRWMutex: reader() cannot be used while the same task holds writer()"
-                )
-            if task not in self._reader_depth:
+            with self._depth_lock:
+                if self._writer_task is task:
+                    raise RuntimeError(
+                        "AsyncRWMutex: reader() cannot be used while the same task holds writer()"
+                    )
+                already_reader = task in self._reader_depth
+            if not already_reader:
                 while self._fallback_writer or self._fallback_pending_writers > 0:
                     await self._read_ok.wait()
                 self._fallback_readers += 1
-            self._reader_depth[task] = self._reader_depth.get(task, 0) + 1
+            with self._depth_lock:
+                self._reader_depth[task] = self._reader_depth.get(task, 0) + 1
 
         try:
             yield
@@ -135,15 +158,21 @@ class AsyncRWMutex:
                 except asyncio.CancelledError:
                     cancelled = True
             try:
-                depth = self._reader_depth.get(task, 0)
-                if depth > 0:
-                    if depth == 1:
-                        del self._reader_depth[task]
-                        self._fallback_readers -= 1
-                        if self._fallback_readers == 0:
-                            self._write_ok.notify_all()
+                with self._depth_lock:
+                    depth = self._reader_depth.get(task, 0)
+                    if depth > 0:
+                        if depth == 1:
+                            del self._reader_depth[task]
+                            is_last = True
+                        else:
+                            self._reader_depth[task] = depth - 1
+                            is_last = False
                     else:
-                        self._reader_depth[task] = depth - 1
+                        is_last = False
+                if is_last:
+                    self._fallback_readers -= 1
+                    if self._fallback_readers == 0:
+                        self._write_ok.notify_all()
             finally:
                 self._lock.release()
             if cancelled:
@@ -159,12 +188,13 @@ class AsyncRWMutex:
         if task is None:
             raise RuntimeError("writer() must be used inside an active asyncio task")
 
-        if task in self._reader_depth:
-            raise RuntimeError(
-                "AsyncRWMutex: writer() cannot be used while the same task holds reader()"
-            )
-        if self._writer_task is task:
-            raise RuntimeError("AsyncRWMutex: writer() is not reentrant")
+        with self._depth_lock:
+            if task in self._reader_depth:
+                raise RuntimeError(
+                    "AsyncRWMutex: writer() cannot be used while the same task holds reader()"
+                )
+            if self._writer_task is task:
+                raise RuntimeError("AsyncRWMutex: writer() is not reentrant")
 
         if self._raw is not None:
             if not self._raw.try_acquire_write():
@@ -178,12 +208,14 @@ class AsyncRWMutex:
                         if wakers:
                             _wake_all(wakers)
                         raise
-            self._writer_task = task
+            with self._depth_lock:
+                self._writer_task = task
 
             try:
                 yield
             finally:
-                self._writer_task = None
+                with self._depth_lock:
+                    self._writer_task = None
                 wakers = self._raw.release_write()
                 if wakers:
                     _wake_all(wakers)
@@ -191,19 +223,21 @@ class AsyncRWMutex:
 
         # Pure Python fallback path
         async with self._lock:
-            if task in self._reader_depth:
-                raise RuntimeError(
-                    "AsyncRWMutex: writer() cannot be used while the same task holds reader()"
-                )
-            if self._writer_task is task:
-                raise RuntimeError("AsyncRWMutex: writer() is not reentrant")
+            with self._depth_lock:
+                if task in self._reader_depth:
+                    raise RuntimeError(
+                        "AsyncRWMutex: writer() cannot be used while the same task holds reader()"
+                    )
+                if self._writer_task is task:
+                    raise RuntimeError("AsyncRWMutex: writer() is not reentrant")
             self._fallback_pending_writers += 1
             acquired = False
             try:
                 while self._fallback_writer or self._fallback_readers > 0:
                     await self._write_ok.wait()
                 self._fallback_writer = True
-                self._writer_task = task
+                with self._depth_lock:
+                    self._writer_task = task
                 acquired = True
             finally:
                 self._fallback_pending_writers -= 1
@@ -223,7 +257,8 @@ class AsyncRWMutex:
                         cancelled = True
                 try:
                     self._fallback_writer = False
-                    self._writer_task = None
+                    with self._depth_lock:
+                        self._writer_task = None
                     if self._fallback_pending_writers > 0:
                         self._write_ok.notify_all()
                     else:

@@ -1,79 +1,8 @@
-use parking_lot::Mutex;
-use pyo3::exceptions::PyRuntimeError;
+use parking_lot::{Condvar, Mutex};
+use pyo3::exceptions::{PyRuntimeError, PyTimeoutError};
 use pyo3::prelude::*;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-
-#[pyclass(module = "multiloop._multiloop_core")]
-pub struct Channel {
-    sender: flume::Sender<Py<PyAny>>,
-    receiver: flume::Receiver<Py<PyAny>>,
-    is_closed: Arc<AtomicBool>,
-}
-
-#[pymethods]
-impl Channel {
-    #[new]
-    pub fn new(maxsize: usize) -> Self {
-        let (sender, receiver) = if maxsize > 0 {
-            flume::bounded(maxsize)
-        } else {
-            flume::unbounded()
-        };
-        Channel {
-            sender,
-            receiver,
-            is_closed: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub fn close(&self) {
-        self.is_closed.store(true, Ordering::Release);
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.is_closed.load(Ordering::Acquire) || self.sender.is_disconnected()
-    }
-
-    pub fn try_send(&self, item: Py<PyAny>) -> PyResult<bool> {
-        if self.is_closed() {
-            return Err(PyRuntimeError::new_err("Channel is closed"));
-        }
-        match self.sender.try_send(item) {
-            Ok(_) => Ok(true),
-            Err(flume::TrySendError::Full(_)) => Ok(false),
-            Err(flume::TrySendError::Disconnected(_)) => {
-                Err(PyRuntimeError::new_err("Channel is closed"))
-            }
-        }
-    }
-
-    /// Non-blocking receive.
-    ///
-    /// Returns `(has_item, item)`: `has_item` distinguishes "channel empty"
-    /// from "item is None" — PyO3 maps both `Ok(None)` and `Ok(Some(None))`
-    /// to Python `None`, so a bare `Option` return would lose None payloads.
-    pub fn try_recv(&self, _py: Python<'_>) -> PyResult<(bool, Option<Py<PyAny>>)> {
-        match self.receiver.try_recv() {
-            Ok(item) => Ok((true, Some(item))),
-            Err(flume::TryRecvError::Empty) => {
-                if self.is_closed() {
-                    Err(PyRuntimeError::new_err("Channel is closed"))
-                } else {
-                    Ok((false, None))
-                }
-            }
-            Err(flume::TryRecvError::Disconnected) => {
-                Err(PyRuntimeError::new_err("Channel is closed"))
-            }
-        }
-    }
-
-    pub fn qsize(&self) -> usize {
-        self.receiver.len()
-    }
-}
 
 /// A registered async waiter: (event loop, future, optional channel token).
 pub(crate) struct ChannelWaiter {
@@ -89,11 +18,13 @@ pub(crate) struct ChannelState {
     pub(crate) getters: VecDeque<ChannelWaiter>,
     pub(crate) putters: VecDeque<ChannelWaiter>,
     pub(crate) select_watchers: VecDeque<ChannelWaiter>,
+    pub(crate) in_flight_putters: usize,
 }
 
 #[pyclass(module = "multiloop._multiloop_core")]
 pub struct RawAsyncChannel {
     pub(crate) state: Arc<Mutex<ChannelState>>,
+    condvar: Arc<Condvar>,
     wake_fn: Option<Py<PyAny>>,
     select_wake_fn: Option<Py<PyAny>>,
 }
@@ -109,23 +40,34 @@ impl RawAsyncChannel {
         &self,
         py: Python<'_>,
         waiter: &ChannelWaiter,
-        val: Option<&Bound<'_, PyAny>>,
-        is_exc: bool,
+        result: Option<Py<PyAny>>,
+        is_exception: bool,
     ) {
         if let Some(ref w_fn) = self.wake_fn {
             let loop_obj = waiter.event_loop.bind(py);
             let fut = waiter.future.bind(py);
-            let res = match val {
+            let has_val = result.is_some();
+            let is_exc = pyo3::types::PyBool::new(py, is_exception);
+            let _ = match result {
                 Some(v) => loop_obj.call_method1(
                     "call_soon_threadsafe",
-                    (w_fn.bind(py), fut, v, is_exc, true),
+                    (w_fn.bind(py), fut, v.bind(py), is_exc, has_val),
                 ),
                 None => loop_obj.call_method1(
                     "call_soon_threadsafe",
-                    (w_fn.bind(py), fut, py.None(), is_exc, false),
+                    (w_fn.bind(py), fut, py.None(), is_exc, has_val),
                 ),
             };
-            let _ = res;
+        } else {
+            let fut = waiter.future.bind(py);
+            if is_exception {
+                if let Some(exc) = result {
+                    let _ = fut.call_method1("set_exception", (exc,));
+                }
+            } else {
+                let res = result.unwrap_or_else(|| py.None());
+                let _ = fut.call_method1("set_result", (res,));
+            }
         }
     }
 
@@ -133,23 +75,24 @@ impl RawAsyncChannel {
         &self,
         py: Python<'_>,
         watcher: &ChannelWaiter,
-        channel_obj: &Bound<'_, PyAny>,
+        token: Bound<'_, PyAny>,
     ) {
         if let Some(ref sw_fn) = self.select_wake_fn {
             let loop_obj = watcher.event_loop.bind(py);
             let fut = watcher.future.bind(py);
-            let _ =
-                loop_obj.call_method1("call_soon_threadsafe", (sw_fn.bind(py), fut, channel_obj));
+            let _ = loop_obj.call_method1("call_soon_threadsafe", (sw_fn.bind(py), fut, token));
+        } else {
+            let _ = watcher.future.bind(py).call_method1("set_result", (token,));
         }
     }
 
     pub(crate) fn dispatch_wake(&self, py: Python<'_>, target: WakeTarget) {
         match target {
-            WakeTarget::Waiter(w, val, is_exc) => {
-                self.wake_waiter(py, &w, val.as_ref().map(|v| v.bind(py)), is_exc);
+            WakeTarget::Waiter(w, res, is_exc) => {
+                self.wake_waiter(py, &w, res, is_exc);
             }
             WakeTarget::SelectWatcher(w, token) => {
-                self.wake_select_watcher(py, &w, token.bind(py));
+                self.wake_select_watcher(py, &w, token.into_bound(py));
             }
         }
     }
@@ -172,7 +115,9 @@ impl RawAsyncChannel {
                 getters: VecDeque::new(),
                 putters: VecDeque::new(),
                 select_watchers: VecDeque::new(),
+                in_flight_putters: 0,
             })),
+            condvar: Arc::new(Condvar::new()),
             wake_fn,
             select_wake_fn,
         }
@@ -186,6 +131,7 @@ impl RawAsyncChannel {
                 return Ok(());
             }
             guard.is_closed = true;
+            guard.in_flight_putters = 0;
             let closed_exc: Py<PyAny> = PyRuntimeError::new_err("Channel is closed")
                 .into_value(py)
                 .into_any();
@@ -207,6 +153,7 @@ impl RawAsyncChannel {
         for target in to_wake {
             self.dispatch_wake(py, target);
         }
+        self.condvar.notify_all();
         Ok(())
     }
 
@@ -229,7 +176,7 @@ impl RawAsyncChannel {
 
     pub fn full(&self) -> bool {
         let guard = self.state.lock();
-        guard.maxsize > 0 && guard.buffer.len() >= guard.maxsize
+        guard.maxsize > 0 && (guard.buffer.len() + guard.in_flight_putters >= guard.maxsize)
     }
 
     pub fn try_send(&self, py: Python<'_>, item: Py<PyAny>) -> PyResult<bool> {
@@ -242,8 +189,11 @@ impl RawAsyncChannel {
             if let Some(getter) = guard.getters.pop_front() {
                 to_wake.push(WakeTarget::Waiter(getter, Some(item), false));
                 if guard.maxsize > 0 {
-                    while !guard.putters.is_empty() && guard.buffer.len() < guard.maxsize {
+                    while !guard.putters.is_empty()
+                        && (guard.buffer.len() + guard.in_flight_putters) < guard.maxsize
+                    {
                         if let Some(next_putter) = guard.putters.pop_front() {
+                            guard.in_flight_putters += 1;
                             to_wake.push(WakeTarget::Waiter(next_putter, None, false));
                         }
                     }
@@ -257,7 +207,10 @@ impl RawAsyncChannel {
                     .unwrap_or_else(|| py.None());
                 to_wake.push(WakeTarget::SelectWatcher(watcher, token));
             } else {
-                if guard.maxsize > 0 && guard.buffer.len() >= guard.maxsize {
+                if guard.maxsize > 0
+                    && (guard.buffer.len() + guard.in_flight_putters >= guard.maxsize
+                        || !guard.putters.is_empty())
+                {
                     return Ok(false);
                 }
                 guard.buffer.push_back(item);
@@ -266,6 +219,7 @@ impl RawAsyncChannel {
         for target in to_wake {
             self.dispatch_wake(py, target);
         }
+        self.condvar.notify_all();
         Ok(true)
     }
 
@@ -276,6 +230,7 @@ impl RawAsyncChannel {
             if let Some(item) = guard.buffer.pop_front() {
                 if guard.maxsize > 0 {
                     if let Some(putter) = guard.putters.pop_front() {
+                        guard.in_flight_putters += 1;
                         to_wake = Some(WakeTarget::Waiter(putter, None, false));
                     }
                 }
@@ -289,7 +244,118 @@ impl RawAsyncChannel {
         if let Some(target) = to_wake {
             self.dispatch_wake(py, target);
         }
+        if res.as_ref().is_ok_and(|r| r.0) {
+            self.condvar.notify_all();
+        }
         res
+    }
+
+    /// Synchronously send an item into the channel from a worker or background OS thread.
+    ///
+    /// Blocks the current thread using `parking_lot::Condvar` without busy-waiting.
+    /// Automatically detaches from Python via `py.detach()` during condvar waits so other
+    /// threads can run uninterrupted.
+    #[pyo3(signature = (item, timeout = None))]
+    pub fn send_sync(&self, py: Python<'_>, item: Py<PyAny>, timeout: Option<f64>) -> PyResult<()> {
+        let deadline = timeout
+            .map(|t| std::time::Instant::now() + std::time::Duration::from_secs_f64(t.max(0.0)));
+        let state = self.state.clone();
+        let condvar = self.condvar.clone();
+        loop {
+            if self.try_send(py, item.clone_ref(py))? {
+                return Ok(());
+            }
+            let is_closed = self.state.lock().is_closed;
+            if is_closed {
+                return Err(PyRuntimeError::new_err("Channel is closed"));
+            }
+            let state_clone = state.clone();
+            let condvar_clone = condvar.clone();
+            let timed_out = py.detach(move || {
+                let mut guard = state_clone.lock();
+                if guard.is_closed {
+                    return false;
+                }
+                if guard.maxsize == 0
+                    || (guard.buffer.len() + guard.in_flight_putters < guard.maxsize
+                        && guard.putters.is_empty())
+                {
+                    return false;
+                }
+                if let Some(dl) = deadline {
+                    let now = std::time::Instant::now();
+                    if now >= dl {
+                        true
+                    } else {
+                        condvar_clone.wait_for(&mut guard, dl - now).timed_out()
+                    }
+                } else {
+                    condvar_clone.wait(&mut guard);
+                    false
+                }
+            });
+            if timed_out {
+                let guard = self.state.lock();
+                if guard.maxsize > 0
+                    && (guard.buffer.len() + guard.in_flight_putters >= guard.maxsize
+                        || !guard.putters.is_empty())
+                {
+                    return Err(PyTimeoutError::new_err("send_sync timed out"));
+                }
+            }
+        }
+    }
+
+    /// Synchronously receive an item from the channel from a worker or background OS thread.
+    ///
+    /// Blocks the current thread using `parking_lot::Condvar` without busy-waiting.
+    /// Automatically detaches from Python via `py.detach()` during condvar waits so other
+    /// threads can run uninterrupted.
+    #[pyo3(signature = (timeout = None))]
+    pub fn recv_sync(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Py<PyAny>> {
+        let deadline = timeout
+            .map(|t| std::time::Instant::now() + std::time::Duration::from_secs_f64(t.max(0.0)));
+        let state = self.state.clone();
+        let condvar = self.condvar.clone();
+        loop {
+            let (has_item, item_opt) = self.try_recv(py)?;
+            if has_item {
+                if let Some(item) = item_opt {
+                    return Ok(item);
+                }
+            }
+            {
+                let guard = self.state.lock();
+                if guard.is_closed && guard.buffer.is_empty() {
+                    return Err(PyRuntimeError::new_err("Channel is closed"));
+                }
+            }
+            let state_clone = state.clone();
+            let condvar_clone = condvar.clone();
+            let timed_out = py.detach(move || {
+                let mut guard = state_clone.lock();
+                if guard.is_closed || !guard.buffer.is_empty() {
+                    return false;
+                }
+                if let Some(dl) = deadline {
+                    let now = std::time::Instant::now();
+                    if now >= dl {
+                        true
+                    } else {
+                        condvar_clone.wait_for(&mut guard, dl - now).timed_out()
+                    }
+                } else {
+                    condvar_clone.wait(&mut guard);
+                    false
+                }
+            });
+            if timed_out {
+                let guard = self.state.lock();
+                if guard.buffer.is_empty() {
+                    return Err(PyTimeoutError::new_err("recv_sync timed out"));
+                }
+            }
+        }
     }
 
     pub fn register_getter(
@@ -305,6 +371,7 @@ impl RawAsyncChannel {
                 let item = guard.buffer.pop_front().unwrap();
                 if guard.maxsize > 0 {
                     if let Some(putter) = guard.putters.pop_front() {
+                        guard.in_flight_putters += 1;
                         to_wake = Some(WakeTarget::Waiter(putter, None, false));
                     }
                 }
@@ -327,29 +394,46 @@ impl RawAsyncChannel {
     }
 
     pub fn unregister_getter(&self, py: Python<'_>, fut: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let mut to_wake = None;
+        let mut to_wake = Vec::new();
+        let target_ptr = fut.as_ptr();
         let removed = {
             let mut guard = self.state.lock();
-            let before = guard.getters.len();
-            guard.getters.retain(|g| !g.future.bind(py).is(fut));
-            let removed = guard.getters.len() != before;
+            let removed = if let Some(pos) = guard
+                .getters
+                .iter()
+                .position(|g| g.future.as_ptr() == target_ptr)
+            {
+                guard.getters.remove(pos);
+                true
+            } else {
+                false
+            };
             if !removed && !guard.buffer.is_empty() {
                 if let Some(next_getter) = guard.getters.pop_front() {
                     let item = guard.buffer.pop_front().unwrap();
-                    to_wake = Some(WakeTarget::Waiter(next_getter, Some(item), false));
+                    to_wake.push(WakeTarget::Waiter(next_getter, Some(item), false));
+                    if guard.maxsize > 0 {
+                        if let Some(putter) = guard.putters.pop_front() {
+                            guard.in_flight_putters += 1;
+                            to_wake.push(WakeTarget::Waiter(putter, None, false));
+                        }
+                    }
                 } else if let Some(watcher) = guard.select_watchers.pop_front() {
                     let token = watcher
                         .channel_token
                         .as_ref()
                         .map(|t| t.clone_ref(py))
                         .unwrap_or_else(|| py.None());
-                    to_wake = Some(WakeTarget::SelectWatcher(watcher, token));
+                    to_wake.push(WakeTarget::SelectWatcher(watcher, token));
                 }
             }
             removed
         };
-        if let Some(target) = to_wake {
+        for target in to_wake {
             self.dispatch_wake(py, target);
+        }
+        if removed {
+            self.condvar.notify_all();
         }
         Ok(removed)
     }
@@ -364,7 +448,10 @@ impl RawAsyncChannel {
         if guard.is_closed {
             return Err(PyRuntimeError::new_err("Channel is closed"));
         }
-        if guard.putters.is_empty() && (guard.maxsize == 0 || guard.buffer.len() < guard.maxsize) {
+        if guard.putters.is_empty()
+            && (guard.maxsize == 0
+                || (guard.buffer.len() + guard.in_flight_putters) < guard.maxsize)
+        {
             return Ok(true);
         }
         guard.putters.push_back(ChannelWaiter {
@@ -377,14 +464,30 @@ impl RawAsyncChannel {
 
     pub fn unregister_putter(&self, py: Python<'_>, fut: &Bound<'_, PyAny>) -> PyResult<bool> {
         let mut to_wake = None;
+        let target_ptr = fut.as_ptr();
         let removed = {
             let mut guard = self.state.lock();
-            let before = guard.putters.len();
-            guard.putters.retain(|p| !p.future.bind(py).is(fut));
-            let removed = guard.putters.len() != before;
-            if !removed && (guard.maxsize == 0 || guard.buffer.len() < guard.maxsize) {
-                if let Some(next_putter) = guard.putters.pop_front() {
-                    to_wake = Some(WakeTarget::Waiter(next_putter, None, false));
+            let removed = if let Some(pos) = guard
+                .putters
+                .iter()
+                .position(|p| p.future.as_ptr() == target_ptr)
+            {
+                guard.putters.remove(pos);
+                true
+            } else {
+                false
+            };
+            if !removed {
+                if guard.in_flight_putters > 0 {
+                    guard.in_flight_putters -= 1;
+                }
+                if guard.maxsize == 0
+                    || (guard.buffer.len() + guard.in_flight_putters) < guard.maxsize
+                {
+                    if let Some(next_putter) = guard.putters.pop_front() {
+                        guard.in_flight_putters += 1;
+                        to_wake = Some(WakeTarget::Waiter(next_putter, None, false));
+                    }
                 }
             }
             removed
@@ -392,7 +495,51 @@ impl RawAsyncChannel {
         if let Some(target) = to_wake {
             self.dispatch_wake(py, target);
         }
+        if removed {
+            self.condvar.notify_all();
+        }
         Ok(removed)
+    }
+
+    pub fn claim_put(&self, py: Python<'_>, item: Py<PyAny>) -> PyResult<bool> {
+        let mut to_wake = Vec::new();
+        {
+            let mut guard = self.state.lock();
+            if guard.is_closed {
+                return Err(PyRuntimeError::new_err("Channel is closed"));
+            }
+            if guard.in_flight_putters > 0 {
+                guard.in_flight_putters -= 1;
+            }
+            if let Some(getter) = guard.getters.pop_front() {
+                to_wake.push(WakeTarget::Waiter(getter, Some(item), false));
+                if guard.maxsize > 0 {
+                    while !guard.putters.is_empty()
+                        && (guard.buffer.len() + guard.in_flight_putters) < guard.maxsize
+                    {
+                        if let Some(next_putter) = guard.putters.pop_front() {
+                            guard.in_flight_putters += 1;
+                            to_wake.push(WakeTarget::Waiter(next_putter, None, false));
+                        }
+                    }
+                }
+            } else if let Some(watcher) = guard.select_watchers.pop_front() {
+                guard.buffer.push_back(item);
+                let token = watcher
+                    .channel_token
+                    .as_ref()
+                    .map(|t| t.clone_ref(py))
+                    .unwrap_or_else(|| py.None());
+                to_wake.push(WakeTarget::SelectWatcher(watcher, token));
+            } else {
+                guard.buffer.push_back(item);
+            }
+        }
+        for target in to_wake {
+            self.dispatch_wake(py, target);
+        }
+        self.condvar.notify_all();
+        Ok(true)
     }
 
     pub fn register_select_watcher(
@@ -417,11 +564,19 @@ impl RawAsyncChannel {
         Ok(true)
     }
 
-    pub fn unregister_select_watcher(&self, py: Python<'_>, fut: &Bound<'_, PyAny>) -> bool {
+    pub fn unregister_select_watcher(&self, _py: Python<'_>, fut: &Bound<'_, PyAny>) -> bool {
         let mut guard = self.state.lock();
-        let before = guard.select_watchers.len();
-        guard.select_watchers.retain(|w| !w.future.bind(py).is(fut));
-        guard.select_watchers.len() != before
+        let target_ptr = fut.as_ptr();
+        if let Some(pos) = guard
+            .select_watchers
+            .iter()
+            .position(|w| w.future.as_ptr() == target_ptr)
+        {
+            guard.select_watchers.remove(pos);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn forward_select_wakeup(&self, py: Python<'_>) {
