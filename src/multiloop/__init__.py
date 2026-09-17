@@ -7,7 +7,7 @@ built around a Rust core. Key capabilities:
 - Channel and select_channel for Go-style communication
 - CancelScope and TaskGroup for structured concurrency
 - AsyncContext, AsyncWaitGroup, AsyncOnce, AsyncRWMutex primitives
-- ASGI worker (MultiloopASGIWorker) for FastAPI-style servers
+- Comprehensive synchronization primitives (Lock, Semaphore, Condition, Barrier, CapacityLimiter)
 
 Docs: https://github.com/hankaihong1/multiloop (docs/API.md, docs/sphinx_html/).
 """
@@ -34,7 +34,6 @@ from multiloop._sync import (
     Semaphore,
 )
 from multiloop._taskgroup import TaskGroup, TaskHandle, TaskStatus
-from multiloop.asgi import MultiloopASGIWorker
 from multiloop.context import AsyncContext
 from multiloop.exceptions import (
     ChannelClosedError,
@@ -52,13 +51,13 @@ from multiloop.primitives import (
     AsyncOnce,
     AsyncWaitGroup,
     Channel,
+    ReceiveChannel,
+    SendChannel,
     select_channel,
 )
 from multiloop.rwlock import AsyncRWMutex
-from multiloop.server import ConnectionPinningServer
-from multiloop.wsgi import MultiloopWSGIWorker
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 
 async def run_in_pool(coro: Any, *args: Any, num_threads: int = 0, **kwargs: Any) -> Any:
@@ -91,15 +90,14 @@ __all__ = [
     "Channel",
     "ChannelClosedError",
     "Condition",
-    "ConnectionPinningServer",
     "Event",
     "EventLoopThreadPool",
     "Lock",
-    "MultiloopASGIWorker",
     "MultiloopError",
-    "MultiloopWSGIWorker",
     "PoolOptions",
+    "ReceiveChannel",
     "Semaphore",
+    "SendChannel",
     "TaskGroup",
     "TaskHandle",
     "TaskStatus",

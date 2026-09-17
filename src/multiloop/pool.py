@@ -6,8 +6,9 @@ import asyncio
 import contextvars
 import os
 import threading
+import time
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any, Protocol, Self
 
 from multiloop._cancel import CancelScope
@@ -24,9 +25,7 @@ __all__ = [
 
 _logger = get_logger("pool")
 
-_WORKER_POLL_INTERVAL = 0.05  # Dispatcher wait_for timeout while idle (s)
-_MAX_DRAIN_ITERATIONS = 50  # Max drain polls (~5 s) before force-stopping loops
-_DRAIN_GRACE_PERIOD = 0.05  # Initial grace before first drain active==0 check (s)
+_DEFAULT_DRAIN_TIMEOUT = 2.5  # Default maximum drain wait (s) before force-stopping loops
 
 
 def _safe_complete(
@@ -74,7 +73,6 @@ class _WorkerPoolProtocol(Protocol):
 NativeWorkerPool: type[_WorkerPoolProtocol] | None = _try_import_rust_class(
     "multiloop._multiloop_core", "NativeWorkerPool"
 )
-_RustPoolClosedError = _try_import_rust_class("multiloop._multiloop_core", "ThreadPoolClosedError")
 
 
 class EventLoopThreadPool:
@@ -115,6 +113,7 @@ class EventLoopThreadPool:
         self._loops: list[asyncio.AbstractEventLoop] = []
         self._notify_events: list[asyncio.Event] = []
         self._lock = threading.Lock()
+        self._drain_barrier = threading.Condition(self._lock)
         self._running = False
         self._started = False
         self._index = 0
@@ -155,6 +154,36 @@ class EventLoopThreadPool:
         with self._lock:
             return self._metrics_collector.get_snapshot(self._running)
 
+    def _is_drained_locked(self) -> bool:
+        """Return True if all tasks across outstanding futures, metrics, and queues are drained.
+
+        Must be called while holding self._lock.
+        """
+        if len(self._outstanding) > 0:
+            return False
+        if self._metrics_collector.is_enabled:
+            active = sum(self._metrics_collector.get_active(i) for i in range(self.num_threads))
+            if active > 0:
+                return False
+        if self._native_pool is not None and hasattr(self._native_pool, "is_drained"):
+            return bool(self._native_pool.is_drained())
+        return True
+
+    def _wait_drained_sync(self, timeout: float | None) -> bool:
+        """Synchronously wait for the pool to drain all tasks via condition variable.
+
+        Called in a separate thread via asyncio.to_thread to avoid blocking event loops.
+        """
+        effective_timeout = timeout if timeout is not None else _DEFAULT_DRAIN_TIMEOUT
+        deadline = time.monotonic() + effective_timeout
+        with self._drain_barrier:
+            while not self._is_drained_locked():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._drain_barrier.wait(timeout=remaining)
+            return True
+
     async def _run_task_wrapper(self, worker_idx: int, task_func: Callable[[], Any]) -> None:
         """Execute a task pulled from the queue while tracking active metrics."""
         self._metrics_collector.inc_active(worker_idx)
@@ -162,6 +191,9 @@ class EventLoopThreadPool:
             await task_func()
         finally:
             self._metrics_collector.dec_active(worker_idx)
+            with self._lock:
+                if not self._running and self._is_drained_locked():
+                    self._drain_barrier.notify_all()
 
     async def _worker_dispatcher(self, index: int, notify_event: asyncio.Event) -> None:
         """Worker dispatch loop executing 3-source drain and event-driven task consumption."""
@@ -189,9 +221,7 @@ class EventLoopThreadPool:
                     else:
                         break
                 except Exception as exc:  # noqa: BLE001
-                    if (
-                        _RustPoolClosedError is not None and isinstance(exc, _RustPoolClosedError)
-                    ) or (isinstance(exc, ThreadPoolClosedError)):
+                    if isinstance(exc, ThreadPoolClosedError):
                         return
                     if self._native_pool.is_closed():
                         return
@@ -217,9 +247,7 @@ class EventLoopThreadPool:
                 with self._lock:
                     self._idle_workers.add(index)
                 try:
-                    await asyncio.wait_for(notify_event.wait(), timeout=_WORKER_POLL_INTERVAL)
-                except TimeoutError:
-                    pass
+                    await notify_event.wait()
                 except asyncio.CancelledError:
                     break
                 finally:
@@ -307,13 +335,40 @@ class EventLoopThreadPool:
         except RuntimeError:
             pass
 
+    def _notify_next_worker(self) -> None:
+        """Wake up an idle worker or round-robin to the next worker for global work."""
+        with self._lock:
+            if not self._running or not self._loops:
+                return
+            if self._idle_workers:
+                target_idx = next(iter(self._idle_workers))
+            else:
+                target_idx = self._index
+                self._index = (target_idx + 1) % len(self._loops)
+
+        self._notify_worker(target_idx)
+
+    def _notify_all_workers(self) -> None:
+        """Trigger instant Pipe/EventFD wakeup on all worker event loops."""
+        with self._lock:
+            pairs = list(zip(self._loops, self._notify_events, strict=False))
+
+        for loop, event in pairs:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                pass
+
     async def close(self, timeout: float | None = None) -> None:
         """Gracefully shut down the thread pool and release all resources.
 
-        Drains active tasks, stops each worker event loop, and joins threads.
-        Safe to call multiple times (idempotent).
+        Sets the closed state, wakes all worker dispatchers, and waits on an internal
+        condition variable barrier (:attr:`_drain_barrier`) for all active and queued
+        tasks across all worker event loops to cleanly drain before stopping worker
+        event loops and joining threads. Safe to call multiple times (idempotent).
 
-        :param timeout: Maximum seconds to wait for active tasks to drain.
+        :param timeout: Maximum seconds to wait for active and queued tasks to drain
+                        (defaults to 5.0 seconds if None).
         """
         with self._lock:
             if not self._running:
@@ -322,31 +377,22 @@ class EventLoopThreadPool:
             self._running = False
             loops = list(self._loops)
             threads = list(self._threads)
-            self._loops.clear()
-            self._threads.clear()
 
         if self._native_pool:
             self._native_pool.close()
 
-        await asyncio.sleep(_DRAIN_GRACE_PERIOD)
-        drain_iterations = (
-            max(1, int(timeout / 0.05)) if timeout is not None else _MAX_DRAIN_ITERATIONS
-        )
-        for _ in range(drain_iterations):
-            with self._lock:
-                outstanding_count = len(self._outstanding)
-            if self._metrics_collector.is_enabled:
-                active = sum(self._metrics_collector.get_active(i) for i in range(self.num_threads))
-            else:
-                active = 0
-            is_drained = (
-                self._native_pool.is_drained()
-                if self._native_pool and hasattr(self._native_pool, "is_drained")
-                else True
-            )
-            if active == 0 and is_drained and outstanding_count == 0:
-                break
-            await asyncio.sleep(0.05)
+        # Wake up all workers to ensure idling workers start draining
+        self._notify_all_workers()
+
+        # Wait for all active & queued tasks to drain via condition variable barrier
+        with self._lock:
+            already_drained = self._is_drained_locked()
+
+        if not already_drained:
+            try:
+                await asyncio.to_thread(self._wait_drained_sync, timeout)
+            except Exception:  # noqa: BLE001, S110
+                pass
 
         for loop in loops:
             try:
@@ -361,6 +407,8 @@ class EventLoopThreadPool:
                 pass
 
         with self._lock:
+            self._loops.clear()
+            self._threads.clear()
             leftover = list(self._outstanding)
             self._outstanding.clear()
         close_exc = ThreadPoolClosedError("Pool closed before task ran")
@@ -471,7 +519,7 @@ class EventLoopThreadPool:
 
     def submit(
         self,
-        target: Callable[..., Any],
+        target: Callable[..., Any] | Any,
         *args: Any,
         pin_to: asyncio.AbstractEventLoop | int | None = None,
         cancel_scope: CancelScope | None = None,
@@ -557,6 +605,8 @@ class EventLoopThreadPool:
             finally:
                 with self._lock:
                     self._outstanding.discard(fut)
+                    if not self._running and self._is_drained_locked():
+                        self._drain_barrier.notify_all()
 
         setattr(_execute_task, "_multiloop_ctx", contextvars.copy_context())  # noqa: B010
 
@@ -568,7 +618,7 @@ class EventLoopThreadPool:
                 except Exception as exc:  # noqa: BLE001
                     with self._lock:
                         self._outstanding.discard(fut)
-                    if _RustPoolClosedError is not None and isinstance(exc, _RustPoolClosedError):
+                    if isinstance(exc, ThreadPoolClosedError):
                         raise ThreadPoolClosedError("ThreadPool is closed") from exc
                     raise
                 self._notify_worker(target_idx)
@@ -579,29 +629,26 @@ class EventLoopThreadPool:
                 except Exception as exc:  # noqa: BLE001
                     with self._lock:
                         self._outstanding.discard(fut)
-                    if _RustPoolClosedError is not None and isinstance(exc, _RustPoolClosedError):
+                    if isinstance(exc, ThreadPoolClosedError):
                         raise ThreadPoolClosedError("ThreadPool is closed") from exc
                     raise
-
-            event: asyncio.Event | None = None
-            loop: asyncio.AbstractEventLoop | None = None
-            with self._lock:
-                if self._loops and self._running:
-                    if self._idle_workers:
-                        idx = next(iter(self._idle_workers))
-                    else:
-                        idx = self._index
-                        self._index = (idx + 1) % len(self._loops)
-                    loop = self._loops[idx]
-                    event = self._notify_events[idx]
-
-            if loop is not None and event is not None:
-                try:
-                    loop.call_soon_threadsafe(event.set)
-                except RuntimeError:
-                    pass
+            self._notify_next_worker()
 
         return fut
+
+    def submit_many(
+        self,
+        targets: Iterable[Callable[..., Any] | Any],
+        cancel_scope: CancelScope | None = None,
+    ) -> list[asyncio.Future[Any]]:
+        """Submit a batch of tasks to the thread pool for distributed execution.
+
+        :param targets: An iterable of coroutine objects, coroutine functions, or callables.
+        :param cancel_scope: Optional :class:`CancelScope` tracking task cancellation across the batch.
+        :returns: A list of :class:`asyncio.Future` instances corresponding to each submitted task.
+        :raises ThreadPoolClosedError: If submitted to an unstarted or closed pool.
+        """
+        return [self.submit(target, cancel_scope=cancel_scope) for target in targets]
 
 
 async def create_pool(

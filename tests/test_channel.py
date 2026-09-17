@@ -1052,3 +1052,112 @@ async def test_channel_alias_and_basic_operation() -> None:
     assert ch.empty()
     ch.close()
     assert ch.is_closed
+
+
+@pytest.mark.asyncio
+async def test_channel_split_send_receive_views() -> None:
+    """Ensure Channel.split() produces isolated SendChannel and ReceiveChannel views."""
+    ch = Channel(maxsize=3)
+    tx, rx = ch.split()
+
+    assert repr(tx) == "<SendChannel is_closed=False>"
+    assert repr(rx) == "<ReceiveChannel is_closed=False>"
+
+    assert tx.maxsize == 3
+    assert rx.empty()
+    assert not tx.full()
+
+    # Send through tx
+    await tx.send("item1")
+    assert tx.try_send("item2") is True
+    tx.send_sync("item3")
+
+    assert tx.full()
+    assert rx.qsize() == 3
+
+    # Receive through rx
+    assert rx.try_recv() == "item1"
+    assert await rx.recv() == "item2"
+    assert await rx.recv() == "item3"
+
+    # Test context manager on tx and rx
+    async with tx:
+        await tx.send("item4")
+
+    assert rx.try_recv() == "item4"
+    assert tx.is_closed
+    assert rx.is_closed
+
+
+@pytest.mark.asyncio
+async def test_channel_anti_barging_fifo() -> None:
+    """Ensure unqueued senders cannot barge in ahead of queued putters in a bounded channel."""
+    ch = Channel(maxsize=1)
+    await ch.send("initial")
+
+    # Launch a background sender that blocks because channel is full
+    sent_order: list[str] = []
+
+    async def putter1() -> None:
+        await ch.send("p1")
+        sent_order.append("p1")
+
+    task1 = asyncio.create_task(putter1())
+    await asyncio.sleep(0.01)  # Ensure task1 reaches the wait state
+
+    # A receiver consumes 'initial'
+    val = ch.try_recv()
+    assert val == "initial"
+
+    # At this moment, p1 was queued before any barger.
+    # An unqueued sender tries to barge in immediately:
+    barge_succeeded = ch.try_send("barger")
+    # Anti-barging invariant: barger MUST NOT be allowed to barge ahead of queued p1!
+    assert not barge_succeeded, "Barger was allowed to steal slot from queued putter!"
+
+    await task1
+    assert await ch.recv() == "p1"
+
+
+@pytest.mark.asyncio
+async def test_channel_recv_sync_from_thread() -> None:
+    """Ensure recv_sync reliably receives items on a worker thread with Condvar blocking."""
+    ch = Channel(maxsize=4)
+    received = []
+
+    def consumer_thread() -> None:
+        for _ in range(5):
+            received.append(ch.recv_sync(timeout=2.0))
+
+    thread = threading.Thread(target=consumer_thread)
+    thread.start()
+
+    for i in range(5):
+        await asyncio.sleep(0.01)
+        await ch.send(f"msg_{i}")
+
+    thread.join(timeout=3.0)
+    assert received == [f"msg_{i}" for i in range(5)]
+
+
+def test_channel_sync_timeout_and_closed() -> None:
+    """Ensure send_sync and recv_sync timeout and handle channel close correctly."""
+    ch = Channel(maxsize=1)
+    ch.send_sync("first", timeout=1.0)
+
+    # Channel full, send_sync times out
+    with pytest.raises(TimeoutError):
+        ch.send_sync("second", timeout=0.05)
+
+    assert ch.recv_sync(timeout=1.0) == "first"
+
+    # Channel empty, recv_sync times out
+    with pytest.raises(TimeoutError):
+        ch.recv_sync(timeout=0.05)
+
+    ch.close()
+    with pytest.raises(ChannelClosedError):
+        ch.send_sync("blocked")
+
+    with pytest.raises(ChannelClosedError):
+        ch.recv_sync()

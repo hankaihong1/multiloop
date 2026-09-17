@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-09-17
+
+### Added & Optimized
+- **Cross-Loop Structured Concurrency (`TaskGroup` & `AsyncContext`)**:
+  - `TaskGroup(pool=...)` multi-loop task distribution with isolated per-task child `CancelScope` instances.
+  - Remote drain barrier on context exit, bidirectional cascading cancellation, and unified `ExceptionGroup` aggregation.
+  - Unified `AsyncContext.task_group(pool=...)` lifecycle tracking and automatic cascading cancellation.
+- **Native Synchronous Channel Communication (`Channel.send_sync` & `Channel.recv_sync`)**:
+  - Replaced busy-spin polling with native `parking_lot::Condvar` wait/notify in `RawAsyncChannel`.
+  - Releases the Python GIL via `py.detach()` during blocking waits, eliminating CPU waste.
+  - Added `ReceiveChannel.recv_sync(timeout=None)` to segregation views.
+- **Concurrency & Free-Threaded (Python 3.14t) Hardening**:
+  - `AsyncRWMutex`: Protected reentrancy depth and writer task with `self._depth_lock = threading.Lock()`, with out-of-lock `_wake_all()` execution to eliminate deadlocks.
+  - `EventLoopThreadPool`: Implemented condition-variable drain barrier `self._drain_barrier` and event-driven worker dispatcher.
+  - `AtomicMetrics`: Added `add_global_pull` batch counter accumulation and upgraded pool metrics to `RwLock`.
+  - `_channel_base.py`: Enforced $O(1)$ waiter unregistration via `OrderedDict.pop()`.
+  - `AsyncWaitGroup`: Removed GC finalizer `self._wg.done()` invocation in `_TrackedCoroutine.__del__` to prevent cross-thread re-entrancy and deadlocks under multi-threaded GC.
+  - Standardized cross-language `ThreadPoolClosedError` exception hierarchy.
+
 ## [0.1.2] - 2026-08-21
 
 ### Added & Optimized

@@ -38,9 +38,6 @@
 | 长循环里定期检查取消 | `checkpoint()` | 同步代码里查取消点 |
 | 查当前最紧的截止时间 | `current_effective_deadline()` | shield 会截断外部 deadline |
 | 跨线程级联取消/超时广播 | `AsyncContext` | 树状传播取消到所有相关任务 |
-| 跑 ASGI 服务（FastAPI、Starlette、WebSocket） | `MultiloopASGIWorker` | 支持 Lifespan 与 WebSocket 的多事件循环 ASGI 3.0 Worker |
-| 跑同步 WSGI 服务（Django、Flask、PEP 3333） | `MultiloopWSGIWorker` | 线程池同步执行并通过无锁通道流式回传 |
-| 长连接钉在固定 worker | `ConnectionPinningServer` | 连接亲和性，状态不迁移 |
 | 记日志 / 调日志级别 | `get_logger()` / `set_log_level()` | 统一日志出口 |
 
 ---

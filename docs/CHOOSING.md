@@ -40,9 +40,6 @@
 | Periodically check cancellation in a long loop | `checkpoint()` | Cancellation checkpoint inside sync code |
 | Query the tightest effective deadline | `current_effective_deadline()` | Shield truncates outer deadlines |
 | Cross-thread cascading cancellation / timeout broadcast | `AsyncContext` | Tree-propagated cancellation |
-| Run an ASGI service (FastAPI, Starlette, WebSockets) | `MultiloopASGIWorker` | Multi-event-loop ASGI 3.0 worker with Lifespan & WebSocket support |
-| Run a synchronous WSGI service (Django, Flask, PEP 3333) | `MultiloopWSGIWorker` | Synchronous runner with lock-free channel response streaming |
-| Pin long-lived connections to a fixed worker | `ConnectionPinningServer` | Connection affinity, state never migrates |
 | Logging / adjust log level | `get_logger()` / `set_log_level()` | Unified logging outlet |
 
 ---

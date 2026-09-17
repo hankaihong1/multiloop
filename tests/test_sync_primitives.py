@@ -40,6 +40,23 @@ async def test_semaphore_acquire_release():
 
 
 @pytest.mark.asyncio
+async def test_semaphore_try_acquire():
+    """try_acquire() decrements value if >0 and returns False when empty."""
+    sem = Semaphore(2)
+    assert sem.try_acquire() is True
+    assert sem.value == 1
+    assert sem.try_acquire() is True
+    assert sem.value == 0
+    assert sem.try_acquire() is False
+    assert sem.value == 0
+
+    sem.release()
+    assert sem.value == 1
+    assert sem.try_acquire() is True
+    assert sem.value == 0
+
+
+@pytest.mark.asyncio
 async def test_semaphore_cancel_acquire():
     """Cancelling a waiting acquire does not leak the token."""
     sem = Semaphore(1)
@@ -160,6 +177,23 @@ async def test_capacity_limiter_acquire_release():
 
     limiter.release()
     assert limiter.available_tokens == 1.0
+
+
+@pytest.mark.asyncio
+async def test_capacity_limiter_try_acquire():
+    """try_acquire() borrows a token if under capacity, returns False when full."""
+    limiter = CapacityLimiter(2.0)
+    assert limiter.try_acquire() is True
+    assert limiter.borrowed_tokens == 1.0
+    assert limiter.try_acquire() is True
+    assert limiter.borrowed_tokens == 2.0
+    assert limiter.try_acquire() is False
+    assert limiter.borrowed_tokens == 2.0
+
+    limiter.release()
+    assert limiter.borrowed_tokens == 1.0
+    assert limiter.try_acquire() is True
+    assert limiter.borrowed_tokens == 2.0
 
 
 @pytest.mark.asyncio
@@ -671,13 +705,23 @@ async def test_async_wait_group_track_unawaited_leak_protection() -> None:
     # Counter must be 0, so wait() returns immediately
     await asyncio.wait_for(wg.wait(), timeout=0.1)
 
-    # Case 2: tracked coroutine discarded and garbage collected
-    def discard_tracked() -> None:
-        _ = wg.track(sample_coro())
+    # Case 2: tracked coroutine discarded without being awaited emits RuntimeWarning on GC
+    wg2 = AsyncWaitGroup()
+    with pytest.warns(
+        RuntimeWarning, match="Tracked coroutine was never awaited; AsyncWaitGroup counter leaked"
+    ):
 
-    discard_tracked()
-    gc.collect()
-    await asyncio.wait_for(wg.wait(), timeout=0.1)
+        def discard_tracked() -> None:
+            _ = wg2.track(sample_coro())
+
+        discard_tracked()
+        gc.collect()
+
+    # Counter remains 1 because GC does not invoke state machine mutators in __del__
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(wg2.wait(), timeout=0.05)
+    wg2.done()
+    await asyncio.wait_for(wg2.wait(), timeout=0.05)
 
     # Case 3: tracked coroutine awaited normally
     tracked_normal = wg.track(sample_coro())

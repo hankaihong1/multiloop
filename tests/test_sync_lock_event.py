@@ -31,6 +31,30 @@ async def test_lock_acquire_release():
 
 
 @pytest.mark.asyncio
+async def test_lock_try_acquire():
+    """try_acquire() succeeds when unheld and fails when held."""
+    lock = Lock()
+    assert lock.try_acquire() is True
+    assert lock.locked
+    assert lock.owner is asyncio.current_task()
+
+    # Reentrant attempt raises RuntimeError
+    with pytest.raises(RuntimeError, match="Lock is not reentrant"):
+        lock.try_acquire()
+
+    # Another task cannot acquire
+    async def other_task():
+        return lock.try_acquire()
+
+    assert await asyncio.create_task(other_task()) is False
+
+    lock.release()
+    assert not lock.locked
+    assert lock.try_acquire() is True
+    lock.release()
+
+
+@pytest.mark.asyncio
 async def test_lock_async_context_manager():
     """Lock works as an async context manager."""
     lock = Lock()

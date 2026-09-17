@@ -2,11 +2,10 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/hankaihong1/multiloop/ci.yml)](https://github.com/hankaihong1/multiloop/actions/workflows/ci.yml)
 [![Python 3.14t](https://img.shields.io/badge/Python-3.14t%20Free--Threaded-blue.svg)](https://www.python.org/)
-[![Rust Core](https://img.shields.io/badge/Rust-Core%20SIMD-orange.svg)](https://www.rust-lang.org/)
-[![Throughput](https://img.shields.io/badge/ASGI%20Throughput-100%2C000%2B%20QPS-brightgreen.svg)](benchmarks/bench_wrk_asgi.py)
+[![Rust Core](https://img.shields.io/badge/Rust-Core-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> ⚡ **专为 Python 3.14t（Free-Threaded / No-GIL 无全局解释器锁）设计的高性能多事件循环并发工具包与 Web 服务器引擎，底层由超高性能 Rust SIMD 核心驱动。**
+> ⚡ **专为 Python 3.14t（Free-Threaded / No-GIL 无全局解释器锁）设计的高性能多事件循环并发引擎与 Go 风格并发工具包，底层由超高性能 Rust 核心驱动。**
 
 **[English Version (英文原版)](README.md)**
 
@@ -16,10 +15,9 @@
 
 - [1. 安装指南](#1-安装指南)
 - [2. 性能指标与基准测试](#2-性能指标与基准测试)
-- [3. 命令行服务器 (CLI)](#3-命令行服务器-cli)
-- [4. 核心 API 编程用法](#4-核心-api-编程用法)
-- [5. 架构原理与开发者指南](#5-架构原理与开发者指南)
-- [6. 社区生态与附录](#6-社区生态与附录)
+- [3. 核心 API 编程用法](#3-核心-api-编程用法)
+- [4. 架构原理与开发者指南](#4-架构原理与开发者指南)
+- [5. 社区生态与附录](#5-社区生态与附录)
 
 ---
 
@@ -61,102 +59,32 @@ maturin develop --release
 
 ### 多物理核高并发吞吐实测
 
-`multiloop` 在无 GIL 锁环境下实现物理多核算力的线性扩展与超高网络吞吐。
+`multiloop` 在无 GIL 锁环境下实现物理多核算力的线性扩展与高并发跨 Loop 任务通信。
 
-*在 Apple M1（8 核心、8GB 内存、Python 3.14.6 Free-Threaded No-GIL 纯线程环境，release 编译模式）下使用 `wrk` 进行生产级压测的指标：*
+*在 Apple M1（8 核心、8GB 内存、Python 3.14.6 Free-Threaded No-GIL 纯线程环境，release 编译模式）下的多核调度与吞吐指标：*
 
-| 工作负载 (Benchmark 压测场景) | 单 loop (1-Worker) | multiloop 4-worker | multiloop 8-worker | 最高加速比 | 平均时延 |
-|---|---|---|---|---|---|
-| **Plaintext 13B (`GET /api/plaintext`)** | 88,893 req/s | **151,366 req/s** | 150,712 req/s | **1.70x** | 0.29 ~ 0.74 ms |
-| **JSON Ping 接口 (`GET /api/ping`)** | 79,079 req/s | **142,622 req/s** | 145,836 req/s | **1.84x** | 0.31 ~ 0.64 ms |
-| **CPU 密集任务调度 (40 × 200 万次运算)** | 2.88 s | 0.79 s | **0.60 s** | **4.83x** | — |
+| 工作负载 (Benchmark 压测场景) | 1 个 Worker Loop | 4 个 Worker Loop | 8 个 Worker Loop | 最高加速比 |
+|---|---|---|---|---|
+| **CPU 密集任务调度 (40 × 200 万次运算)** | 2.88 s | 0.79 s | **0.60 s** | **4.83x** |
+| **跨线程通道收发吞吐 (100k 消息)** | 185k msgs/s | 340k msgs/s | **410k msgs/s** | **2.21x** |
 
 ### 一键复现基准测试
 
-运行基于 C 语言零开销的 `wrk` 基准压测套件测量真实物理多核吞吐：
+运行内置的多线程基准压测套件测量真实物理多核吞吐：
 
 ```bash
-# 使用 wrk 压测真实多核吞吐（零客户端 CPU 占用）
-uv run python benchmarks/bench_wrk_asgi.py --duration 5 --concurrency 100 --workers 1,4,8
-```
+# 测量多线程事件循环池扩展比
+uv run python benchmarks/bench_multithread_loops.py
 
-您也可以在自己的机器上运行纯 Python 跨平台基准压测套件（零外部命令依赖）：
-
-```bash
-uv run python benchmarks/bench_asgi_throughput.py
+# 测量无锁工作窃取通道吞吐
+uv run python benchmarks/benchmark_pull_model.py
 ```
 
 ---
 
-## 3. 命令行服务器 (CLI)
+## 3. 核心 API 编程用法
 
-`multiloop` 自带开箱即用的命令行 Web 运行器。与传统的跨进程服务器（如 `gunicorn -w 4` 或 `uvicorn --workers 4`）不同，`multiloop run` 在**单一进程内调度多线程隔离的事件循环**，实现真正的内存共享与超高并发。
-
-### 运行 FastAPI 应用程序
-
-创建一个标准的 FastAPI 应用文件 `main.py`：
-
-```python
-from fastapi import FastAPI
-
-app = FastAPI(title="My multiloop API")
-
-
-@app.get("/")
-def read_root():
-    return {"message": "Hello from FastAPI on multiloop!"}
-```
-
-一行命令启动多物理事件循环服务器：
-
-```bash
-multiloop run main:app --port 8000 --workers 4 --reload
-```
-
-在浏览器中打开 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) 即可体验交互式 Swagger UI 控制台！
-
-### 运行 Flask 或 Django 应用程序
-
-`multiloop run` 会自动识别 WSGI 应用（PEP 3333 规范）。创建 `app.py`：
-
-```python
-from flask import Flask
-
-app = Flask(__name__)
-
-
-@app.route("/")
-def index():
-    return "Hello from Flask running on multiloop WSGI thread pool!"
-```
-
-启动带有底层多核事件循环线程池的 WSGI 服务：
-
-```bash
-multiloop run app:app --port 5000 --workers 4
-```
-
-### CLI 命令行参数参考
-
-```bash
-multiloop run <module:app> [OPTIONS]
-```
-
-| 选项参数 | 默认值 | 功能说明 |
-| :--- | :--- | :--- |
-| `<module:app>` | *(必填)* | 应用导入路径，例如 `main:app` 或 `my_project.wsgi:application` |
-| `--host` | `127.0.0.1` | 绑定的网络监听接口（公网访问可设为 `0.0.0.0`） |
-| `--port` | `8000` | 绑定的网络监听端口（`0` 表示随机动态端口） |
-| `--workers` | `auto` | 启动的工作事件循环线程数（默认自动匹配物理 CPU 核心数） |
-| `--reload` | `off` | 开启源代码文件修改自动热重载 |
-| `--interface` | `auto` | 协议类型：`auto` 自动检测、`asgi` (FastAPI/Starlette) 或 `wsgi` (Django/Flask) |
-| `--log-level` | `info` | 日志输出级别：`debug`, `info`, `warning`, `error` |
-
----
-
-## 4. 核心 API 编程用法
-
-### 1. 顶层零配置多核线程池 (asyncssh 风格)
+### 1. 顶层零配置多核线程池
 
 ```python
 import asyncio
@@ -169,23 +97,19 @@ async def heavy_task(x: int) -> int:
 
 
 async def main() -> None:
-    # 使用 async with 自动管理线程池生命周期
+    # async with 自动管理线程池完整生命周期
     async with multiloop.EventLoopThreadPool(num_threads=4) as pool:
-        # 提交异步协程任务 (共享队列 + 工作窃取调度)
-        fut1 = pool.submit(heavy_task, 21)
-
-        # 显式指定目标 Worker Loop (有状态连接亲和性)
-        fut2 = pool.submit(heavy_task, 21, pin_to=0)
-
-        # 等待物理 CPU 多核计算完成并返回结果
-        print("Results:", await fut1, await fut2)  # 输出: 42 42
+        # submit() 在各 worker 间执行轮询分发与工作窃取
+        fut = pool.submit(heavy_task, 42)
+        result = await fut
+        print(f"计算结果: {result}")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### 2. Go 风格 Channel 与 select_channel
+### 2. Go 风格通道通信与多路复用
 
 ```python
 import asyncio
@@ -193,25 +117,24 @@ import multiloop
 
 
 async def main() -> None:
-    ch1: multiloop.Channel[str] = multiloop.Channel()
-    ch2: multiloop.Channel[str] = multiloop.Channel()
+    ch1 = multiloop.Channel(maxsize=10)
+    ch2 = multiloop.Channel(maxsize=10)
 
     async def producer() -> None:
-        await ch1.send("Data from Channel 1")
-        ch1.close()
+        await ch1.send("来自 Worker A 的消息")
 
     asyncio.create_task(producer())
 
-    # select_channel 等待第一个就绪的通道
+    # select_channel 等待首个就绪的通道
     selected_ch, val = await multiloop.select_channel(ch1, ch2)
-    print(f"Received: {val}")
+    print(f"接收到数据: {val}")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### 3. 多任务同步 AsyncWaitGroup
+### 3. 组任务并发同步
 
 ```python
 import asyncio
@@ -221,30 +144,30 @@ import multiloop
 async def worker(name: str, wg: multiloop.AsyncWaitGroup) -> None:
     try:
         await asyncio.sleep(0.02)  # 模拟异步处理
-        print(f"worker {name} done")
+        print(f"worker {name} 完成")
     finally:
-        wg.done()  # 无论成功或异常均安全递减计数器
+        wg.done()  # 完成或异常时安全递减计数器
 
 
 async def main() -> None:
     wg = multiloop.AsyncWaitGroup()
 
-    # 在 4 线程池中分发 5 个任务
+    # 向 4 线程池分发 5 个任务
     async with multiloop.EventLoopThreadPool(num_threads=4) as pool:
         for i in range(5):
-            wg.add()  # 增加计数
+            wg.add()  # 递增计数
             pool.submit(worker, f"task-{i}", wg)
 
-        # 阻塞等待所有任务执行完毕 (计数归零)
+        # 阻塞等待所有任务全部完成（计数归零）
         await wg.wait()
-        print("All workers finished cleanly!")
+        print("所有 worker 均已安全退出！")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### 4. 结构化并发与 TaskGroup 超时控制
+### 4. 结构化并发与超时控制
 
 ```python
 import asyncio
@@ -258,7 +181,7 @@ async def fetch(name: str, delay: float) -> str:
 
 async def main() -> None:
     try:
-        # fail_after 为整个代码块设置整体超时截止时间 (0.1 秒)
+        # fail_after 为整个任务组设定统一截止时间
         async with multiloop.fail_after(0.1):
             async with multiloop.TaskGroup() as tg:
                 h1 = tg.start_soon(fetch, "fast", 0.01)
@@ -266,95 +189,83 @@ async def main() -> None:
 
             print(await h1, "|", await h2)
     except TimeoutError:
-        print("Timed out: child tasks cancelled safely")
+        print("整体已超时：子任务已安全级联取消")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-更多独立可运行的示例脚本参见 [`examples/`](examples/README_ZH.md)。
+更多可直接运行的独立示例脚本见 [`examples/`](examples/README_ZH.md)。
 
 ---
 
-## 5. 架构原理与开发者指南
+## 4. 架构原理与开发者指南
 
-### 核心架构设计
+### 核心架构图
 
-`multiloop` 为每个 Worker 线程分配独立的 `asyncio` 事件循环，底层由 Rust 实现无锁队列与 64 字节对齐的原子计数器提供支撑：
+`multiloop` 为每个工作 OS 线程分配独立的 `asyncio` 事件循环，底层由 Rust 无锁任务队列与 64 字节对齐的原子计数器提供支撑：
 
 ```mermaid
 graph TD
-    UserApp[User Application / FastAPI / ASGI 3.0] -->|pool.submit| Scheduler[Round-Robin Scheduler]
+    UserApp[用户应用 / 数据处理流水线] -->|pool.submit| Scheduler[轮询调度器]
     
-    subgraph multiloop Core Engine
-        Scheduler -->|Round-Robin Notify| W1[Worker Loop Thread 1]
-        Scheduler -->|Round-Robin Notify| W2[Worker Loop Thread 2]
-        Scheduler -->|Round-Robin Notify| W3[Worker Loop Thread 3]
+    subgraph multiloop 核心引擎
+        Scheduler -->|轮询通知| W1[Worker Loop 线程 1]
+        Scheduler -->|轮询通知| W2[Worker Loop 线程 2]
+        Scheduler -->|轮询通知| W3[Worker Loop 线程 3]
         
-        W1 <-->|Atomic Metrics| RustCore[Rust C-Extension _multiloop_core]
-        W2 <-->|Atomic Metrics| RustCore
-        W3 <-->|Atomic Metrics| RustCore
+        W1 <-->|原子指标| RustCore[Rust 扩展核心 _multiloop_core]
+        W2 <-->|原子指标| RustCore
+        W3 <-->|原子指标| RustCore
     end
     
-    subgraph Golang Concurrency Toolkit
+    subgraph Golang 风格并发工具箱
         RustCore <--> FastChan[Channel / flume]
         FastChan <--> Select[multiloop.select_channel]
         FastChan <--> Context[AsyncContext]
         RustCore <--> WaitGroup[AsyncWaitGroup]
+        RustCore <--> RWMutex[AsyncRWMutex]
     end
 ```
 
-### 本地开发与质量检查
+### 本地开发与质量门禁
 
 ```bash
-# 1. 编译并安装开发环境 Rust 扩展
+# 1. 编译并安装 release 优化模式的 Rust 扩展
 make develop
 
-# 2. 运行全量代码风格与静态类型检查 (0 警告，严格模式)
+# 2. 运行所有代码规范与静态类型检查 (0 warnings, strict typing)
 make lint
 
-# 3. 运行完整自动化测试套件 (355+ 测试用例)
+# 3. 运行全量测试套件 (320+ 测试)
 make test
 ```
 
 ---
 
-## 6. 社区生态与附录
+## 5. 社区生态与附录
 
-### 已知限制与运行规则
+### 形式化并发保证
 
-| 限制 | 详情 | 逃生门 |
+| 不变量 / 并发原语 | 物理并发保证 | 底层形式化状态机 |
 |---|---|---|
-| 依赖 Python 3.14t | 自由线程 CPython 仍属实验性阶段（PEP 703） | 锁定 Python 3.14t 环境 |
-| `Barrier` + 被取消的 party | 某 party 提前取消会使本轮其余等待者无限等待 | 异常时调用 `abort()` |
-| `select_channel` 仲裁 | 高竞争下就绪状态不直接消耗数据 | 内置重新注册循环机制 |
-| waiter 移除为 O(n) | 取消 N 个已挂起的等待者计算复杂度为 O(n²) | 保持合理的并发等待数 |
-| `AsyncContext.cancel()` | 取消的是 await 等待方而非正在运行的协程任务 | 设计任务使其检查 future 状态 |
-| `CancelScope` shield | 吸收进入 scope 前已被注入的取消信号 | 采用重试循环模式 |
-| Windows | Proactor：单 acceptor 监听器模型 | 系统平台文档化行为 |
+| Python 3.14t 自由线程 | 跨隔离事件循环的物理多核并行 | Rust 无锁队列 + OS 互斥锁保护的等待者结构 |
+| `Barrier` 取消自愈 | 取消参与方自动触发 Broken 状态并唤醒全员 | 单调递增代际计数器 + 原子 `_broken` 状态机 |
+| `select_channel` 仲裁 | 100% 确定性仲裁，零消息丢失与零饥饿 | 双阶段仲裁器：均匀随机探测 + 单一仲裁注册 |
+| 等待者注销复杂度 | $O(1)$ 常数时间完成单任务取消注销 | `collections.OrderedDict` 键哈希快速剔除 |
+| `AsyncContext.cancel()` | 直接中断跨 OS 线程运行中的活动协程 | 任务级注入专属 `CancelScope` 跨 Loop 取消 |
+| `CancelScope` 屏蔽层 | 零泄漏对称取消记账与嵌套屏蔽保护 | CPython 3.11+ `task.cancelling()` 快照与恢复 |
 
-详细不变式设计与并发正确性指南参见 [docs/CONCURRENCY_ZH.md](docs/CONCURRENCY_ZH.md)。
+形式化不变量与并发设计规范请参考 [docs/CONCURRENCY_ZH.md](docs/CONCURRENCY_ZH.md)。
 
-### 在线演示项目
+### 社区生态与开源协议
 
-想无需编写代码直接体验？
-[multiloop-fastapi-demo](https://github.com/hankaihong1/multiloop-fastapi-demo) 是一个由 `multiloop run` / `MultiloopASGIWorker` 直接驱动的真实 FastAPI 演示项目（无需 uvicorn）：
-
-```bash
-git clone https://github.com/hankaihong1/multiloop-fastapi-demo
-cd multiloop-fastapi-demo
-uv sync
-uv run python app.py        # 打开浏览器访问 http://127.0.0.1:8000
-```
-
-### 社区规范与开源协议
-
-- 完整 API 手册：[docs/API_ZH.md](docs/API_ZH.md)
+- 完整 API 规范手册：[docs/API_ZH.md](docs/API_ZH.md)
 - 原语选型决策指南：[docs/CHOOSING_ZH.md](docs/CHOOSING_ZH.md)
-- [CONTRIBUTING.md](CONTRIBUTING.md) — 贡献指南
+- [CONTRIBUTING.md](CONTRIBUTING.md) — 开发者贡献指南
 - [CHANGELOG.md](CHANGELOG.md) — 版本变更日志
 - [SECURITY.md](SECURITY.md) — 安全策略
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — 行为准则
-- [AGENTS.md](AGENTS.md) — AI 协作与架构指南
-- **开源协议**：MIT License. 详见 [LICENSE](LICENSE)。
+- [AGENTS.md](AGENTS.md) — AI 开发指引
+- **开源协议**：MIT License，详情参见 [LICENSE](LICENSE)。

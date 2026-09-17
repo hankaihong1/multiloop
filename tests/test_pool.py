@@ -913,3 +913,45 @@ async def test_pool_abort_unstepped_coroutine_cleanup() -> None:
 
     runtime_warnings = [w for w in recorded_warnings if issubclass(w.category, RuntimeWarning)]
     assert not runtime_warnings, f"Unexpected warnings: {runtime_warnings}"
+
+
+@pytest.mark.asyncio
+async def test_pool_submit_many_basic():
+    """submit_many correctly dispatches an iterable of tasks across worker threads."""
+    async with EventLoopThreadPool(num_threads=4) as pool:
+
+        async def worker(idx: int) -> int:
+            await asyncio.sleep(0.01)
+            return idx * 2
+
+        futs = pool.submit_many([worker(i) for i in range(20)])
+        assert len(futs) == 20
+        results = await asyncio.gather(*futs)
+        assert results == [i * 2 for i in range(20)]
+
+
+@pytest.mark.asyncio
+async def test_pool_submit_many_empty():
+    """submit_many with empty iterable returns empty list immediately."""
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        futs = pool.submit_many([])
+        assert futs == []
+
+
+def test_atomic_metrics_add_global_pull():
+    from multiloop._metrics import AtomicMetrics
+
+    if AtomicMetrics is None:
+        pytest.skip("AtomicMetrics not available")
+    m = AtomicMetrics(2)
+    assert m.get_global_pull(0) == 0
+    m.inc_global_pull(0)
+    assert m.get_global_pull(0) == 1
+    m.add_global_pull(0, 15)
+    assert m.get_global_pull(0) == 16
+    assert m.get_global_pull(1) == 0
+    m.add_global_pull(1, 42)
+    assert m.get_global_pull(1) == 42
+    # out of bounds should be safe (no-op)
+    m.add_global_pull(99, 10)
+    assert m.get_global_pull(99) == 0

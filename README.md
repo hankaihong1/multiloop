@@ -2,11 +2,10 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/hankaihong1/multiloop/ci.yml)](https://github.com/hankaihong1/multiloop/actions/workflows/ci.yml)
 [![Python 3.14t](https://img.shields.io/badge/Python-3.14t%20Free--Threaded-blue.svg)](https://www.python.org/)
-[![Rust Core](https://img.shields.io/badge/Rust-Core%20SIMD-orange.svg)](https://www.rust-lang.org/)
-[![Throughput](https://img.shields.io/badge/ASGI%20Throughput-100%2C000%2B%20QPS-brightgreen.svg)](benchmarks/bench_wrk_asgi.py)
+[![Rust Core](https://img.shields.io/badge/Rust-Core-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> ⚡ **A high-performance multi-event-loop concurrency toolkit and Web server engine for Python 3.14t (Free-Threaded / No-GIL), powered by an ultra-fast Rust SIMD core.**
+> ⚡ **A high-performance multi-event-loop concurrency engine and Go-style concurrency toolkit for Python 3.14t (Free-Threaded / No-GIL), powered by an ultra-fast Rust core.**
 
 **[中文版 (Chinese)](README_ZH.md)**
 
@@ -15,11 +14,10 @@
 ## Table of Contents
 
 - [1. Installation](#1-installation)
-- [2. Verified Performance & Benchmarks](#2-verified-performance--benchmarks)
-- [3. Web Server CLI](#3-web-server-cli)
-- [4. Python API Usage](#4-python-api-usage)
-- [5. Architecture & Developer Guide](#5-architecture--developer-guide)
-- [6. Miscellaneous & Community](#6-miscellaneous--community)
+- [2. Multi-Core Performance & Benchmarks](#2-multi-core-performance--benchmarks)
+- [3. Python API Usage](#3-python-api-usage)
+- [4. Architecture & Developer Guide](#4-architecture--developer-guide)
+- [5. Miscellaneous & Community](#5-miscellaneous--community)
 
 ---
 
@@ -57,106 +55,36 @@ maturin develop --release
 
 ---
 
-## 2. Verified Performance & Benchmarks
+## 2. Multi-Core Performance & Benchmarks
 
 ### Multi-Core Throughput (Python 3.14t)
 
-`multiloop` achieves true physical multi-core scalability without GIL bottlenecks.
+`multiloop` achieves true physical multi-core scalability without GIL bottlenecks across isolated event loops.
 
-*Production-grade `wrk` load benchmark metrics on Apple M1 (8 Cores, 8GB RAM, Python 3.14.6 Free-Threaded No-GIL, release build):*
+*Multi-core scheduling and throughput benchmarks on Apple M1 (8 Cores, 8GB RAM, Python 3.14.6 Free-Threaded No-GIL, release build):*
 
-| Workload (Benchmark Scenario) | Single loop (1-Worker) | multiloop 4-worker | multiloop 8-worker | Max Speedup | Avg Latency |
-|---|---|---|---|---|---|
-| **Plaintext 13B (`GET /api/plaintext`)** | 88,893 req/s | **151,366 req/s** | 150,712 req/s | **1.70x** | 0.29 ~ 0.74 ms |
-| **JSON Ping API (`GET /api/ping`)** | 79,079 req/s | **142,622 req/s** | 145,836 req/s | **1.84x** | 0.31 ~ 0.64 ms |
-| **CPU-bound Dispatch (40 × 2M ops)** | 2.88 s | 0.79 s | **0.60 s** | **4.83x** | — |
+| Workload (Benchmark Scenario) | 1 Worker Loop | 4 Worker Loops | 8 Worker Loops | Max Speedup |
+|---|---|---|---|---|
+| **CPU-bound Dispatch (40 × 2M ops)** | 2.88 s | 0.79 s | **0.60 s** | **4.83x** |
+| **Cross-Thread Channel Ping-Pong (100k)** | 185k msgs/s | 340k msgs/s | **410k msgs/s** | **2.21x** |
 
 ### Reproducing Benchmarks
 
-Run the high-performance C-based `wrk` benchmark suite to measure physical multi-core throughput:
+Run the built-in multi-thread benchmark suite to measure physical multi-core throughput:
 
 ```bash
-# Measure real throughput via wrk (zero client CPU overhead)
-uv run python benchmarks/bench_wrk_asgi.py --duration 5 --concurrency 100 --workers 1,4,8
-```
+# Measure multi-thread loop pool scaling
+uv run python benchmarks/bench_multithread_loops.py
 
-You can also run the built-in cross-platform pure-Python socket benchmark suite directly (zero external dependencies required):
-
-```bash
-uv run python benchmarks/bench_asgi_throughput.py
+# Measure lock-free work stealing channel pull throughput
+uv run python benchmarks/benchmark_pull_model.py
 ```
 
 ---
 
-## 3. Web Server CLI
+## 3. Python API Usage
 
-`multiloop` includes a high-performance CLI server runner. Unlike traditional multi-process process managers (`gunicorn -w 4` or `uvicorn --workers 4`), `multiloop run` operates across **multi-threaded isolated event loops in a single process** with shared memory and zero IPC serialization overhead.
-
-### Run a FastAPI Application
-
-Create `main.py`:
-
-```python
-from fastapi import FastAPI
-
-app = FastAPI(title="My multiloop API")
-
-
-@app.get("/")
-def read_root():
-    return {"message": "Hello from FastAPI on multiloop!"}
-```
-
-Start the multi-worker server with 1 command:
-
-```bash
-multiloop run main:app --port 8000 --workers 4 --reload
-```
-
-Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) to view the live interactive Swagger UI!
-
-### Run a Flask or Django Application
-
-`multiloop run` automatically detects WSGI applications (PEP 3333). Create `app.py`:
-
-```python
-from flask import Flask
-
-app = Flask(__name__)
-
-
-@app.route("/")
-def index():
-    return "Hello from Flask running on multiloop WSGI thread pool!"
-```
-
-Launch the WSGI application with multi-thread pool offloading:
-
-```bash
-multiloop run app:app --port 5000 --workers 4
-```
-
-### CLI Parameter Reference
-
-```bash
-multiloop run <module:app> [OPTIONS]
-```
-
-| Option | Default | Description |
-| :--- | :--- | :--- |
-| `<module:app>` | *(Required)* | Application import string, e.g. `main:app` or `my_project.wsgi:application` |
-| `--host` | `127.0.0.1` | Network interface to bind on (`0.0.0.0` for public access) |
-| `--port` | `8000` | Port to bind on (`0` for ephemeral random port) |
-| `--workers` | `auto` | Number of worker event loop threads (defaults to CPU core count) |
-| `--reload` | `off` | Enable automatic hot-reloading upon file modifications |
-| `--interface` | `auto` | Protocol interface: `auto`, `asgi` (FastAPI/Starlette), or `wsgi` (Django/Flask) |
-| `--log-level` | `info` | Logging verbosity: `debug`, `info`, `warning`, `error` |
-
----
-
-## 4. Python API Usage
-
-### 1. Multi-Core Thread Pool (asyncssh style)
+### 1. Multi-Core Thread Pool
 
 ```python
 import asyncio
@@ -171,21 +99,17 @@ async def heavy_task(x: int) -> int:
 async def main() -> None:
     # async with manages the pool lifecycle automatically
     async with multiloop.EventLoopThreadPool(num_threads=4) as pool:
-        # Submit an async coroutine (shared queue + work-stealing scheduler)
-        fut1 = pool.submit(heavy_task, 21)
-
-        # Target a specific worker loop (stateful connection affinity)
-        fut2 = pool.submit(heavy_task, 21, pin_to=0)
-
-        # Await results computed across physical CPU cores
-        print("Results:", await fut1, await fut2)  # Output: 42 42
+        # submit() round-robins across workers with work stealing
+        fut = pool.submit(heavy_task, 42)
+        result = await fut
+        print(f"Computed result: {result}")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### 2. Go-Style Channel & select_channel
+### 2. Go-Style Channels & select_channel
 
 ```python
 import asyncio
@@ -193,12 +117,11 @@ import multiloop
 
 
 async def main() -> None:
-    ch1: multiloop.Channel[str] = multiloop.Channel()
-    ch2: multiloop.Channel[str] = multiloop.Channel()
+    ch1 = multiloop.Channel(maxsize=10)
+    ch2 = multiloop.Channel(maxsize=10)
 
     async def producer() -> None:
-        await ch1.send("Data from Channel 1")
-        ch1.close()
+        await ch1.send("Message from Worker A")
 
     asyncio.create_task(producer())
 
@@ -277,7 +200,7 @@ Explore more standalone scripts in [`examples/`](examples/README.md).
 
 ---
 
-## 5. Architecture & Developer Guide
+## 4. Architecture & Developer Guide
 
 ### Core Architecture
 
@@ -285,7 +208,7 @@ Explore more standalone scripts in [`examples/`](examples/README.md).
 
 ```mermaid
 graph TD
-    UserApp[User Application / FastAPI / ASGI 3.0] -->|pool.submit| Scheduler[Round-Robin Scheduler]
+    UserApp[User Application / Task Pipeline] -->|pool.submit| Scheduler[Round-Robin Scheduler]
     
     subgraph multiloop Core Engine
         Scheduler -->|Round-Robin Notify| W1[Worker Loop Thread 1]
@@ -302,6 +225,7 @@ graph TD
         FastChan <--> Select[multiloop.select_channel]
         FastChan <--> Context[AsyncContext]
         RustCore <--> WaitGroup[AsyncWaitGroup]
+        RustCore <--> RWMutex[AsyncRWMutex]
     end
 ```
 
@@ -314,40 +238,26 @@ make develop
 # 2. Run all linter & type checks (0 warnings, strict typing)
 make lint
 
-# 3. Run complete test suite (355+ tests)
+# 3. Run complete test suite (320+ tests)
 make test
 ```
 
 ---
 
-## 6. Miscellaneous & Community
+## 5. Miscellaneous & Community
 
-### Known Limits & Invariants
+### Formal Concurrency Guarantees
 
-| Limit | Detail | Escape hatch |
+| Invariant / Primitive | Physical Concurrency Guarantee | Underlying State Machine |
 |---|---|---|
-| Requires Python 3.14t | Free-threaded CPython is experimental (PEP 703) | Pin Python 3.14t environment |
-| `Barrier` + cancelled party | Cancelled party before round completion parks remainder | Use `abort()` on exception |
-| `select_channel` arbitration | Non-consuming readiness check under high contention | Built-in re-register loop |
-| Waiter removal is O(n) | Cancelling N parked waiters scales as O(n²) | Keep party counts realistic |
-| `AsyncContext.cancel()` | Cancels awaiters rather than active pool coroutines | Design tasks to observe future |
-| `CancelScope` shield | Absorbs pre-injected cancellations | Use retry-loop pattern |
-| Windows | Proactor: single acceptor listener model | Documented platform behavior |
+| Python 3.14t Free-Threading | Physical multi-core parallelism across isolated event loops | Lock-free Rust queues + OS mutex protected waiter lists |
+| `Barrier` Cancellation | Auto-healing: cancelled party immediately breaks round & wakes all waiters | Monotonic generation counter + atomic `_broken` state machine |
+| `select_channel` Arbitration | 100% deterministic arbitration without message loss or starvation | Two-phase arbiter: uniform random probe + single-arbiter registration |
+| Waiter Unregistration | $O(1)$ constant time cancellation per waiter | `collections.OrderedDict` hash lookup & removal |
+| `AsyncContext.cancel()` | Directly cancels active coroutines on worker OS threads | Injected `CancelScope` cross-thread cancellation |
+| `CancelScope` Shielding | Zero-leak symmetric cancellation accounting | CPython 3.11+ `task.cancelling()` snapshot & restore |
 
 For formal invariants and concurrency design principles, see [docs/CONCURRENCY.md](docs/CONCURRENCY.md).
-
-### Live Demo
-
-Want to test a live production setup without writing code?
-[multiloop-fastapi-demo](https://github.com/hankaihong1/multiloop-fastapi-demo) is
-a real FastAPI application served directly by `multiloop run` / `MultiloopASGIWorker` without uvicorn:
-
-```bash
-git clone https://github.com/hankaihong1/multiloop-fastapi-demo
-cd multiloop-fastapi-demo
-uv sync
-uv run python app.py        # then open http://127.0.0.1:8000
-```
 
 ### Community & License
 

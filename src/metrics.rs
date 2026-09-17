@@ -73,11 +73,22 @@ impl AtomicMetrics {
         }
     }
 
+    /// Increment the global queue pull counter by 1 for worker `index`.
     pub fn inc_global_pull(&self, index: usize) {
         if index < self.global_pull_count.len() {
             self.global_pull_count[index]
                 .0
                 .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Increment the global queue pull counter by `count` in a single atomic operation
+    /// for worker `index`, avoiding lock and cache-line bouncing during batch pulls.
+    pub fn add_global_pull(&self, index: usize, count: usize) {
+        if index < self.global_pull_count.len() {
+            self.global_pull_count[index]
+                .0
+                .fetch_add(count, Ordering::Relaxed);
         }
     }
 
