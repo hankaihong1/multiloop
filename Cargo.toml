@@ -13,7 +13,7 @@ flume = "0.11"
 parking_lot = "0.12"
 
 [build-dependencies]
-pyo3-build-config = "0.29"
+pyo3-build-config = "0.30"
 
 [features]
 extension-module = ["pyo3/extension-module"]
