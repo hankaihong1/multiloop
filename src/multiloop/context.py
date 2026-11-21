@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import weakref
 from collections.abc import Callable
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
 from multiloop._cancel import CancelScope
 from multiloop._taskgroup import TaskGroup
 from multiloop.pool import EventLoopThreadPool
+
+if TYPE_CHECKING:
+    from multiloop._sync import CapacityLimiter
 
 __all__ = ["AsyncContext"]
 
@@ -25,16 +29,23 @@ class AsyncContext:
                    cascades cancellation to this child context.
     """
 
+    __slots__ = (
+        "__weakref__",
+        "_cancelled",
+        "_children",
+        "_lock",
+        "_parent",
+        "_scopes",
+        "_task_groups",
+    )
+
     def __init__(self, parent: AsyncContext | None = None) -> None:
         self._parent = parent
         self._cancelled = False
         self._lock = threading.Lock()
         self._children: set[AsyncContext] = set()
-        # Track pending futures and their per-task cancel scopes
-        self._futures: dict[asyncio.Future[Any], asyncio.AbstractEventLoop | None] = {}
         self._scopes: dict[asyncio.Future[Any], CancelScope] = {}
-        self._task_groups: set[TaskGroup] = set()
-        self._cancel_scope: CancelScope = CancelScope()
+        self._task_groups: weakref.WeakSet[TaskGroup] = weakref.WeakSet()
 
         if parent is not None:
             parent._add_child(self)
@@ -85,6 +96,8 @@ class AsyncContext:
         """
         with self._lock:
             if self._cancelled:
+                if asyncio.iscoroutine(target):
+                    target.close()
                 caller_loop = asyncio.get_running_loop()
                 fut: asyncio.Future[Any] = caller_loop.create_future()
                 fut.cancel()
@@ -93,49 +106,34 @@ class AsyncContext:
 
         fut_res: asyncio.Future[Any] = pool.submit(target, *args, cancel_scope=scope, **kwargs)
 
+        cancel_now = False
         with self._lock:
-            # Double check: handle race where cancel() fired between initial check and pool.submit()
             if self._cancelled:
-                scope.cancel()
-                if not fut_res.done():
-                    fut_loop = fut_res.get_loop()
-                    if fut_loop and fut_loop.is_running():
-                        try:
-                            fut_loop.call_soon_threadsafe(fut_res.cancel)
-                        except RuntimeError:
-                            pass
-                    else:
-                        fut_res.cancel()
-            else:
-                submit_loop: asyncio.AbstractEventLoop | None = None
-                try:
-                    submit_loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    submit_loop = None
-                self._futures[fut_res] = submit_loop
+                cancel_now = True
+            elif not fut_res.done():
                 self._scopes[fut_res] = scope
                 fut_res.add_done_callback(self._discard_future)
+
+        if cancel_now:
+            scope.cancel()
 
         return fut_res
 
     def _discard_future(self, fut: asyncio.Future[Any]) -> None:
-        """Remove a completed future and its scope from tracking dicts."""
+        """Remove a completed future's CancelScope from tracking."""
         with self._lock:
-            self._futures.pop(fut, None)
             self._scopes.pop(fut, None)
 
     def cancel(self) -> None:
-        """Cancel this context and thread-safely propagate cancellation to all child contexts and futures."""
+        """Cancel this context and thread-safely propagate cancellation via CancelScopes."""
         with self._lock:
             if self._cancelled:
                 return
             self._cancelled = True
             children = list(self._children)
-            futures = list(self._futures.items())
             scopes = list(self._scopes.values())
             task_groups = list(self._task_groups)
             self._children.clear()
-            self._futures.clear()
             self._scopes.clear()
             self._task_groups.clear()
 
@@ -143,10 +141,8 @@ class AsyncContext:
         if self._parent is not None:
             self._parent._remove_child(self)
 
-        self._cancel_scope.cancel()
-
         for tg in task_groups:
-            tg.cancel_all()
+            tg._cancel_from_context()
 
         for child in children:
             child.cancel()
@@ -154,21 +150,12 @@ class AsyncContext:
         for scope in scopes:
             scope.cancel()
 
-        for fut, loop in futures:
-            if not fut.done():
-                if loop and loop.is_running():
-                    try:
-                        loop.call_soon_threadsafe(fut.cancel)
-                    except RuntimeError:
-                        pass
-                else:
-                    fut.cancel()
-
     def task_group(
         self,
         pool: EventLoopThreadPool | None = None,
         name: str | None = None,
         max_concurrency: int | None = None,
+        limiter: CapacityLimiter | None = None,
     ) -> TaskGroup:
         """Create a :class:`~multiloop.TaskGroup` integrated with this cancellation context.
 
@@ -181,12 +168,14 @@ class AsyncContext:
                      across worker event loops with structured concurrency guarantees.
         :param name: Optional identifier for the task group.
         :param max_concurrency: Optional positive integer constraining maximum concurrent tasks.
+        :param limiter: Optional external :class:`~multiloop.CapacityLimiter` to share concurrency
+                        budgets across multiple task groups.
         :returns: A :class:`~multiloop.TaskGroup` instance linked to this context.
         """
-        tg = TaskGroup(name=name, max_concurrency=max_concurrency, pool=pool)
+        tg = TaskGroup(name=name, max_concurrency=max_concurrency, limiter=limiter, pool=pool)
         with self._lock:
             if self._cancelled:
-                tg.cancel_all()
+                tg._cancel_from_context()
             else:
                 self._task_groups.add(tg)
         return tg

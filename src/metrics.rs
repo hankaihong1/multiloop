@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[repr(align(64))]
 pub(crate) struct PaddedAtomic(pub(crate) AtomicUsize);
 
-#[pyclass(module = "multiloop._multiloop_core")]
+#[pyclass(frozen, module = "multiloop._multiloop_core")]
 pub struct AtomicMetrics {
     active: Vec<PaddedAtomic>,
     completed: Vec<PaddedAtomic>,

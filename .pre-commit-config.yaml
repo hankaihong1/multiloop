@@ -1,11 +1,11 @@
 # mypy is excluded from pre-commit because mirrors-mypy runs in an isolated
-# sandbox without access to the gsyncio package or its Rust extension. Mypy is
-# covered by CI.
+# sandbox without access to the multiloop package or its Rust extension. Mypy
+# and pyright are covered by `make lint` and CI.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.1
+    rev: v0.16.2
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
       - id: ruff-format
 
@@ -27,6 +27,6 @@ repos:
         pass_filenames: false
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy -- -D warnings
+        entry: cargo clippy --locked -- -D warnings
         language: system
         pass_filenames: false

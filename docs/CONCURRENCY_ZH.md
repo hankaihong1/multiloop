@@ -10,72 +10,72 @@
 
 ## 1. 并发模型总览（谁锁什么、谁等什么）
 
-multiloop 的同步原语遵循同一个骨架：**Python 侧一把 `threading.Lock` 保护
-waiter 结构，Rust 侧用原子操作 + flume 承载数据面**。跨线程唤醒一律走
-`loop.call_soon_threadsafe(...)`，绝不跨线程直接触碰 asyncio 对象。
+multiloop 的同步原语遵循同一个骨架：**Rust 核心（`_multiloop_core`）在
+`parking_lot::Mutex` 下 100% 独占跨线程共享可变状态，Python 侧仅作为极薄异步门面**。
+所有等待者通过单调递增的 `WaiterId (u64)` 票据与不透明 `(loop_obj, fut)` 句柄注册（`src/waiter.rs`），
+跨线程唤醒一律在**释放 Rust 互斥锁之后**通过 `loop.call_soon_threadsafe(...)` 派发，并在目标事件循环已关闭时自动执行令牌回滚或向后转发。
 
 ### 1.0 并发物理假设公理体系（Physical Concurrency Axioms）
 
-multiloop 借用了 AnyIO 和 Trio 的顶层 API 命名与人体工程学接口，但在底层**彻底脱离其单线程无竞争假设**。在单线程协作式运行时（AnyIO/Trio）中，协程在 `await` 之间的执行是绝对串行非抢占的，容器操作无需 OS 锁，原语仅作为协作式并发量节流阀。
+multiloop 运行在 **Python 3.14t（自由线程 / 无 GIL）多核物理真并行**之上的多 OS 线程与独立事件循环中。并发正确性不能依赖单线程启发式假设，必须建立在以下六项严密的形式化物理并发公理之上：
 
-与之相反，multiloop 运行在 **Python 3.14t（自由线程 / 无 GIL）多核物理真并行**之上的多 OS 线程与独立事件循环中。并发正确性不能依赖单线程直觉，必须建立在以下七项严密的形式化物理假设与公理之上：
-
-0. **与 AnyIO/Trio 的范式分水岭（API 借用 vs 多线程物理公理）**：AnyIO/Trio API（`TaskGroup`、`CancelScope`、`CapacityLimiter`、`Event` 等）仅作为人体工程学调用界面被借用。所有底层语义完全基于多线程/多 Loop 物理模型重新设计，严格依赖状态机代数闭包、代币守恒律与 OS 互斥锁同步。
-1. **Python 3.14t 自由线程（无 GIL）真并行假设**：字节码与对象读写在多核 CPU 上真并行执行，无全局解释器锁保护。任何涉及复合状态的操作（如计数器增减 + 等待者队列出入队）必须收敛在单一 OS 互斥锁（`threading.Lock` / `parking_lot::Mutex`）临界区内，杜绝复合锁竞争撕裂。
-2. **跨线程 EventLoop 物理隔离公理**：`asyncio.Task`、`Future` 与 `Event` 严格物理绑定于单一 OS 线程及其 EventLoop。跨线程通信与唤醒绝对只能通过 `loop.call_soon_threadsafe(...)` 或 Rust `Channel` 派发。
+1. **Python 3.14t 自由线程（无 GIL）真并行假设**：字节码与对象读写在多核 CPU 上真并行执行，无全局解释器锁保护。任何涉及跨线程复合状态的操作（如计数器增减 + 等待者队列出入队）收敛在单一 Rust `parking_lot::Mutex` 临界区内，杜绝复合锁竞争撕裂与双轨制脑裂。
+2. **跨线程 EventLoop 物理隔离与不透明句柄公理**：`asyncio.Task`、`Future`、`Event` 与 `TimerHandle` 严格物理绑定于单一 OS 线程及其 EventLoop。Rust 核心绝不跨线程调用 `.done()`，也绝不在持有 `parking_lot::Mutex` 期间调用任何 Python 方法；跨线程唤醒一律在锁外通过 `loop.call_soon_threadsafe(...)` 派发。
 3. **ContextVar 线程/任务局部性公理**：`contextvars.ContextVar` 严格归属于当前 OS 线程与当前 Task。跨线程取消（`scope.cancel()`）严禁跨线程读取 ContextVar 栈，仅依赖线程互斥锁与 `call_soon_threadsafe`。
-4. **asyncio 原生取消与单账本对称记账公理**：完全基于 Python 3.11+/3.14t 原生 `task.cancelling()` 与 `task.uncancel()` 机制。Scope 仅对其显式注入的取消（`_injected == True`）执行对称的 `task.uncancel()` 冲销，绝不误吞外部第三方取消。Shield 严格采用快照-恢复（Snapshot-and-Restore）模型。
-5. **统一 Rust 原生 Channel 核心与防插队 FIFO 公理**：通道全量收敛至 Rust `RawAsyncChannel`（`parking_lot::Mutex<ChannelInner>`），通过 `in_flight_putters` 预留名额机制严格维护 FIFO 防插队不变量与令牌守恒，彻底消除 Python 锁双轨制与脑裂。
-6. **结构化并发物理作用域公理**：`TaskGroup` 物理限定于单个 `asyncio.AbstractEventLoop` 内部。跨 Loop、跨线程并发由 `EventLoopThreadPool`、`Channel` 与 `AsyncContext` 协同编排。
+4. **路线 3 纯 Rust 任务取消栈（`RawTaskCancelState`）公理**：`CancelScope`、`fail_after`/`fail_at`、`move_on_after`/`move_on_at`、`sleep`、`wait_cancellable` 与 `checkpoint` 在每任务的 Rust `RawTaskCancelState` 栈上运行（通过 `_TASK_CANCEL_STATES` `WeakKeyDictionary` 绑定任务弱引用），**全程绝不调用 `task.cancel()`、`task.uncancel()` 或读写修改 `task.cancelling()`**。等待点经 `_await_cancellable`（`park_waiter` / `unpark_waiter`）订阅取消，外部协程经 `wait_cancellable()` 桥接，`shield=True` 屏蔽外层 `CancelScope` 截止时间与取消，`__aexit__` 严格执行三模式退出规则（`PLAIN` 抛 `CancelledError`、`MOVE_ON` 静默吸收并置 `cancelled_caught=True`、`FAIL_AFTER` 转换为 `TimeoutError`）。
+5. **统一票据等待者协议与防插队 FIFO 公理**：所有 Rust 同步原语统一分配单调递增的 `WaiterId (u64)` 票据（`src/waiter.rs`），严禁使用裸指针地址（`fut.as_ptr()`）作身份标识，彻底根除内存地址复用引发的 ABA 误删；通道（`RawAsyncChannel`）通过 `in_flight_putters` 预留名额机制严格维护 FIFO 防插队不变量与令牌守恒。
+6. **结构化并发物理作用域公理**：`TaskGroup` 的宿主上下文及派生调用（`start_soon` / `start`）物理绑定于宿主 `asyncio.AbstractEventLoop`，并关联宿主 `CancelScope`，当子任务异常崩溃或调用 `cancel_all()` 时立即中断阻塞在 `async with TaskGroup()` 块内的宿主协程。传入 `TaskGroup(pool=pool)` 时，子任务通过独立子 `CancelScope` 分发至 `EventLoopThreadPool` 各工作线程 Loop 执行，并在退出时经屏蔽栅栏安全排空；跨 Loop 消息传递与级联取消同时由 `Channel` 与 `AsyncContext` 协同编排。
 
 ### 1.1 通道类（Channel）
 
 | 组件 | 锁/原语 | waiter 结构 | 关键不变量 |
 |---|---|---|---|
-| Rust `RawAsyncChannel` | `parking_lot::Mutex<ChannelInner>` | `getters` / `putters` 两个 `VecDeque<(loop_obj, fut, wake_fn)>` | FIFO 防插队：当存在排队 putter 或缓冲满时 `try_send` 严格拒绝；唤醒的 putter 通过 `in_flight_putters` 持有预留名额直到 `claim_put`。跨 Loop 通过 `call_soon_threadsafe` 安全唤醒（`src/channel.rs`） |
+| Rust `RawAsyncChannel` | `parking_lot::Mutex<ChannelState>` | `getters` / `putters` / `select_watchers` `VecDeque<WaiterEntry>` | 基于 `WaiterId (u64)` 票据的 FIFO 防插队：当存在排队 putter 或缓冲满时 `try_send` 严格拒绝；唤醒的 putter 通过 `in_flight_putters` 持有预留名额直到 `claim_put`。锁外通过 `call_soon_threadsafe` 安全唤醒并在目标 Loop 已关闭时自动回滚转发（`src/channel.rs`） |
 | Python `Channel` | `RawAsyncChannel` 的极薄门面 | — | 直接透传 Rust 核心，无双轨制分叉；支持 `select_channel` 单仲裁器注册与防插队重试（`src/multiloop/primitives.py`） |
-| 唤醒协议 | — | — | waiter 从 VecDeque 头部 FIFO 弹出并通过 `call_soon_threadsafe(wake_fn, fut, val, is_exc, has_val)` 调度回归属 Loop。被唤醒但随后取消的 waiter 负责令牌向后转发以保证活性 |
+| 唤醒协议 | — | — | waiter 在锁内从 `VecDeque` 头部 FIFO 弹出，并在锁外通过 `wake_waiter_outside_lock` 调度回归属 Loop。被唤醒但在申领前取消（`cancel_putter` / `cancel_getter`）或目标 Loop 已关闭的 waiter 负责令牌向后转发以保证活性（`src/waiter.rs`, `src/channel.rs`） |
 
 **全收敛单轨架构**：缓冲数据与异步 waiter 统一由 Rust `RawAsyncChannel` 核心管理。`send`/`recv` 均遵循
-「快路径尝试 → 锁内注册 future → await → 取消时锁内注销 → 消费预留名额入队/出队」。
+「快路径尝试 → 锁内尝试入队或注册 future 并获取 `WaiterId`（`send_or_register` / `register_getter_ticket`）→ await → 取消时按 `WaiterId` 锁内取消（`cancel_putter` / `cancel_getter`）→ 消费预留名额入队/出队（`claim_put` / `claim_get`）」。
 
 ### 1.2 锁与信号量
 
 | 原语 | 保护锁 | waiter 结构 | 关键不变量 |
 |---|---|---|---|
-| `Lock` | `threading.Lock` | `deque[(task, asyncio.Event)]` | FIFO；owner 死亡（`_owner.done()`）自动回收，不泄漏锁（`_sync.py:56-62`）；release 时跳过已 done 的 waiter（`_sync.py:90-97`） |
-| `Semaphore` | `threading.Lock` | `deque[(loop, asyncio.Event)]` | FIFO；取消的 waiter 若已被 release 弹出，令牌**转发**给下一个 waiter 或归还池（`_sync.py:192-213`） |
-| `CapacityLimiter` | `threading.Lock`（`_lock`） | `deque[(loop, asyncio.Event)]` | 单锁原子模型：`available + borrowed == total` 在 `_lock` 下恒成立；3.14t 下原子借还与动态亏空吸收（`_sync.py:329-497`） |
+| `Lock` | Rust：`parking_lot::Mutex<LockInner>`（`RawAsyncLock`） | `VecDeque<LockWaiter>`（`WaiterId` 票据） | 严格 FIFO；非阻塞 `try_acquire()` + `acquire_or_register() -> Option<WaiterId>` + `cancel_waiter(task_id, ticket_id)`（已获授所有权时向后转发）+ 同 Loop 死亡持有者回收（`check_owner_same_loop` / `on_owner_task_done`）；`release()` 锁内弹出下一个 waiter 并在锁外唤醒，若目标 Loop 已关闭则自动回滚并向后转发所有权（`src/sync.rs`, `_sync.py`） |
+| `AsyncRWMutex` | Rust：`parking_lot::Mutex<RWMutexInner>`（`RawAsyncRWMutex`） | `read_waiters` / `write_waiters` `VecDeque<RWMutexWaiter>`（`WaiterId` 票据）+ `woken_readers` | 写者优先（`pending_writers` 阻断新读者）与同任务读者可重入（`reader_depths`）；提供 `acquire_read_ticket()` / `cancel_read_ticket()` / `release_read_task()` 与 `acquire_write_ticket()` / `cancel_write_ticket()` / `release_write_task()`，锁外唤醒并支持关闭 Loop 自动回滚（`src/rwlock.rs`, `rwlock.py`） |
+| `Semaphore` | Rust：`parking_lot::Mutex<SemaphoreInner>`（`RawAsyncSemaphore`） | `VecDeque<WaiterEntry>`（`WaiterId` 票据）+ `granted_tickets` | 严格 FIFO；`acquire_or_register()` + `claim_acquire(ticket_id)` + `cancel_waiter(ticket_id)`；取消的 waiter 若已被 `release()` 授予许可，`cancel_waiter(ticket_id)` 会将许可**向后转发**给下一个 waiter 或归还池（`src/sync.rs`, `_sync.py`） |
+| `CapacityLimiter` | Rust：`parking_lot::Mutex<CapacityLimiterInner>`（`RawAsyncCapacityLimiter`） | `VecDeque<WaiterEntry>`（`WaiterId` 票据）+ `granted_tickets` | Rust 单锁原子模型：`acquire_or_register()`、`claim_acquire()`、`cancel_waiter()` 与 `snapshot()`（`available == total_tokens - borrowed`，含动态缩容亏空吸收）在 `parking_lot::Mutex` 下原子维护；锁外唤醒并支持关闭 Loop 自动回滚转发（`src/sync.rs`, `_sync.py`） |
 
 ### 1.3 事件与条件
 
 | 原语 | 保护锁 | waiter 结构 | 关键不变量 |
 |---|---|---|---|
-| `Event` | `threading.Lock` | `list[(loop, asyncio.Event)]` | **sticky**（trio 语义，无 clear）；`set()` 锁内换出列表、锁外逐个 `call_soon_threadsafe`（`_sync.py:385-398`） |
-| `Condition` | `_waiters_lock`（waiter 队列）+ 底层 `Lock` | `deque[(loop, asyncio.Event)]` | `notify()` **不需要**持底层锁（`_sync.py:507-522`）；`wait()` 释放锁 → 等通知 → **shield 下重获锁且取消时自动转发通知**（`_sync.py:624-646`） |
+| `Event` | Rust：`parking_lot::Mutex<EventInner>`（`RawAsyncEvent`） | `Vec<WaiterEntry>`（`WaiterId` 票据） | **sticky**（单向触发，不可逆，无 clear）；`wait_or_register()` + `cancel_waiter()`；`set()` 锁内取出全部列表、锁外逐个 `call_soon_threadsafe` 唤醒（`src/sync.rs`, `_sync.py`） |
+| `Condition` | Rust：`parking_lot::Mutex<ConditionInner>`（`RawAsyncCondition`）+ 底层 `Lock` | `VecDeque<WaiterEntry>`（`WaiterId` 票据）+ `notified_tickets` | `notify()` **不需要**持底层锁；`wait()` 先通过 `register_waiter()` 注册 `WaiterId` 票据再释放底层 `Lock` → 等通知（取消调 `cancel_or_forward()`，唤醒调 `claim_waiter()`）→ **通过 `_reacquire_lock()` 吸收取消重试循环重获 `Lock`，若重获期间被取消则调 `forward_notify()` 向后转发通知**（`src/sync.rs`, `_sync.py`） |
 
 ### 1.4 屏障与组同步
 
 | 原语 | 保护锁 | waiter 结构 | 关键不变量 |
 |---|---|---|---|
-| `Barrier` | `threading.Mutex` | `list[(loop, asyncio.Event, box)]` | `_generation` 计数器绑定轮次；轮次完成前有任意 party 被取消，屏障自动进入 Broken 状态并唤醒其余所有 party 抛出异常，并自增代际（`_sync.py:774-896`） |
-| `AsyncWaitGroup` | Rust：`parking_lot::Mutex<WaitGroupInner>` | `Vec[(loop, future)]` | 单互斥锁统一管理 `counter`、`generation` 和 `waiters`；`add(-n)` 与 `done()` 归零时原子递增 `generation` 并通过 `mem::take` 移交全部 waiter 列表（`lib.rs:465-540`）；`register_waiter` 对已归零状态立即返回已就绪；提供 `holding()` 上下文管理器支持 RAII 追踪 |
-| `AsyncOnce` | `threading.Lock` | `deque[(loop, future)]` | leader/follower：锁内决定谁执行、follower 锁内注册，leader 在 finally 中**持锁** `_wake_all`——注册与唤醒在同一把锁下，无 lost-wakeup 窗口（`primitives.py:377-416`） |
+| `Barrier` | Rust：`parking_lot::Mutex<BarrierInner>`（`RawAsyncBarrier`） | `VecDeque<BarrierWaiter>`（`WaiterId` 票据） | `generation` 计数器通过 `arrive_or_register()` 绑定轮次；轮次完成前有任意 party 被取消，`cancel_waiter(generation, ticket_id)` 自动将屏障置为 Broken 状态并在锁外唤醒其余所有 party 抛出异常，同时自增 `generation`（`src/sync.rs`, `_sync.py`） |
+| `AsyncWaitGroup` | Rust：`parking_lot::Mutex<WaitGroupInner>`（`RawAsyncWaitGroup`） | `Vec<WaiterEntry>`（`WaiterId` 票据） | 单互斥锁统一管理 `next_waiter_id`、`counter` 和 `waiters`（单调递增 `WaiterId` 票据防 ABA，无需 `generation` 字段）；`add(-n)` 与 `done()` 归零时原子排空 `waiters` 列表并在锁外经 `wake_waiter_outside_lock` 唤醒（`src/waitgroup.rs`, `src/waiter.rs`, `primitives.py`）；`register_waiter_ticket()` 返回 `Option<WaiterId>`（归零时为 `None`），取消时由 `cancel_waiter_ticket(ticket_id)` 移除 |
+| `AsyncOnce` | Rust：`parking_lot::Mutex<OnceInner>`（`RawAsyncOnce`） | `Vec<WaiterEntry>`（`WaiterId` 票据） | Rust 单一四状态机（`done` / `executing` / `result` / `exc`）：`enter_or_register()` 原子选举唯一 leader（`status = 0`）、为 follower 分配 `WaiterId`（`status = 1`，取消调 `cancel_waiter()`）或直接返回缓存结果（`status = 2` / `3`）；`complete(result, exc)` 更新状态并在锁外唤醒全部 follower，follower 通过 `outcome()` 读取结果（`src/sync.rs`, `primitives.py`） |
 
 ### 1.5 取消与结构化并发
 
 | 组件 | 机制 | 关键点 |
 |---|---|---|
-| `CancelScope` | 每任务 contextvars 栈 + 单账本 `_injected` | shield 进入时 snapshot 取消计数并清零，退出时恢复；单账本精确跟踪实际注入并对称冲销；严格 RAII 作用域栈生命周期（`_cancel.py`） |
-| `select_channel` | 两阶段仲裁器（Phase 1 伪随机均匀快速 `try_recv`，Phase 2 单播唤醒多通道注册） | 废除 TaskGroup 投机取消，赢家通过 `try_recv()` 消费并在 `finally` 中切除所有通道 watcher 注册（`primitives.py:230-290`） |
+| `CancelScope` | 路线 3 Rust `RawTaskCancelState` 栈（`_TASK_CANCEL_STATES` `WeakKeyDictionary`）+ `_await_cancellable`（`park_waiter` / `unpark_waiter`） | 零修改 CPython `task.cancel()` / `uncancel()` / `cancelling()`；`shield=True` 屏蔽外层 `CancelScope` 并保持外部 CPython `task.cancelling()` 原封不动；严格三模式退出（`PLAIN` / `MOVE_ON` / `FAIL_AFTER`）；`sleep()` 与 `wait_cancellable()` 提供路线 3 可取消挂起（`_cancel.py`, `src/cancel.rs`） |
+| `TaskGroup` | `_TGState` 枚举（`IDLE`..`FAILED`）+ `_CancelReason` 枚举 + `_children_lock`（`threading.Lock`）+ 每子任务独立 `CancelScope`（本地与池统一）+ `_wake_fut`（`_await_cancellable`） | 宿主上下文与派生调用绑定于 `self._loop`；本地与 `pool=pool` 子任务统一通过子 `CancelScope` 级联取消；`_wait_children` 在 `CancelScope(shield=True)` 内排空并保留外部 CPython `host_task.cancelling()`（`_taskgroup.py`） |
+| `select_channel` | 两阶段仲裁器（Phase 1 轮询起始索引快速 `try_recv`，Phase 2 基于 `WaiterId` 票据与 `weakref.ref(ch)` 的 `register_select_watcher_ticket`） | 通过 `_await_cancellable(loop, arbiter_fut)` 零引用环报告就绪；赢家通过 `try_recv()` 消费并在 `finally` 中调用 `cancel_select_watcher` 切除所有 `WaiterId` watcher 票据（`primitives.py`, `src/channel.rs`） |
 
 ### 1.6 多核调度与线程池并发模型（Multi-Core Scheduling & Pool Concurrency Model）
 
 | 组件 | 架构职责 | 线程 / 状态保护 | 核心不变式 |
 |---|---|---|---|
-| Rust `NativeWorkerPool` | 无锁任务队列与工作窃取 | Flume 全局队列 + 各 Worker 专用通道 | 软 Poller 门禁（`num_polling < max(workers/2, 1)`）限制并发探测；三级消费漏斗（私有缓冲 → 全局批量拉取 → 本地专用通道）保障零任务饥饿（`src/pool.rs`）。 |
-| Python `EventLoopThreadPool` | 多事件循环协调器 | 绑定独立事件循环的 Worker OS 线程 | 未钉选任务通过 `pop_work()` 抢占分发；钉选任务确定性路由至本地通道；安全关闭在退出前验证三源彻底排空（`src/multiloop/pool.py`）。 |
-| Python `AsyncContext` | 跨线程级联取消树 | `threading.Lock` + 注入专属 `CancelScope` | 同时取消调用方 Future 与 Worker 物理线程上正在执行的活动协程（`src/multiloop/context.py`）。 |
+| Rust `NativeWorkerPool` | 无锁任务队列与工作窃取 | Flume 全局队列 + 各 Worker 专用通道 + `Mutex<VecDeque>` 私有缓冲 + `Box<[AtomicU64]>` 位图 + `outstanding_tasks` 排空条件变量 | 软 Poller 门禁（`num_polling < max(workers/2, 1)`）限制并发探测；>64 核 CAS 空闲位图；四级消费漏斗配合 `wait_drained` / `drain_all` 保障零任务饥饿与关池彻底排空（`src/pool.rs`）。 |
+| Python `EventLoopThreadPool` | 多事件循环协调器 | 不可变快照（`_loops_snapshot` / `_notify_events_snapshot`）+ `threading.Lock`（`_lifecycle_lock`）+ `_PoolWorkItem`（`weakref.ref(pool)`） | 提交热路径完全去锁（`itertools.count()` + 原子指标与 Rust 队列）；各 Worker 本地 `active_items` 配合 `drain_all()` 清理；`submit_many` 拒绝多目标传入 `cancel_scope`（抛 `ValueError`）（`src/multiloop/pool.py`）。 |
+| Python `AsyncContext` | 跨线程级联取消树 | `threading.Lock` + Loop 安全的 `CancelScope`（`_scopes`）/ 子上下文 / `WeakSet[TaskGroup]` 派发 | 跨线程级联取消子 `AsyncContext`、关联 `TaskGroup`（`_cancel_from_context()`）与活动 Worker 的 `CancelScope`（`src/multiloop/context.py`）。 |
 
 ---
 
@@ -90,7 +90,7 @@ multiloop 借用了 AnyIO 和 Trio 的顶层 API 命名与人体工程学接口�
 **根因**：检查与操作不是原子的。
 **正确姿势**：合并为单次锁内操作；无法合并时用 try/except 兜底。
 **例证**：
-- `CapacityLimiter` 统一由单一把 `_lock` 保护全部 token、借出与 waiter 状态；调用 `snapshot()` 原子上锁读出 `(total, avail, borrowed)`（`_sync.py:329-497`）。
+- `CapacityLimiter`（`RawAsyncCapacityLimiter`）统一由单一把 `parking_lot::Mutex` 保护全部 token、借出与 waiter 状态；调用 `snapshot()` 原子上锁读出 `(total, avail, borrowed)`（`src/sync.rs`, `_sync.py`）。
 - 通用教训（他处修复过）：`contains_key → getitem` 之间 key 可被并发删除
   → 拆开两步 + `try/except KeyError`。
 
@@ -101,10 +101,9 @@ future 时数据已经被取走，future 永远没人 resolve → 挂死。
 **根因**：无锁快路径（`try_send`/`try_recv`）与加锁的 waiter 列表是两个
 不同的状态面，快路径赢过慢路径时唤醒信号丢失。
 **正确姿势**：快路径尝试后，**在锁内再检查一次**才注册 future；注册与
-`_wakeup_next` 都在 `_lock` 下完成。
-**例证**：`_wait_and_send`（`_channel_base.py:136-177`）、`_recv_impl`
-（`primitives.py:165-197`）——这就是 AGENTS.md 六项决策里的 "Double-check
-lock in Channel"。
+唤醒目标提取都在同一把 `parking_lot::Mutex` 下完成，并在释放锁后调用 `call_soon_threadsafe`。
+**例证**：`RawAsyncChannel::send_or_register` / `register_getter_ticket`（`src/channel.rs`）、
+`Channel.send` / `Channel.recv`（`primitives.py`）。
 
 ### 模式 3：取消路径的锁重获取（shield 缺失 → 死锁）
 
@@ -113,8 +112,8 @@ lock in Channel"。
 卡死在清理路径，锁泄漏。
 **根因**：Python 的取消是"每次 await 都会重抛"的，清理代码里的 await
 不能执行。
-**正确姿势**：用"取消重试循环"重获取锁——`asyncio.Condition.wait` 的官方模式（bpo-34094 家族）：吞掉每次重获取尝试抛出的 `CancelledError` 并重试，直到锁拿回，再重抛取消。每次被吞的取消都会让 `Lock` 保持干净（其取消路径会清理 waiter 条目），所以重试是安全的——而且能扛住重获取期间*反复*到达的取消。`CancelScope(shield=True)` 做不到这一点：它是快照/恢复式，只吸收*进入前*已注入的取消；屏蔽期间到达的取消会打断 body 的 await。
-**例证**：`Condition._reacquire_lock`（`_sync.py:718-738`）；`AsyncRWMutex` 的 reader/writer 释放路径（`rwlock.py:78-111, 153-175`）。
+**正确姿势**：将异步清理路径与取消隔离——通用清理块使用 `CancelScope(shield=True)`（`_cancel.py`, `src/cancel.rs`），在任务 Rust `RawTaskCancelState` 栈上屏蔽外层 `CancelScope` 的截止时间与取消（保护 `sleep`、`wait_cancellable`、`Channel`、`Lock` 等清理 await），同时保持 CPython `task.cancelling()` 不受修改；或者采用吸收取消的重试循环——`asyncio.Condition.wait` 的官方模式（bpo-34094 家族），在 `while True` 循环内捕获 `asyncio.CancelledError` 重试直至 `await self._lock.acquire()` 成功拿回锁，再重新抛出 `CancelledError`。
+**例证**：`Condition._reacquire_lock`（`_sync.py`，配合 `Condition.wait` 中的 `_raw.forward_notify()`）；`CancelScope(shield=True)`（`_cancel.py`）。
 
 ### 模式 4：通知与等待的锁不一致
 
@@ -122,37 +121,32 @@ lock in Channel"。
 了那把锁** → 通知方永远拿不到锁 → 死锁。
 **根因**：notify 依赖的锁与 wait 释放的锁不是同一把，或 notify 被错误地
 要求持锁。
-**正确姿势**：`notify()` 不要求底层锁；waiter 队列用独立的
-`_waiters_lock` 保护，`notify` 只操作队列、不碰业务锁。
-**例证**：`Condition.notify()`（`_sync.py:507-522`）——持锁 notify 还会
+**正确姿势**：`notify()` 不要求底层锁；waiter 队列由独立的 Rust `RawAsyncCondition` 互斥锁保护，`notify` 只操作等待队列、不碰业务锁。
+**例证**：`Condition.notify()`（`_sync.py`, `src/sync.rs`）——持锁 notify 还会
 让生产者批量攒通知、饿死 waiter。
 
-### 模式 5：轮次/代际错位（wrong-round removal）
+### 模式 5：轮次/代际错位与 ABA 指针复用（wrong-round removal）
 
-**症状**：上一轮的取消/超时处理删掉了**下一轮**的 waiter 条目，屏障永远
-凑不齐 party 数。
-**根因**：waiter 条目复用了，但删除逻辑不知道条目已经属于新一轮。
-**正确姿势**：waiter 注册时记录当时的 `_generation`，取消处理先比对
-generation 再决定是否删除。
-**例证**：`Barrier.wait()`（`_sync.py:628-643`）；同样手法在
-`Semaphore._cancel_waiter`（令牌转发而非盲删，`_sync.py:192-213`）。
+**症状**：上一轮的取消/超时处理删掉了**下一轮**的 waiter 条目，或新分配的 `asyncio.Future` 复用了刚完成的 Future 内存地址（`fut.as_ptr()`）而被迟到的取消回调误删。
+**根因**：waiter 条目或内存地址发生复用，基于裸指针或无代际校验的删除逻辑误删了新等待者。
+**正确姿势**：每次 waiter 注册分配单调递增的 `WaiterId (u64)` 票据（`src/waiter.rs`），对于可循环轮次原语同时记录当时的 `generation`；取消处理严格按 `ticket_id`（循环屏障按 `(generation, ticket_id)`）比对后再决定删除或转发令牌。
+**例证**：`RawAsyncBarrier::cancel_waiter`（`src/sync.rs`）、`RawAsyncWaitGroup::cancel_waiter_ticket`（`src/waitgroup.rs`）、
+`RawAsyncSemaphore::cancel_waiter`（`src/sync.rs`）。
 
 **Barrier Broken 注**：generation 守卫保护的是*下一轮*条目，且当轮次凑齐前有 party 被取消时，屏障自动转移至 Broken 状态并唤醒当前轮次所有等待者抛出异常，从根源杜绝死锁。
 
-**已知限制**：`Barrier`/`Condition`/`Semaphore` 取消处理里的
-删除是每个 waiter O(n)（重建列表/dict），N 个 waiter 的取消风暴总成本
-O(n²)——实测 5000 waiter ≈ 560 ms。真实 party 数量级下可
-接受；记录在案，防止后人"优化"成 wrong-round bug。
+**已知限制**：`Channel`/`Lock`/`Semaphore`/`CapacityLimiter`/`Condition`/`RWMutex`/`WaitGroup`/`Once` 取消处理里按 `WaiterId` 扫描队列是每个取消 waiter O(n)，N 个挂起 waiter 的取消风暴总成本
+O(n²)（而 `Barrier::cancel_waiter` 在首个取消到达时 O(n) 置破本轮并推进 `generation`，同轮后续取消凭 `generation` O(1) 提前返回）。真实等待者数量级下可接受；记录在案，防止后人"优化"成 wrong-round 或 ABA bug。
 
 ### 模式 6：注册-完成竞态（register-after-done）
 
 **症状**：`wait()` 检查"计数已为 0"后正要注册，`done()` 恰好把计数减到 0
 并清空 waiter 列表 → 新 waiter 永远不被唤醒。
 **根因**：检查与注册之间的窗口。
-**正确姿势**：注册后由注册函数返回"是否已完成"；已完成则不等待直接返回
+**正确姿势**：注册函数在同一把互斥锁内原子检查完成状态，已完成时直接返回 `None` 而不入队等待
 （Go `sync.WaitGroup.Wait` 同款语义）。
-**例证**：`AsyncWaitGroup.wait()` + `register_waiter` 的布尔返回
-（`primitives.py:332-339`、`lib.rs:473-487`），内部受 `parking_lot::Mutex` 保护。注意：**所有正 delta 的 `add()` 必须 happens-before `register_waiter()`**，确保调用方不会在工作协程启动前误观察到计数器为 0 并提前放行。
+**例证**：`AsyncWaitGroup.wait()` + 返回 `Option<WaiterId>` 的 `RawAsyncWaitGroup::register_waiter_ticket()`
+（`src/multiloop/primitives.py:752-763`、`src/waitgroup.rs:112-125`），内部受 `parking_lot::Mutex<WaitGroupInner>` 保护。注意：**所有正 delta 的 `add()` 必须 happens-before `register_waiter_ticket()`**，确保调用方不会在工作协程启动前误观察到计数器为 0 并提前放行。
 
 ### 模式 7：跨线程共享 asyncio 对象
 
@@ -163,20 +157,20 @@ O(n²)——实测 5000 waiter ≈ 560 ms。真实 party 数量级下可
 **正确姿势**：跨线程一律 `loop.call_soon_threadsafe(fut.set_result, ...)`
 或 `call_soon_threadsafe(event.set)`；线程间通信用 `Channel`，不要
 直接传 asyncio 原语。
-**例证**：`_wake_all`（`_channel_base.py:41-48`）、`Event.set`
-（`_sync.py:397-398`）、`Lock.release`（`_sync.py:96`）。
+**例证**：`wake_waiter_outside_lock` / `wake_pair_outside_lock`（`src/waiter.rs`）、
+`RawAsyncChannel::dispatch_wake`（`src/channel.rs`）、`RawTaskCancelState::cancel_scope`（`src/cancel.rs`）、
+`RawAsyncEvent::set` 与 `RawAsyncLock::release`（`src/sync.rs`）。
 
 ### 模式 8：死锁家族（锁顺序 / await 持锁 / 递归持锁）
 
 **症状**：两个线程各自持有对方要的锁；或持锁时 await；或同一线程重复
 获取非重入锁。
 **正确姿势**：
-- 多锁场景固定加锁顺序（如总是先 `_total_lock` 再碰 semaphore 内部锁）；
+- 多锁场景固定严格的加锁顺序（或如 `RawAsyncCapacityLimiter` 一样将复合状态收敛到单一把 Rust `parking_lot::Mutex` 下）；
 - **绝不在持锁期间 await**（`threading.Lock` 无法跨 await 保持，等价于
   释放了锁还以为是持锁状态——`asyncio.Lock` 才有此语义）；
-- 调用可能再取锁的函数前先 `drop(guard)` 释放已持锁。
-**例证**：`push_local` 满队列回退时先 `drop(guard)` 再 `push_global`
-（`lib.rs:276-280`）。
+- 调用可能再取锁或触发 Python 回调的函数前先 `drop(guard)` 释放已持锁。
+**例证**：`NativeWorkerPool::pop_work` 的跨 worker 缓冲窃取（`src/pool.rs:341-363`，先释放 `victim_buf` 再获取 `self.buffers[index]` 锁）以及所有锁外唤醒路径（`src/channel.rs`, `src/sync.rs`, `src/rwlock.rs`, `src/waitgroup.rs`, `src/waiter.rs`）均先 `drop(guard)` 释放互斥锁再获取下一把锁或触发 Python 回调。
 
 ### 模式 9：组件特定反模式与误用陷阱
 
@@ -205,42 +199,54 @@ async with TaskGroup() as tg:
     tg.start_soon(tracked_worker)
 ```
 
-**2. `select_channel` 高吞吐饱和社会下的顺序饿死**：
-- **陷阱**：`select_channel` 在 Phase 1 中按照参数由左至右顺序确定性探测。若多个通道持续有数据堆积，右侧通道会被 100% 饿死。
+**2. `select_channel` 线程局部轮询索引假设陷阱（无位置优先级与步调共振混叠）**：
+- **陷阱**：Phase 1 通过线程局部单调计数器（`_next_select_index`）轮转 `try_recv()` 起始探测下标，因此参数顺序**不会**赋予靠前通道优先权；反之，同一线程内步调一致地交替调用 `N` 处 `N` 通道 `select_channel` 会触发 `counter % N` 同余混叠，使各调用点被固定锁死在同一起始下标。
 - **错误示例**：
 ```python
 while True:
-    ch, val = await select_channel(ch1, ch2)
+    # 误以为 high_prio 总是优先于 low_prio 被排空（错误：Phase 1 实际按轮询轮转！）
+    ch, val = await select_channel(high_prio, low_prio)
     process(val)
 ```
-- **正确姿势**：若需要就绪通道间的统计学公平调度，在循环轮询前打乱（shuffle）通道列表。
+- **正确姿势**：需严格优先级时先显式 `try_recv()` 排空高优通道再回退至 `select_channel`（或在多调用点步调共振场景下打乱通道列表）。
 
 **3. `Barrier` 单方超时与自动破损状态机**：
 - **陷阱**：当某个等待方被取消或超时退出时，`Barrier` 会自动进入 Broken 破损状态并唤醒当前轮次的所有其他等待方抛出 `RuntimeError`。在此之后，后续的 `wait()` 会持续抛出异常，直到显式调用 `barrier.reset()`。
 - **错误示例**：
 ```python
 try:
-    await asyncio.wait_for(barrier.wait(), timeout=1.0)
+    async with fail_after(1.0):
+        await barrier.wait()
 except TimeoutError:
     pass  # 屏障已破损；后续 wait() 调用将直接失败!
 ```
 - **正确姿势**：
 ```python
 try:
-    await asyncio.wait_for(barrier.wait(), timeout=1.0)
+    async with fail_after(1.0):
+        await barrier.wait()
 except TimeoutError:
     barrier.reset()  # 重置屏障代际以允许后续轮次继续运行
     raise
 ```
 
 **4. `CapacityLimiter` 匿名归还与浮点容量感知断层**：
-- **陷阱**：`CapacityLimiter` 是匿名令牌模型（不校验借用者 Task 身份），且浮点容量（如 `2.5`）底层信号量仅有整型容量（`2`）。
+- **陷阱**：`CapacityLimiter` 是匿名令牌模型（不校验借用者 Task 身份），且浮点容量（如 `2.5`）实际有效并发槽位为整型截断容量（`int(total_tokens) = 2`）。
 - **错误示例**：
 ```python
 if limiter.available_tokens > 0:  # 例如 0.5 > 0
     await limiter.acquire()  # 若整型容量已借满则必然阻塞!
 ```
 - **正确姿势**：统一推荐 `async with limiter:` 上下文管理器；使用 `limiter.available_capacity >= 1`（或 `available_tokens >= 1.0`）确保可立即无阻借出。
+
+**5. 在路线 3 `CancelScope` / `TaskGroup` / `AsyncContext` 中裸用 `asyncio.*` 阻塞原语**：
+- **陷阱**：路线 3 `CancelScope` 不修改 CPython `task.cancel()`，因此裸用 `asyncio.sleep(...)`、`asyncio.Event().wait()`、`asyncio.Queue().get()`、`asyncio.wait_for(...)` / `asyncio.gather(...)`（会创建游离于外层取消栈之外的子 `Task`），以及未经桥接的 `await pool.submit(...)`，都会无视作用域取消与截止时间。
+- **错误示例**：
+```python
+async with fail_after(0.1):
+    await asyncio.sleep(10)  # 会卡住 10s；路线 3 不会唤醒 asyncio.sleep
+```
+- **正确姿势**：优先使用支持路线 3 订阅的 `multiloop` 原语（`multiloop.sleep(...)`、`fail_after(...)`、`TaskGroup`、`multiloop.Event`、`Channel`、`run_in_pool(...)`），遇到第三方或标准库 awaitable / 原始 `Future` 时用 `wait_cancellable(...)` 包装桥接。
 
 ---
 
@@ -252,7 +258,7 @@ if limiter.available_tokens > 0:  # 例如 0.5 > 0
 - [ ] 改动是否新增/修改 **waiter 注册或唤醒路径**？→ 过模式 2/4：注册与
       唤醒是否在同一把锁下？是否有锁外快路径+锁内双检？
 - [ ] 改动是否触及 **取消/超时路径**？→ 过模式 3/5：清理路径的 await
-      是否在 shield 内？waiter 删除是否带 generation/身份校验？
+      是否在 shield 或吸收取消的重试循环内？waiter 删除是否带 generation/`WaiterId` 票据校验？
 - [ ] 改动是否让 **asyncio 对象跨线程**？→ 过模式 7：跨线程只允许
       `call_soon_threadsafe`。
 - [ ] 改动是否引入 **多个锁**？→ 过模式 8：锁顺序是否一致？是否在 await
@@ -268,48 +274,53 @@ if limiter.available_tokens > 0:  # 例如 0.5 > 0
 
 ---
 
-## 4. Rust 核心注意事项（`src/lib.rs`）
+## 4. Rust 核心注意事项（`src/*.rs`）
 
-### 4.1 三个组件、各自的并发边界
+### 4.1 核心组件与各自的并发边界
 
 | 组件 | 线程边界 | 注意 |
 |---|---|---|
-| `NativeWorkerPool` | 任意线程可 `push_global`/`push_local`；`pop_work` 仅 worker 线程 | 关池先丢 sender 再置 flag（`lib.rs:219-225`） |
-| `Channel` | 任意线程可 send/recv | flume 本身无锁；`is_closed` 是 flag store/load（Release/Acquire） |
-| `RawAsyncWaitGroup` | 任意线程可 add/done/register | 计数 AcqRel；waiter 列表 parking_lot Mutex |
+| `NativeWorkerPool` | 任意线程可 `push_global`/`push_local`；`pop_work` 仅 worker 线程 | 关池先丢 sender 再置 flag；无界局部队列 + 兄弟缓冲窃取（`src/pool.rs`） |
+| `RawAsyncChannel` | 任意线程可 send/recv/register | `parking_lot::Mutex<ChannelState>` 防插队 FIFO、`WaiterId (u64)` 票据与锁外唤醒（`src/channel.rs`） |
+| `RawAsyncWaitGroup` | 任意线程可 add/done/register | 单 `parking_lot::Mutex<WaitGroupInner>` 状态机与 `WaiterId` 票据；`done()` 锁内排空等待者并在锁外经 `wake_waiter_outside_lock` 唤醒（`src/waitgroup.rs`, `src/waiter.rs`, `primitives.py`） |
+| `RawAsyncRWMutex` | 任意线程可获取/释放 reader/writer | 写者优先 `parking_lot::Mutex<RWMutexInner>` 状态机、`WaiterId` 票据与锁外唤醒（`src/rwlock.rs`） |
+| `RawAsyncLock` / `Semaphore` / `Event` / `Condition` / `Barrier` / `CapacityLimiter` / `Once` | 任意线程可 acquire/release/notify/wait | 统一 Rust 状态机（`src/sync.rs`），基于 `parking_lot::Mutex`、`WaiterId (u64)` 票据与锁外唤醒（`src/waiter.rs`） |
+| `RawTaskCancelState` | 任意线程可 `cancel_scope` / 查询；宿主任务压栈/弹栈/挂起 | 路线 3 纯 Rust 任务取消栈，在 `parking_lot::Mutex<CancelStateInner>` 下维护并在锁外唤醒 `WaiterEntry`（`src/cancel.rs`, `_cancel.py`） |
+| `AtomicMetrics` | 任意线程可记录/读取 | 单 worker 独立 64 字节填充原子计数器，避免伪共享（`src/metrics.rs`） |
 
 ### 4.2 软 poller 门（`num_polling`）
 
 - `fetch_add(1, Relaxed)` 后判断 `< max(num_workers/2, 1)`，**瞬时门**：
   抢到门只对本轮 batch pull 有效，释放即失效——没有硬角色分配，任何
-  worker 随时可以偷全局队列（`lib.rs:301-303`）。
+  worker 随时可以偷全局队列（`src/pool.rs:275-285`）。
 - **必须用 `PollerGuard`（RAII）递减**：panic 也能保证 `fetch_sub`
-  执行（`lib.rs:170-176`）。手写 `fetch_add`/`fetch_sub` 配对时，任何
+  执行（`src/pool.rs:25-31`）。手写 `fetch_add`/`fetch_sub` 配对时，任何
   `?`/panic 路径都会泄漏计数 → 永远用 guard。
 
-### 4.3 batch pull 的三层消费
+### 4.3 `pop_work` 的四层消费
 
-优先级：**private buffer → global batch → local channel**（`lib.rs:287-352`）。
-- batch_size = `min(global_len / num_workers + 1, 128)`，摊薄 flume pop 成本。
+优先级：**private buffer → global batch pull → local channel → single-item fallback & cross-worker buffer work-stealing**（`src/pool.rs:256-391`）。
+- batch_size = `min(global_len / num_workers + 1, 128)`（排空阶段为 `64`），摊薄 flume pop 成本（`src/pool.rs:287-290`）。
 - 改优先级/批次公式时，同时检查：worker 是否会饿死全局队列（Python 侧
   `await asyncio.sleep(0)` 的防贪婪机制在 `pool.py` 的 `_worker_dispatcher`）。
-- `push_local` 满队列**回退 global** 保 liveness（`lib.rs:276-280`）——
-  别把它改成阻塞等待，否则单 worker 队列满会卡住提交方。
+- `push_local` 采用**无界**局部队列保障 `pin_to` 任务 100% 强亲和性，
+  避免任务漂移至全局队列且不卡死提交方，关池排空阶段验证全局队列、全部 worker 缓冲及局部通道均完全排空（`src/pool.rs:58, 156-171, 223-254, 371-381`）。
 
 ### 4.4 原子操作与内存序
 
 - `AtomicMetrics` 每个计数器是 `#[repr(align(64))] PaddedAtomic`——防
   false sharing。**加新计数器时保持 64 字节对齐**，否则多核下吞吐会
-  莫名下降（`lib.rs:14-15`）。
+  莫名下降（`src/metrics.rs:6-7`）。
 - 已确立的序约定，新代码沿用：
-  - `is_closed`：`Release` store / `Acquire` load（flag 模式，`lib.rs:224, 232`）
-  - WaitGroup 计数：`add` 用 `Release`，`done` 用 `AcqRel`（`lib.rs:439, 444`）
+  - `is_closed`：`Release` store / `Acquire` load（flag 模式，`src/pool.rs:138, 146`）
+  - `idle_mask`：`Release` 位更新（`fetch_or`/`fetch_and`）/ `Acquire` load（`src/pool.rs:78-104`）
+  - `num_polling`、`rr_index` 与 `AtomicMetrics` 各计数器：`Relaxed`（`src/pool.rs:29, 103, 277`, `src/metrics.rs`）
 - flume 是 lock-free 但**不是零成本**：跨线程 send/recv 仍有原子操作与
   内存栅栏。性能敏感路径不要假设"无锁=免费"。
 
-### 4.5 `register_waiter` 的顺序约束
+### 4.5 `register_waiter_ticket` 的顺序约束
 
-`RawAsyncWaitGroup`（`lib.rs:548`）由 `parking_lot::Mutex<WaitGroupInner>` 单互斥锁保护：**调用方必须保证所有正 delta 的 `add()` 在 `register_waiter()` 之前 happens-before**（Go WaitGroup 同款约定）。否则在计数为 0 时调用 `wait()` 会立即返回已就绪，从而漏过后续启动的并发任务。
+`RawAsyncWaitGroup`（`src/waitgroup.rs:112-125`）由 `parking_lot::Mutex<WaitGroupInner>` 单互斥锁保护：**调用方必须保证所有正 delta 的 `add()` 在 `register_waiter_ticket()` 之前 happens-before**（Go WaitGroup 同款约定）。否则在计数为 0 时调用 `wait()` 会立即返回已就绪，从而漏过后续启动的并发任务。
 
 ---
 
@@ -369,4 +380,4 @@ uv run pytest --lf
 
 - [API_ZH.md](API_ZH.md) — 完整 API 参考
 - [CHOOSING_ZH.md](CHOOSING_ZH.md) — 原语选择决策表（"该用哪个"）
-- [AGENTS.md](../AGENTS.md) — AI 导航（六项非显而易见设计决策的速查）
+- [AGENTS.md](../AGENTS.md) — AI 导航（七项非显而易见设计决策的速查）

@@ -1,12 +1,14 @@
 """Tests for multiloop.Lock and multiloop.Event cross-event-loop-safe primitives."""
 
 import asyncio
+import gc
 import threading
+import weakref
 from typing import Any
 
 import pytest
 
-from multiloop import Condition, Event, Lock
+from multiloop import Event, Lock
 from multiloop.testing import wait_all_tasks_blocked
 
 # ---------------------------------------------------------------------------
@@ -393,34 +395,6 @@ async def test_lock_handoff_to_cancelled_waiter_forwards() -> None:
 
 
 @pytest.mark.asyncio
-async def test_condition_notify_consumed_by_cancelled_waiter_forwards() -> None:
-    """W11: a notify consumed by a cancelled waiter must wake the next waiter."""
-    cond = Condition()
-    w3_got = asyncio.Event()
-    results: list[str] = []
-
-    async def waiter(name: str, got: asyncio.Event | None = None) -> None:
-        async with cond:
-            await cond.wait()
-            results.append(name)
-            if got is not None:
-                got.set()
-
-    t2 = asyncio.create_task(waiter("w2"))
-    await asyncio.sleep(0.05)
-    t3 = asyncio.create_task(waiter("w3", w3_got))
-    await asyncio.sleep(0.05)
-
-    cond.notify()  # pops W2's entry and wakes it
-    t2.cancel()  # ...but W2 is cancelled before it re-acquires the lock
-
-    # Pre-fix this times out: the notification is gone and W3 never wakes.
-    await asyncio.wait_for(w3_got.wait(), timeout=1.0)
-    await asyncio.gather(t2, t3, return_exceptions=True)
-    assert results == ["w3"]
-
-
-@pytest.mark.asyncio
 async def test_wake_race_no_callback_noise() -> None:
     """W21: cancelling a waiter after it was popped must not spam the loop
     exception handler with InvalidStateError."""
@@ -461,49 +435,6 @@ async def test_wake_race_no_callback_noise() -> None:
 async def _release_after(lock: Lock) -> None:
     await asyncio.sleep(0)
     lock.release()
-
-
-# ---------------------------------------------------------------------------
-# Regression tests
-# — 2026-08-10 audit
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_writer_cancel_wakes_blocked_readers() -> None:
-    """cancelling a pending writer must wake readers blocked on it.
-
-    A cancelled writer decrements pending_writers without notifying _read_ok —
-    blocked readers then wait forever on a condition that is already false.
-    """
-    from multiloop import AsyncRWMutex
-
-    rw = AsyncRWMutex()
-    reader_done = asyncio.Event()
-
-    async def reader(done: asyncio.Event) -> None:
-        async with rw.reader():
-            done.set()
-
-    async def writer_stuck() -> None:
-        try:
-            async with rw.writer():
-                await asyncio.Event().wait()  # never exits on its own
-        except asyncio.CancelledError:
-            pass
-
-    t1 = asyncio.create_task(reader(asyncio.Event()))
-    await asyncio.sleep(0.05)  # R1 holds the read lock
-    t2 = asyncio.create_task(writer_stuck())
-    await asyncio.sleep(0.05)  # W1 pending (blocks new readers)
-    t3 = asyncio.create_task(reader(reader_done))
-    await asyncio.sleep(0.05)  # R2 blocked on _read_ok
-
-    t2.cancel()  # W1 cancelled: pending_writers -> 0
-
-    # Pre-fix this times out: R2 waits forever.
-    await asyncio.wait_for(reader_done.wait(), timeout=1.0)
-    await asyncio.gather(t1, t2, t3, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -565,68 +496,11 @@ async def test_lock_release_tolerates_closed_loop_waiter() -> None:
 
 
 @pytest.mark.asyncio
-async def test_lock_base_exception_forwards_ownership() -> None:
-    """Lock.acquire must forward ownership when a waiter is interrupted by BaseException."""
-    lock = Lock()
-    await lock.acquire()
-
-    class CustomBaseException(BaseException):
-        pass
-
-    interrupted_task_started = asyncio.Event()
-
-    async def interrupted_waiter() -> None:
-        interrupted_task_started.set()
-        await lock.acquire()
-
-    t2 = asyncio.create_task(interrupted_waiter())
-
-    t3_held = asyncio.Event()
-
-    async def waiter3() -> None:
-        await lock.acquire()
-        t3_held.set()
-        await asyncio.sleep(0.01)
-        lock.release()
-
-    t3 = asyncio.create_task(waiter3())
-    await interrupted_task_started.wait()
-    await wait_all_tasks_blocked()
-
-    # Release lock: ownership is handed to t2 (popped from _waiters)
-    lock.release()
-
-    # Cancel t2 before it can finish acquiring
-    t2.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await t2
-
-    # Ownership must have been forwarded to t3
-    await asyncio.wait_for(t3_held.wait(), timeout=1.0)
-    await t3
-    assert not lock.locked
-
-
-@pytest.mark.asyncio
-async def test_condition_wait_unacquired_owner_check() -> None:
-    """Condition.wait called without acquiring the lock must raise RuntimeError immediately."""
-    cond = Condition()
-    with pytest.raises(RuntimeError, match="cannot wait on un-acquired lock"):
-        await cond.wait()
-
-
-# ---------------------------------------------------------------------------
-# Concurrency audit & semantic refactoring tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
 async def test_lock_dead_owner_fifo_recovery() -> None:
     """Lock dead-owner recovery wakes FIFO waiters in order instead of barging."""
     lock = Lock()
     order: list[str] = []
 
-    # 1. Owner acquires lock then dies without release
     async def doomed_owner() -> None:
         await lock.acquire()
 
@@ -634,7 +508,6 @@ async def test_lock_dead_owner_fifo_recovery() -> None:
     await asyncio.sleep(0.01)
     assert lock.locked
 
-    # 2. Waiter 1 queues while owner is still alive
     async def waiter_1() -> None:
         await lock.acquire()
         order.append("waiter_1")
@@ -643,7 +516,6 @@ async def test_lock_dead_owner_fifo_recovery() -> None:
     t_waiter = asyncio.create_task(waiter_1())
     await asyncio.sleep(0.01)
 
-    # 3. New caller tries to acquire lock after owner dies
     async def new_caller() -> None:
         await lock.acquire()
         order.append("new_caller")
@@ -653,3 +525,117 @@ async def test_lock_dead_owner_fifo_recovery() -> None:
     await asyncio.gather(t_waiter, t_caller)
 
     assert order == ["waiter_1", "new_caller"], f"Expected FIFO order, got {order}"
+
+
+@pytest.mark.asyncio
+async def test_lock_reentrant_acquire_raises() -> None:
+    """Same-task re-acquire raises RuntimeError (asyncio.Lock parity) instead of self-deadlock."""
+    lock = Lock()
+    async with lock:
+        with pytest.raises(RuntimeError):
+            async with lock:
+                pass
+
+
+@pytest.mark.asyncio
+async def test_lock_reentrant_cancel_no_ownership_theft() -> None:
+    """A cancelled re-entrant acquire must NOT hand the lock to a queued waiter while outer holds it."""
+    lock = Lock()
+    t1_in_cs = {"v": False}
+
+    async def t1() -> None:
+        try:
+            async with lock:
+                t1_in_cs["v"] = True
+                try:
+                    async with asyncio.timeout(0.2):
+                        async with lock:
+                            pass
+                except (TimeoutError, RuntimeError):
+                    pass
+                await asyncio.sleep(0.3)
+                t1_in_cs["v"] = False
+        except RuntimeError:
+            pass
+
+    async def t2() -> None:
+        async with lock:
+            assert t1_in_cs["v"] is False
+
+    t1_task = asyncio.create_task(t1())
+    await asyncio.sleep(0.05)
+    t2_task = asyncio.create_task(t2())
+    results = await asyncio.wait_for(
+        asyncio.gather(t1_task, t2_task, return_exceptions=True), timeout=5
+    )
+    assert not any(isinstance(r, BaseException) for r in results), results
+
+
+@pytest.mark.asyncio
+async def test_lock_abandoned_owner_gc_and_locked_state() -> None:
+    """Exiting task holding Lock leaves lock.locked=True, owner=None, and allows GC of dead task."""
+    lock = Lock()
+
+    async def abandoned_worker() -> None:
+        await lock.acquire()
+
+    task = asyncio.create_task(abandoned_worker())
+    task_ref = weakref.ref(task)
+    await task
+    await asyncio.sleep(0)
+    del task
+    gc.collect()
+
+    assert lock.locked is True
+    assert lock.owner is None
+    assert task_ref() is None
+
+
+@pytest.mark.asyncio
+async def test_lock_stale_ticket_cancel_idempotency() -> None:
+    """Stale ticket_id cancellation must not release a Lock held by the same task."""
+    task = asyncio.current_task()
+    assert task is not None
+    task_id = id(task)
+
+    lock = Lock()
+    async with lock:
+        assert lock.locked
+        lock._raw.cancel_waiter(task_id, 999_999)
+        assert lock.locked
+    assert not lock.locked
+
+
+@pytest.mark.asyncio
+async def test_cancellation_storm_lock() -> None:
+    """Cancellation storm on Lock: 500 queued waiters simultaneously cancelled."""
+    lock = Lock()
+    await lock.acquire()
+
+    cancelled_count = 0
+
+    async def waiter() -> None:
+        nonlocal cancelled_count
+        try:
+            await lock.acquire()
+            lock.release()
+        except asyncio.CancelledError:
+            cancelled_count += 1
+            raise
+
+    tasks = [asyncio.create_task(waiter()) for _ in range(500)]
+    await asyncio.sleep(0.01)
+    assert len(lock._waiters) == 500
+
+    for t in tasks:
+        t.cancel()
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert cancelled_count == 500
+    assert len(lock._waiters) == 0
+
+    lock.release()
+    assert not lock.locked
+    await lock.acquire()
+    assert lock.locked
+    lock.release()

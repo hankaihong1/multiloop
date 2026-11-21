@@ -3,33 +3,102 @@
 from __future__ import annotations
 
 import asyncio
-import threading
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager
 from typing import Any
 
-from multiloop._channel_base import _wake_all
+from multiloop._cancel import _await_cancellable, _check_not_cancelled, _task_token
 from multiloop._rust import _try_import_rust_class
-from multiloop._sync import Condition, Lock
 
 __all__ = ["AsyncRWMutex"]
 
 _RawAsyncRWMutex = _try_import_rust_class("multiloop._multiloop_core", "RawAsyncRWMutex")
 
 
+class _ReadLockGuard(AbstractAsyncContextManager[None]):
+    """Zero-generator async context guard for :meth:`AsyncRWMutex.reader`."""
+
+    __slots__ = ("_raw", "_task_token")
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self._task_token: int = 0
+
+    async def __aenter__(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("reader() must be used inside an active asyncio task")
+        _check_not_cancelled()
+        token = _task_token(task)
+        if self._raw.try_acquire_read_task(token):
+            self._task_token = token
+            return
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        ticket_id = self._raw.acquire_read_ticket(token, loop, fut)
+        if ticket_id is not None:
+            try:
+                await _await_cancellable(loop, fut)
+            except BaseException:
+                self._raw.cancel_read_ticket(token, ticket_id)
+                raise
+            self._raw.claim_read_ticket(ticket_id)
+        self._task_token = token
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        self._raw.release_read_task(self._task_token)
+
+
+class _WriteLockGuard(AbstractAsyncContextManager[None]):
+    """Zero-generator async context guard for :meth:`AsyncRWMutex.writer`."""
+
+    __slots__ = ("_raw", "_task_token")
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self._task_token: int = 0
+
+    async def __aenter__(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("writer() must be used inside an active asyncio task")
+        _check_not_cancelled()
+        token = _task_token(task)
+        if self._raw.try_acquire_write_task(token):
+            self._task_token = token
+            return
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        ticket_id = self._raw.acquire_write_ticket(token, loop, fut)
+        if ticket_id is not None:
+            try:
+                await _await_cancellable(loop, fut)
+            except BaseException:
+                self._raw.cancel_write_ticket(token, ticket_id)
+                raise
+        self._task_token = token
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        self._raw.release_write_task(self._task_token)
+
+
 class AsyncRWMutex:
     """Read-Write Lock (RWMutex) for asynchronous Python coroutines.
 
     Allows concurrent shared access for multiple readers while granting exclusive access
-    to a single writer. Built upon Rust ``RawAsyncRWMutex`` (or fallback ``Lock``/``Condition``)
-    with writer-preference fairness to eliminate writer starvation under heavy read traffic.
-
-    Concurrency & Python 3.14t (Free-Threaded) Safety:
-    - Reader reentrancy depth (:attr:`_reader_depth`) and current writer task (:attr:`_writer_task`)
-      are synchronized via an internal :class:`threading.Lock` (:attr:`_depth_lock`), guaranteeing
-      race-free operations across multiple OS worker threads without GIL protection.
-    - All waiter wakeups (:func:`_wake_all`) are executed strictly outside of critical locks,
-      preventing waiter callbacks from deadlocking inside lock transitions.
+    to a single writer. Built upon Rust ``RawAsyncRWMutex`` with writer-preference fairness
+    to eliminate writer starvation under heavy read traffic.
 
     Nesting rules:
     - ``reader()`` is re-entrant for the same task.
@@ -37,233 +106,42 @@ class AsyncRWMutex:
       :class:`RuntimeError` immediately to prevent deadlock.
     """
 
-    def __init__(self) -> None:
-        self._raw = _RawAsyncRWMutex() if _RawAsyncRWMutex is not None else None
-        self._depth_lock = threading.Lock()
-        self._reader_depth: dict[asyncio.Task[Any], int] = {}
-        self._writer_task: asyncio.Task[Any] | None = None
+    __slots__ = ("_raw",)
 
-        # Fallback fields when Rust extension is missing
-        self._fallback_readers = 0
-        self._fallback_writer = False
-        self._fallback_pending_writers = 0
-        self._lock = Lock()
-        self._read_ok = Condition(self._lock)
-        self._write_ok = Condition(self._lock)
+    def __init__(self) -> None:
+        if _RawAsyncRWMutex is None:
+            raise RuntimeError("_multiloop_core Rust extension is not compiled.")
+        self._raw = _RawAsyncRWMutex()
 
     @property
     def _readers(self) -> int:
-        if self._raw is not None:
-            return int(self._raw.snapshot()[0])
-        return self._fallback_readers
+        return int(self._raw.snapshot()[0])
 
     @property
     def _writer(self) -> bool:
-        if self._raw is not None:
-            return bool(self._raw.snapshot()[1])
-        return self._fallback_writer
+        return bool(self._raw.snapshot()[1])
 
     @property
     def _pending_writers(self) -> int:
-        if self._raw is not None:
-            return int(self._raw.snapshot()[2])
-        return self._fallback_pending_writers
+        return int(self._raw.snapshot()[2])
 
     def __repr__(self) -> str:
+        readers, writer, pending_writers = self._raw.snapshot()
         return (
-            f"<AsyncRWMutex readers={self._readers} writer={self._writer}"
-            f" pending_writers={self._pending_writers}>"
+            f"<AsyncRWMutex readers={int(readers)} writer={bool(writer)}"
+            f" pending_writers={int(pending_writers)}>"
         )
 
-    @asynccontextmanager
-    async def reader(self) -> AsyncGenerator[None]:
-        """Acquire a shared read lock context manager.
+    def reader(self) -> AbstractAsyncContextManager[None]:
+        """Return an async context manager that acquires a shared read lock.
 
         :raises RuntimeError: If called by a task that already holds an active writer lock.
         """
-        task = asyncio.current_task()
-        if task is None:
-            raise RuntimeError("reader() must be used inside an active asyncio task")
+        return _ReadLockGuard(self._raw)
 
-        with self._depth_lock:
-            if self._writer_task is task:
-                raise RuntimeError(
-                    "AsyncRWMutex: reader() cannot be used while the same task holds writer()"
-                )
-
-        if self._raw is not None:
-            with self._depth_lock:
-                depth = self._reader_depth.get(task, 0)
-                if depth > 0:
-                    self._reader_depth[task] = depth + 1
-                    is_reentrant = True
-                else:
-                    is_reentrant = False
-
-            if not is_reentrant:
-                if not self._raw.try_acquire_read():
-                    loop = asyncio.get_running_loop()
-                    fut = loop.create_future()
-                    if not self._raw.acquire_read_or_register(loop, fut):
-                        try:
-                            await fut
-                        except BaseException:
-                            wakers = self._raw.remove_waiter(loop, fut, False)
-                            if wakers:
-                                _wake_all(wakers)
-                            raise
-                with self._depth_lock:
-                    self._reader_depth[task] = 1
-
-            try:
-                yield
-            finally:
-                release_raw = False
-                with self._depth_lock:
-                    depth = self._reader_depth.get(task, 0)
-                    if depth > 1:
-                        self._reader_depth[task] = depth - 1
-                    else:
-                        self._reader_depth.pop(task, None)
-                        release_raw = True
-                if release_raw:
-                    wakers = self._raw.release_read()
-                    if wakers:
-                        _wake_all(wakers)
-            return
-
-        # Pure Python fallback path
-        async with self._lock:
-            with self._depth_lock:
-                if self._writer_task is task:
-                    raise RuntimeError(
-                        "AsyncRWMutex: reader() cannot be used while the same task holds writer()"
-                    )
-                already_reader = task in self._reader_depth
-            if not already_reader:
-                while self._fallback_writer or self._fallback_pending_writers > 0:
-                    await self._read_ok.wait()
-                self._fallback_readers += 1
-            with self._depth_lock:
-                self._reader_depth[task] = self._reader_depth.get(task, 0) + 1
-
-        try:
-            yield
-        finally:
-            cancelled = False
-            while True:
-                try:
-                    await self._lock.acquire()
-                    break
-                except asyncio.CancelledError:
-                    cancelled = True
-            try:
-                with self._depth_lock:
-                    depth = self._reader_depth.get(task, 0)
-                    if depth > 0:
-                        if depth == 1:
-                            del self._reader_depth[task]
-                            is_last = True
-                        else:
-                            self._reader_depth[task] = depth - 1
-                            is_last = False
-                    else:
-                        is_last = False
-                if is_last:
-                    self._fallback_readers -= 1
-                    if self._fallback_readers == 0:
-                        self._write_ok.notify_all()
-            finally:
-                self._lock.release()
-            if cancelled:
-                raise asyncio.CancelledError()
-
-    @asynccontextmanager
-    async def writer(self) -> AsyncGenerator[None]:
-        """Acquire an exclusive write lock context manager.
+    def writer(self) -> AbstractAsyncContextManager[None]:
+        """Return an async context manager that acquires an exclusive write lock.
 
         :raises RuntimeError: If called by a task holding a reader lock or another writer lock.
         """
-        task = asyncio.current_task()
-        if task is None:
-            raise RuntimeError("writer() must be used inside an active asyncio task")
-
-        with self._depth_lock:
-            if task in self._reader_depth:
-                raise RuntimeError(
-                    "AsyncRWMutex: writer() cannot be used while the same task holds reader()"
-                )
-            if self._writer_task is task:
-                raise RuntimeError("AsyncRWMutex: writer() is not reentrant")
-
-        if self._raw is not None:
-            if not self._raw.try_acquire_write():
-                loop = asyncio.get_running_loop()
-                fut = loop.create_future()
-                if not self._raw.acquire_write_or_register(loop, fut):
-                    try:
-                        await fut
-                    except BaseException:
-                        wakers = self._raw.remove_waiter(loop, fut, True)
-                        if wakers:
-                            _wake_all(wakers)
-                        raise
-            with self._depth_lock:
-                self._writer_task = task
-
-            try:
-                yield
-            finally:
-                with self._depth_lock:
-                    self._writer_task = None
-                wakers = self._raw.release_write()
-                if wakers:
-                    _wake_all(wakers)
-            return
-
-        # Pure Python fallback path
-        async with self._lock:
-            with self._depth_lock:
-                if task in self._reader_depth:
-                    raise RuntimeError(
-                        "AsyncRWMutex: writer() cannot be used while the same task holds reader()"
-                    )
-                if self._writer_task is task:
-                    raise RuntimeError("AsyncRWMutex: writer() is not reentrant")
-            self._fallback_pending_writers += 1
-            acquired = False
-            try:
-                while self._fallback_writer or self._fallback_readers > 0:
-                    await self._write_ok.wait()
-                self._fallback_writer = True
-                with self._depth_lock:
-                    self._writer_task = task
-                acquired = True
-            finally:
-                self._fallback_pending_writers -= 1
-                if self._fallback_pending_writers == 0 and not self._fallback_writer:
-                    self._read_ok.notify_all()
-
-        try:
-            yield
-        finally:
-            if acquired:
-                cancelled = False
-                while True:
-                    try:
-                        await self._lock.acquire()
-                        break
-                    except asyncio.CancelledError:
-                        cancelled = True
-                try:
-                    self._fallback_writer = False
-                    with self._depth_lock:
-                        self._writer_task = None
-                    if self._fallback_pending_writers > 0:
-                        self._write_ok.notify_all()
-                    else:
-                        self._read_ok.notify_all()
-                finally:
-                    self._lock.release()
-                if cancelled:
-                    raise asyncio.CancelledError()
+        return _WriteLockGuard(self._raw)

@@ -13,19 +13,14 @@ built with PyO3, flume, and parking_lot, and exposes `EventLoopThreadPool`,
 `Channel`, `select_channel`, `TaskGroup`, `CancelScope`, and async
 synchronization primitives (`AsyncWaitGroup`, `AsyncOnce`, `AsyncRWMutex`,
 `Lock`, `Semaphore`, `Condition`, `Barrier`, `CapacityLimiter`). The public API
-is intentionally minimal, modeled after `asyncssh`'s top-level-facade style.
+is intentionally minimal, offering a clean top-level facade.
 
-**Crucial Paradigm Distinction: API Lending vs. Single-Threaded Semantics Rejection**:
-`multiloop` borrows the clean, familiar API surface and ergonomics of AnyIO and
-Trio (`TaskGroup`, `CancelScope`, `CapacityLimiter`, `Event`, etc.), but
-**fundamentally rejects their single-threaded, zero-contention semantic
-assumptions**. AnyIO and Trio were designed for single-threaded, single-event-loop
-cooperative multitasking where OS locks are unnecessary and primitives serve
-merely as cooperative coroutine throttles. In contrast, `multiloop` operates under
-Python 3.14t true multi-core physical parallelism across multiple OS threads and
-isolated event loops. Correctness in `multiloop` cannot rely on single-threaded
-cooperative heuristics; it requires **formal axiomatic reasoning, state-machine
-invariants, token conservation laws, and multi-thread signal forwarding**.
+**Multi-Threaded Physical Parallelism & Concurrency Invariants**:
+`multiloop` operates under Python 3.14t true multi-core physical parallelism across
+multiple OS threads and isolated event loops. Correctness cannot rely on single-threaded
+cooperative heuristics; it requires **formal state-machine invariants, token
+conservation laws, OS-level mutex synchronization (`threading.Lock` / `parking_lot::Mutex`),
+and cross-thread signal forwarding (`loop.call_soon_threadsafe`)**.
 
 ---
 
@@ -34,39 +29,46 @@ invariants, token conservation laws, and multi-thread signal forwarding**.
 ```
 multiloop/
 ├── src/
-│   ├── multiloop/              # Python package (15 modules)
+│   ├── multiloop/              # Python package (14 modules)
 │   │   ├── __init__.py       # Public API surface — start here
 │   │   ├── pool.py           # EventLoopThreadPool engine
 │   │   ├── primitives.py     # Channel, select_channel, AsyncWaitGroup, AsyncOnce
 │   │   ├── context.py        # AsyncContext (O(1) set tracking)
-│   │   ├── _cancel.py        # CancelScope, fail_after, move_on_after, shield
-│   │   ├── _sync.py          # Lock, Semaphore, Event, Condition, Barrier, CapacityLimiter
-│   │   ├── _taskgroup.py     # TaskGroup, TaskHandle
+│   │   ├── _cancel.py        # CancelScope (Route 3), fail_after/at, move_on_after/at, sleep, wait_cancellable, checkpoint
+│   │   ├── _sync.py          # Lock, Semaphore, Event, Condition, Barrier, CapacityLimiter (Rust-backed)
+│   │   ├── _taskgroup.py     # TaskGroup (_TGState enum, pool & max_concurrency/limiter), TaskHandle, TaskStatus
 │   │   ├── rwlock.py         # AsyncRWMutex (async read-write lock, Rust-backed)
-│   │   ├── _channel_base.py  # Shared waiter deques, _wake_all, _wakeup_next
 │   │   ├── _rust.py          # _try_import_rust_class helper
 │   │   ├── _metrics.py       # MetricsCollector
 │   │   ├── _options.py       # PoolOptions dataclass
 │   │   ├── _logging.py       # get_logger, set_log_level
 │   │   ├── exceptions.py     # MultiloopError hierarchy
 │   │   └── testing/          # Test helpers
-│   ├── lib.rs                # Rust pymodule registration & tests
+│   ├── lib.rs                # Rust pymodule registration (_multiloop_core)
+│   ├── cancel.rs             # RawTaskCancelState (Route 3 pure Rust task cancel stack & WaiterEntry parking)
+│   ├── errors.rs             # Typed Python exception constructors (multiloop.exceptions)
+│   ├── waiter.rs             # Unified WaiterId ticket & out-of-lock wakeup/cancel helpers
 │   ├── metrics.rs            # AtomicMetrics & 64-byte PaddedAtomic
-│   ├── pool.rs               # NativeWorkerPool & PollerGuard
-│   ├── channel.rs            # Channel, RawAsyncChannel (Anti-Barging FIFO)
+│   ├── pool.rs               # NativeWorkerPool, PollerGuard, >64-worker idle bitmap & drain_all
+│   ├── channel.rs            # RawAsyncChannel & ChannelState (Anti-Barging FIFO, unified sync/async waiters)
+│   ├── sync.rs               # RawAsyncLock, RawAsyncSemaphore, RawAsyncCapacityLimiter, RawAsyncEvent, RawAsyncCondition, RawAsyncBarrier, RawAsyncOnce
 │   ├── waitgroup.rs          # RawAsyncWaitGroup & WaitGroupInner
-│   └── rwlock.rs             # RawAsyncRWMutex (64-bit atomic state machine)
-├── tests/                    # 22 test files (pytest + pytest-asyncio)
+│   ├── rwlock.rs             # RawAsyncRWMutex (writer-preference state machine)
+│   └── tests.rs              # Rust unit tests
+├── tests/                    # 14 test files + conftest.py (pytest + pytest-asyncio)
 ├── benchmarks/               # Multi-thread benchmarks
 ├── examples/                 # Runnable examples (python examples/00_*.py)
 ├── docs/
 │   ├── API.md                # Complete API reference
 │   ├── CHOOSING.md           # Primitive selection decision table (human entry point)
 │   └── CONCURRENCY.md        # Concurrency correctness guide & pre-change checklist
-├── Cargo.toml                # Rust crate config (edition 2021, release LTO)
-├── pyproject.toml            # Python config (mypy strict, ruff, pytest)
-├── Makefile                  # Convenience targets (develop, test, lint, bench)
-├── .github/workflows/        # CI (ci.yml) + publish (publish.yml)
+├── Cargo.toml                # Rust crate config (edition 2021, thin release LTO)
+├── pyproject.toml            # Python config (mypy strict, pyright strict, ruff, pytest)
+├── Makefile                  # Convenience targets (sync, develop, test, lint, package, bench, all)
+├── .github/
+│   ├── actions/              # Shared composite actions (setup-env, run-lint, build-dist)
+│   ├── scripts/              # Shared CI/Makefile helpers (_common.py, run_rust_tests.py, check_release.py, run_ci_versions.py, build_host_wheels.py, verify_dist.py)
+│   └── workflows/            # CI (ci.yml), Publish (publish.yml), Release Drafter
 └── CONTRIBUTING.md           # Human-oriented dev setup guide
 ```
 
@@ -107,13 +109,13 @@ searches, never modify.
 
 | Tool | Configuration | Gate |
 |------|--------------|------|
-| **cargo clippy** | `-D warnings` | Zero warnings |
+| **cargo clippy** | `--locked -- -D warnings` | Zero warnings |
 | **cargo fmt** | Edition 2021 | Clean diff |
-| **release profile** | `opt-level = 3`, `lto = true`, `codegen-units = 1`, `strip = true` | — |
+| **release profile** | `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = false` | — |
 
 ### General
 
-- **Python version**: `>= 3.14` (free-threaded build recommended).
+- **Python version**: `>= 3.14t` (free-threaded / no-GIL only; OS-grouped CI and release builds both target `3.14t` and `3.15t` across Linux, macOS, and Windows).
 - **Package manager**: `uv` exclusively — do not use `pip`.
 - **Rust toolchain**: stable (via rustup).
 - **Rust extension optional**: every Python module that depends on the Rust
@@ -124,12 +126,12 @@ searches, never modify.
   file an issue/request first and wait for approval before writing code.
   A PR is merged only after all required CI checks pass (lint, type checks,
   tests) — never merge a red PR, and never ask a maintainer to.
-- **Docs-only exception to green-before-merge**: changes touching only
-  `*.md` files or `docs/**` skip the heavy lint/build/test matrix — the
-  `Docs Drift Check` job runs `tests/test_docs.py` (EN/ZH parity, code-block
-  syntax, API coverage) and the project lead reviews the diff before
-  merging or pushing. Anything else (code, config, CI files) runs the full
-  suite; a mixed change runs both gates.
+- **Docs/examples-only exception to green-before-merge**: changes touching only
+  `*.md`, `docs/**`, or `examples/**` skip the heavy lint/build/test matrix —
+  the `Docs Drift Check` job runs `ruff` on `tests/test_docs.py`/`examples` plus
+  `tests/test_docs.py` (EN/ZH parity, code-block syntax, API coverage), and the
+  project lead reviews the diff before merging or pushing. Anything else
+  (code, config, CI files) runs the full suite; a mixed change runs both gates.
 - **GitHub Actions is for CI, not debugging**: never use workflow runs as a
   debugging tool — no debug commits, no temporary diagnostic workflows, no
   bisecting platform-specific failures on remote runners (they pollute the
@@ -158,16 +160,26 @@ searches, never modify.
    `_worker_dispatcher` is the per-worker event loop that calls `pop_work()`
    and spawns tasks.
 
-3. **`src/lib.rs`** — Rust backend. Five `#[pyclass]` types: `NativeWorkerPool`
-   (global + per-worker flume queues, batch-pull pop_work), `RawAsyncChannel`
-   (native async channel with anti-barging FIFO), `AtomicMetrics` (padded atomic counters),
-   `RawAsyncWaitGroup` (atomic counter + mutex-protected waiter list), and `RawAsyncRWMutex`.
+3. **`src/lib.rs`** — Rust backend (`_multiloop_core`). Registers thirteen `#[pyclass]`
+   types across seven modules (plus shared `WaiterId` ticket / out-of-lock wakeup &
+   cancellation helpers in `src/waiter.rs` and typed exception constructors in
+   `src/errors.rs`): `RawTaskCancelState` (`src/cancel.rs`), `NativeWorkerPool`
+   (`src/pool.rs`), `RawAsyncChannel` (`src/channel.rs`), `AtomicMetrics`
+   (`src/metrics.rs`), `RawAsyncWaitGroup` (`src/waitgroup.rs`),
+   `RawAsyncRWMutex` (`src/rwlock.rs`), and the synchronization state machines in
+   `src/sync.rs` (`RawAsyncLock`, `RawAsyncSemaphore`, `RawAsyncCapacityLimiter`,
+   `RawAsyncEvent`, `RawAsyncCondition`, `RawAsyncBarrier`, `RawAsyncOnce`).
 
 4. **`src/multiloop/primitives.py`** — `Channel` Python facade over native Rust
-   `RawAsyncChannel`, `select_channel`, `AsyncWaitGroup`, `AsyncOnce`.
+   `RawAsyncChannel`, `select_channel` (weakref-backed watchers), `AsyncWaitGroup`
+   (over `RawAsyncWaitGroup`), and `AsyncOnce` (over `RawAsyncOnce`).
 
-5. **`src/multiloop/_cancel.py`** — `CancelScope` with shield semantics, using
-   `task.uncancel()` / `task.cancel()` snapshot/restore on Python 3.11+.
+5. **`src/multiloop/_cancel.py`** — Route 3 pure Rust task cancel stack:
+   `CancelScope` (with `shield` and `PLAIN` / `MOVE_ON` / `FAIL_AFTER` exit modes),
+   `fail_after`/`fail_at`, `move_on_after`/`move_on_at`, `sleep`, `wait_cancellable`,
+   and `checkpoint`, backed by `RawTaskCancelState` (`_TASK_CANCEL_STATES`
+   `WeakKeyDictionary`) with zero mutation of CPython `task.cancel()` / `uncancel()` /
+   `cancelling()`.
 
 ### For bug investigation
 
@@ -179,17 +191,17 @@ searches, never modify.
 ### Module dependency map (simplified)
 
 ```
-__init__.py  ──┬── pool.py ────────── _rust.py ── _multiloop_core (lib.rs)
-                ├── primitives.py ──── _channel_base.py
-                ├── _cancel.py
-                ├── _sync.py
-                ├── _taskgroup.py
-                ├── context.py
-                ├── rwlock.py
-                ├── exceptions.py
-                ├── _metrics.py
-                ├── _options.py
-                └── _logging.py
+__init__.py  ──┬── pool.py ──────────┬── _rust.py ── _multiloop_core (lib.rs)
+               ├── primitives.py ────┤
+               ├── _sync.py ─────────┤
+               ├── rwlock.py ────────┤
+               ├── exceptions.py ────┤
+               ├── _metrics.py ──────┤
+               ├── _cancel.py ───────┘
+               ├── _taskgroup.py
+               ├── context.py
+               ├── _options.py
+               └── _logging.py
 ```
 
 ## 4.1 Mandatory reading before touching concurrency code
@@ -199,14 +211,15 @@ waitgroups, cancellation, or the pool **must** pass the checklist in
 [`docs/CONCURRENCY.md`](docs/CONCURRENCY.md) (sections 1-3). Hard rules that
 hold regardless:
 
-1. **Read `docs/CONCURRENCY.md` first** — the eight trap patterns and the
-   pre-change checklist are the operating manual; the six design decisions
+1. **Read `docs/CONCURRENCY.md` first** — the nine trap patterns and the
+   pre-change checklist are the operating manual; the seven design decisions
    below are the "why" summary.
 2. New or modified waiter registration/wakeup paths need a lock-free fast
    path **plus a re-check under the lock** (lost-wakeup is the #1 bug class
    here).
 3. Cancellation paths re-acquiring locks must run under a cancellation
-   shield; waiter removal must carry generation/identity checks.
+   shield or cancellation-absorbing retry loop; waiter removal must carry
+   generation/`WaiterId` ticket checks.
 4. New public APIs must update `docs/API.md`, `__init__.pyi`, and (for new
    features) an `examples/` script — `tests/test_docs.py` enforces the first
    two.
@@ -239,6 +252,7 @@ work via `NativeWorkerPool::pop_work()` with this priority order:
 1. **Private buffer** (per-worker `VecDeque` — cached from previous batch pulls)
 2. **Global queue** (batch-pull under a soft poller gate)
 3. **Local dedicated channel** (for loop-pinned tasks)
+4. **Single-item fallback & cross-worker buffer work-stealing** (if skipped by the soft poller gate, or stealing up to half of a sibling worker's cached buffer)
 
 The soft poller gate (`num_polling < max(num_workers / 2, 1)`) limits
 concurrent global-queue pollers to ~half the workers, preventing contention
@@ -252,12 +266,15 @@ pops so no single worker greedily drains the global queue.
 
 | Component | Source file | Crate | Purpose |
 |---|---|---|---|
-| `NativeWorkerPool` | `src/pool.rs` | PyO3 + flume | Lock-free global queue + per-worker bounded (256) local channels, batch-pull `pop_work`, soft poller gate |
-| `Channel` | `src/channel.rs` | flume | Lock-free bounded/unbounded channel, exposed to Python as `multiloop.primitives.Channel` |
-| `RawAsyncChannel` | `src/channel.rs` | parking_lot + PyO3 | Python-independent async channel core with anti-barging FIFO ordering protection |
-| `AtomicMetrics` | `src/metrics.rs` | `std::sync::atomic` | 64-byte-padded per-worker counters (`active`, `completed`, `global_pull_count`, `park_count`, etc.) — prevents false sharing |
-| `RawAsyncWaitGroup` | `src/waitgroup.rs` | parking_lot `Mutex<WaitGroupInner>` | Go-style atomic counter + generation + waiter list with single-mutex state machine |
-| `RawAsyncRWMutex` | `src/rwlock.rs` | parking_lot `Mutex<RWMutexInner>` | 64-bit atomic state machine, writer-preference async read-write lock with cancellation cleanup |
+| `WaiterId` / `WaiterEntry` | `src/waiter.rs` | PyO3 | Monotonic `u64` waiter tickets and out-of-lock `call_soon_threadsafe` wakeup/cancel helpers (`wake_waiter_outside_lock`, `cancel_waiter_outside_lock`, `wake_pair_outside_lock`) with closed-loop rollback detection |
+| `RawTaskCancelState` | `src/cancel.rs` | parking_lot + PyO3 | Route 3 per-task cancel stack (`push_scope`, `pop_scope`, `park_waiter`, `unpark_waiter`, `cancel_scope`, `set_shield`, `set_deadline`) — zero `task.cancelling()` mutation |
+| `errors` | `src/errors.rs` | PyO3 | Typed exception builders mapping directly to `multiloop.exceptions` (`WouldBlock`, `ChannelClosedError`, `ThreadPoolClosedError`, `TimeoutError`) |
+| `NativeWorkerPool` | `src/pool.rs` | PyO3 + flume + parking_lot | Lock-free global queue + per-worker unbounded local channels (`pin_to`), `Box<[AtomicU64]>` >64-worker CAS idle bitmap, `outstanding_tasks` / `wait_drained` / `drain_all`, and 4-tier `pop_work` |
+| `RawAsyncChannel` | `src/channel.rs` | parking_lot + PyO3 | Native async channel core with `WaiterId` tickets, anti-barging FIFO ordering protection, and out-of-lock wakeups |
+| `RawAsyncLock`, `RawAsyncSemaphore`, `RawAsyncCapacityLimiter`, `RawAsyncEvent`, `RawAsyncCondition`, `RawAsyncBarrier`, `RawAsyncOnce` | `src/sync.rs` | parking_lot + PyO3 | Unified Rust synchronization state machines with `WaiterId` tickets, FIFO permit/notification conservation, and out-of-lock wakeups |
+| `AtomicMetrics` | `src/metrics.rs` | `std::sync::atomic` + PyO3 | 64-byte-padded per-worker counters (`active`, `completed`, `global_pull_count`, `park_count`, `injection_queue_depth`, `remote_schedule_count`) — prevents false sharing |
+| `RawAsyncWaitGroup` | `src/waitgroup.rs` | parking_lot + PyO3 | Go-style counter + `WaiterId` ticket waiter list under `Mutex<WaitGroupInner>` with out-of-lock wakeups |
+| `RawAsyncRWMutex` | `src/rwlock.rs` | parking_lot + PyO3 | Writer-preference async read-write lock under `Mutex<RWMutexInner>` with `WaiterId` tickets, reader task reentrancy, and cancellation cleanup |
 
 ### Python-side patterns
 
@@ -265,16 +282,20 @@ pops so no single worker greedily drains the global queue.
   depends on `_multiloop_core` imports Rust classes through this function.
   Returns `None` if the extension is missing — no import-time crash.
 
-- **`CancelScope` with shield** (`_cancel.py`): Uses `task.cancelling()` /
-  `task.uncancel()` snapshot on enter, `task.cancel()` restore on exit, so
-  cleanup code (like re-acquiring a lock in `Condition.wait()`) runs to
-  completion even under cancellation.
+- **`CancelScope` with Route 3 pure Rust task cancel stack** (`_cancel.py`, `src/cancel.rs`):
+  Pushes scope entries into the task's `RawTaskCancelState` (`_TASK_CANCEL_STATES`
+  `WeakKeyDictionary`). `multiloop` wait points (`_await_cancellable`, `sleep`,
+  `wait_cancellable`, `Channel`, `Lock`, `TaskHandle`, etc.) subscribe to `park_waiter`
+  without ever mutating CPython `task.cancel()`, `task.uncancel()`, or `task.cancelling()`.
+  `shield=True` blocks outer `CancelScope` cancellation/deadlines cleanly, and `__aexit__`
+  enforces strict `PLAIN` / `MOVE_ON` / `FAIL_AFTER` exit rules (`submit_many` accepts
+  `cancel_scope` only when `len(targets) <= 1`).
 
-- **`Condition` latch & cancellation forwarding** (`_sync.py`): `notify()`
-  does NOT require the underlying lock. Waiters register via sticky
-  `asyncio.Event` under a separate `_waiters_lock`. If a waiter is cancelled
-  while re-acquiring the lock after being notified, it automatically forwards
-  the notification to the next waiter to conserve notification tokens.
+- **`Condition` latch & cancellation forwarding** (`_sync.py`, `src/sync.rs`): `notify()`
+  does NOT require the underlying lock. Waiters register `WaiterId` tickets in
+  `RawAsyncCondition` before releasing `Lock`, then re-acquire `Lock` via a
+  cancellation-absorbing retry loop (`_reacquire_lock`), conserving notification
+  tokens on cancellation via `_raw.cancel_or_forward()` and `_raw.forward_notify()`.
 
 ### Seven non-obvious design decisions
 
@@ -282,77 +303,83 @@ These are the places where a change that looks like a simplification usually
 breaks a real correctness or performance property. **Read each before modifying
 the related code.**
 
-1. **Anti-barging FIFO token conservation in `Channel`** (`channel.rs:270-360`, `primitives.py:180-240`):
+1. **Anti-barging FIFO token conservation in `Channel`** (`src/channel.rs:243-336, 615-786`, `src/multiloop/primitives.py:209-239`):
    `RawAsyncChannel` enforces strict FIFO ordering so external `try_send` cannot barge ahead
    of queued putters. Woken putters hold reservations via `in_flight_putters` until `claim_put`.
-   If a woken putter is cancelled, `unregister_putter` automatically forwards the reservation
-   to the next queued putter or decrements the reservation count, conserving tokens and preventing deadlocks.
+   If a woken putter is cancelled, `cancel_putter` automatically forwards
+   the reservation to the next queued putter or removes it from `in_flight_putters`, conserving tokens and preventing deadlocks.
 
-2. **`CancelScope` shield semantics** (`_cancel.py:97-205`):
-   Shielded scopes snapshot and clear `task.cancelling()`, then restore it on
-   exit. This lets cleanup blocks (like lock re-acquisition) run to completion
-   without the next `await` re-raising `CancelledError`. Without it,
-   `Condition.wait()` deadlocks on cancel.
+2. **Route 3 pure Rust task cancel stack & three-mode exit** (`src/multiloop/_cancel.py`, `src/cancel.rs`):
+   `CancelScope` never mutates CPython `task.cancel()`/`uncancel()`/`cancelling()`, eliminating
+   cross-ledger drift and shield count leaks. Waiters subscribe via `_await_cancellable` +
+   `park_waiter`/`unpark_waiter`; foreign coroutines bridge via `wait_cancellable(...)` and
+   cancellable waits use `multiloop.sleep(...)`. Exiting `__aexit__` strictly enforces `PLAIN`
+   (raises `CancelledError` if cancelled), `MOVE_ON` (`cancelled_caught = True`), and `FAIL_AFTER`
+   (raises `TimeoutError`). `EventLoopThreadPool.submit_many(..., cancel_scope=...)` accepts
+   a scope only for single-target batches (`len <= 1`, raising `ValueError` otherwise).
 
-3. **Condition notification forwarding on re-acquire cancellation** (`_sync.py:624-646`):
-   When a `wait()` coroutine is awakened by `notify()` but receives a cancellation
-   request while waiting to re-acquire the underlying mutex, the notification
-   token has already been deducted. The cancellation handler MUST forward
-   `_forward_notify()` to ensure subsequent waiters are not starved.
+3. **Condition notification forwarding on re-acquire cancellation** (`src/multiloop/_sync.py:463-499, 529-539`, `src/sync.rs:768-785`):
+   When a `wait()` coroutine is cancelled while awaiting its future, `_raw.cancel_or_forward(ticket_id)`
+   forwards the notification if `notify()` had already popped it. When awakened normally and cancelled
+   while re-acquiring `Lock` in `_reacquire_lock()`, the retry loop finishes acquiring `Lock` before
+   re-raising `CancelledError`, and `wait()` calls `_raw.forward_notify()` so subsequent waiters are not starved.
 
-4. **Barrier automatic Broken state machine & generation tracking** (`_sync.py:774-896`):
-   A `_generation` counter ties every waiter to the exact round it joined.
-   On cancellation of any waiting party before round completion, the barrier
-   automatically marks itself broken, wakes all remaining waiting parties with an
-   error, and advances the generation, preventing deadlocks without requiring manual abort.
+4. **Barrier automatic Broken state machine & generation tracking** (`src/multiloop/_sync.py`, `src/sync.rs`):
+   A monotonic `generation` counter in Rust `RawAsyncBarrier` ties every waiter to the exact round it joined.
+   On cancellation of any waiting party before round completion, `cancel_waiter(generation, ticket_id)`
+   automatically marks the barrier broken, wakes all remaining waiting parties with an error outside the lock,
+   and advances `generation`, preventing deadlocks without requiring manual abort.
 
-5. **Condition latch** (`_sync.py:539-744`):
-   `notify()` does not require the lock, avoiding the notifier-blocks-while-
-   sleeper-sleeps deadlock. Sticky `asyncio.Event` + register-before-release
-   closes the lost-notification window.
+5. **Condition latch** (`src/multiloop/_sync.py:463-539`, `src/sync.rs:711-800`):
+   `notify()` does not require the lock, avoiding the notifier-blocks-while-sleeper-sleeps deadlock.
+   Registering a `WaiterId` ticket in `RawAsyncCondition` (`_raw.register_waiter`) before releasing `Lock`
+   — paired with `notified_tickets` tracking — closes the lost-notification window.
 
-6. **Work-stealing with the `num_polling` gate** (`src/pool.rs:170-200`):
+6. **Work-stealing with the `num_polling` gate** (`src/pool.rs:25-31, 275-285`):
    A soft atomic gate (`num_polling < max(num_workers/2, 1)`) limits
    concurrent global-queue pollers. The gate is momentary (acquired per
    `pop_work` call, released immediately via `PollerGuard`), so any worker can
    win it — no hard role assignments that drift with load.
 
-7. **Rust global queue and batch pull with 3-source drain** (`src/pool.rs:160-230`):
-   Three-tier consumption: private buffer → global batch pull → local channel.
-   The push side falls back from local to global when a per-worker channel is
-   full, preserving liveness. Drain phase validates all three sources (global queue,
-   private buffer, local channel) are completely empty before worker loop termination.
+7. **Rust global queue and 4-tier `pop_work` with multi-source drain** (`src/pool.rs:58, 156-171, 223-254, 256-391`):
+   Four-tier consumption: private buffer → global batch pull → local channel → single-item fallback & cross-worker buffer work-stealing.
+   Local channels are unbounded to guarantee 100% strict loop affinity for `pin_to`
+   tasks without silent drift. Drain phase validates that the global queue, all worker
+   buffers, and local channels are completely empty before worker loop termination.
 
 ---
 
 ## 6. Quick Commands
 
-All commands assume you have run `uv sync --group dev` first.
+All commands assume you have run `make sync` (`uv sync --locked --group dev`) first.
 
 ### Build (required before first import)
 
 ```bash
-make develop          # or: uv run maturin develop --release
+make develop          # or: uv run maturin develop --release --locked
 ```
 
 ### Test
 
 ```bash
-make test             # full test suite
-uv run pytest -x -m "not slow"   # skip slow benchmarks
-uv run pytest --lf               # re-run last failures
+make test             # make test-rust + uv run --no-sync pytest
+make test-rust        # cross-platform Rust unit tests via .github/scripts/run_rust_tests.py
+make test-docs        # docs parity + code-block/example AST syntax guard
+uv run --no-sync pytest -x -m "not slow"   # skip slow benchmarks
+uv run --no-sync pytest --lf               # re-run last failures
 ```
 
 ### Lint & Type Check
 
 ```bash
-make lint             # ruff + mypy + pyright + cargo clippy + cargo fmt --check
+make lint             # check-release + ruff (check/format) + mypy + pyright + cargo (clippy/fmt/doc)
 
 # Individual:
-uv run ruff check .
-uv run mypy --strict src/multiloop
-uv run pyright src/multiloop
-cargo clippy -- -D warnings
+uv run --no-sync ruff check .
+uv run --no-sync ruff format --check .
+MYPYPATH=src uv run --no-sync mypy --strict src/multiloop
+uv run --no-sync pyright src/multiloop
+cargo clippy --locked -- -D warnings
 cargo fmt --check
 ```
 

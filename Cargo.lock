@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "multiloop-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "flume",
  "parking_lot",

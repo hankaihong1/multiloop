@@ -3,17 +3,23 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::sync::Arc;
 
-/// A registered waiter: (event loop, future) pair used to wake a suspended
-/// `wait()` coroutine from whichever thread calls `done()`.
-pub(crate) type Waiter = (Py<PyAny>, Py<PyAny>);
+use crate::waiter::{wake_pair_outside_lock, WaiterEntry, WaiterId};
 
 pub(crate) struct WaitGroupInner {
+    pub(crate) next_waiter_id: WaiterId,
     pub(crate) counter: usize,
-    pub(crate) generation: u64,
-    pub(crate) waiters: Vec<Waiter>,
+    pub(crate) waiters: Vec<WaiterEntry>,
 }
 
-#[pyclass(module = "multiloop._multiloop_core")]
+impl WaitGroupInner {
+    fn alloc_id(&mut self) -> WaiterId {
+        let id = self.next_waiter_id;
+        self.next_waiter_id = self.next_waiter_id.wrapping_add(1);
+        id
+    }
+}
+
+#[pyclass(frozen, module = "multiloop._multiloop_core")]
 pub struct RawAsyncWaitGroup {
     pub(crate) state: Arc<Mutex<WaitGroupInner>>,
 }
@@ -30,8 +36,8 @@ impl RawAsyncWaitGroup {
     pub fn new() -> Self {
         RawAsyncWaitGroup {
             state: Arc::new(Mutex::new(WaitGroupInner {
+                next_waiter_id: 1,
                 counter: 0,
-                generation: 0,
                 waiters: Vec::new(),
             })),
         }
@@ -41,75 +47,102 @@ impl RawAsyncWaitGroup {
     ///
     /// Negative deltas are legal, but the counter must never go below zero:
     /// an `add()` that would underflow raises `RuntimeError`.
-    /// Returns `Some(waiters)` when counter reaches 0 to wake registered waiters.
-    pub fn add(&self, delta: isize) -> PyResult<Option<Vec<Waiter>>> {
-        let mut guard = self.state.lock();
-        if delta < 0 {
-            let magnitude = delta.unsigned_abs();
-            if guard.counter < magnitude {
-                return Err(PyRuntimeError::new_err(
-                    "WaitGroup counter went negative: add() with negative delta",
-                ));
-            }
-            guard.counter -= magnitude;
-            if guard.counter == 0 {
-                guard.generation = guard.generation.wrapping_add(1);
-                let waiters = std::mem::take(&mut guard.waiters);
-                return Ok(Some(waiters));
-            }
-        } else {
-            match guard.counter.checked_add(delta as usize) {
-                Some(v) => guard.counter = v,
-                None => {
+    /// Wakes registered waiters directly outside the lock when counter reaches 0.
+    pub fn add(&self, py: Python<'_>, delta: i64) -> PyResult<usize> {
+        let waiters = {
+            let mut guard = self.state.lock();
+            if delta < 0 {
+                let magnitude = delta.unsigned_abs() as usize;
+                if guard.counter < magnitude {
                     return Err(PyRuntimeError::new_err(
-                        "WaitGroup counter overflowed: add() with positive delta",
+                        "WaitGroup counter went negative: add() with negative delta",
                     ));
                 }
+                guard.counter -= magnitude;
+                if guard.counter == 0 {
+                    std::mem::take(&mut guard.waiters)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                match guard.counter.checked_add(delta as usize) {
+                    Some(v) => guard.counter = v,
+                    None => {
+                        return Err(PyRuntimeError::new_err(
+                            "WaitGroup counter overflowed: add() with positive delta",
+                        ));
+                    }
+                }
+                Vec::new()
             }
+        };
+        let count = waiters.len();
+        for w in waiters {
+            wake_pair_outside_lock(py, &w.event_loop, &w.future);
         }
-        Ok(None)
+        Ok(count)
     }
 
-    pub fn done(&self) -> PyResult<Option<Vec<Waiter>>> {
-        let mut guard = self.state.lock();
-        if guard.counter == 0 {
-            return Err(PyRuntimeError::new_err(
-                "WaitGroup counter went negative: too many done() calls",
-            ));
+    pub fn done(&self, py: Python<'_>) -> PyResult<usize> {
+        let waiters = {
+            let mut guard = self.state.lock();
+            if guard.counter == 0 {
+                return Err(PyRuntimeError::new_err(
+                    "WaitGroup counter went negative: too many done() calls",
+                ));
+            }
+            guard.counter -= 1;
+            if guard.counter == 0 {
+                std::mem::take(&mut guard.waiters)
+            } else {
+                Vec::new()
+            }
+        };
+        let count = waiters.len();
+        for w in waiters {
+            wake_pair_outside_lock(py, &w.event_loop, &w.future);
         }
-        guard.counter -= 1;
-        if guard.counter == 0 {
-            guard.generation = guard.generation.wrapping_add(1);
-            let waiters = std::mem::take(&mut guard.waiters);
-            Ok(Some(waiters))
-        } else {
-            Ok(None)
-        }
+        Ok(count)
     }
 
-    /// Registers a waiter that will be notified when the counter reaches zero.
+    pub fn is_zero(&self) -> bool {
+        self.state.lock().counter == 0
+    }
+
+    pub fn waiter_count(&self) -> usize {
+        self.state.lock().waiters.len()
+    }
+
+    /// Registers a waiter using the unified `WaiterId (u64)` ticket protocol.
     ///
-    /// Returns `true` if the counter is already zero (waiter is not registered
-    /// and the caller should proceed immediately). Returns `false` if the waiter
-    /// was registered and will be notified by a future `done()` call.
-    pub fn register_waiter(&self, waiter: Waiter) -> bool {
+    /// Returns `None` if the counter is already zero (caller proceeds immediately),
+    /// or `Some(ticket_id)` if registered.
+    pub fn register_waiter_ticket(
+        &self,
+        loop_obj: Py<PyAny>,
+        fut_obj: Py<PyAny>,
+    ) -> Option<WaiterId> {
         let mut guard = self.state.lock();
         if guard.counter == 0 {
-            true
+            None
         } else {
-            guard.waiters.push(waiter);
-            false
+            let id = guard.alloc_id();
+            guard.waiters.push(WaiterEntry::new(id, loop_obj, fut_obj));
+            Some(id)
         }
     }
 
-    /// Removes a previously registered waiter by future identity.
-    ///
-    /// Returns `true` if the waiter was still queued and is now removed,
-    /// `false` if it had already been handed over by a `done()`-to-zero.
-    pub fn unregister_waiter(&self, fut: Py<PyAny>) -> bool {
+    /// Removes a previously registered waiter by `WaiterId` ticket.
+    pub fn cancel_waiter_ticket(&self, ticket_id: WaiterId) -> bool {
         let mut guard = self.state.lock();
-        let before = guard.waiters.len();
-        guard.waiters.retain(|(_, f)| !f.is(&fut));
-        guard.waiters.len() != before
+        let removed = guard
+            .waiters
+            .iter()
+            .position(|w| w.id == ticket_id)
+            .map(|pos| guard.waiters.swap_remove(pos));
+        drop(guard);
+        let was_present = removed.is_some();
+        drop(removed);
+        was_present
     }
 }

@@ -1,0 +1,66 @@
+name: "Setup Toolchain & Python Environment"
+description: "Configure Rust toolchain (with cache), uv, free-threaded Python, and locked dependencies."
+
+inputs:
+  python-version:
+    description: "Target Python version for uv (e.g. 3.14t, 3.15t)."
+    required: false
+    default: "3.14t"
+  install-rust:
+    description: "Whether to install the stable Rust toolchain."
+    required: false
+    default: "true"
+  rust-components:
+    description: "Comma-separated Rustup components to install (e.g. 'clippy, rustfmt')."
+    required: false
+    default: ""
+  cache-rust:
+    description: "Whether to cache Cargo registry and target directory."
+    required: false
+    default: "true"
+  cache-key:
+    description: "Optional extra suffix for rust-cache key (useful in build matrices)."
+    required: false
+    default: ""
+  sync-mode:
+    description: "Dependency sync mode: no-project | project | none."
+    required: false
+    default: "no-project"
+  uv-cache:
+    description: "uv cache mode: auto | true | false."
+    required: false
+    default: "auto"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Rust toolchain
+      if: ${{ inputs.install-rust == 'true' }}
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.rust-components }}
+
+    - name: Restore Rust cache
+      if: ${{ inputs.install-rust == 'true' && inputs.cache-rust == 'true' }}
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}
+
+    - name: Set up uv and Python ${{ inputs.python-version }}
+      uses: astral-sh/setup-uv@v10.4.0
+      with:
+        enable-cache: ${{ inputs.uv-cache }}
+        cache-dependency-glob: |
+          uv.lock
+          pyproject.toml
+        python-version: ${{ inputs.python-version }}
+
+    - name: Sync dependencies (dev group only, skip local build)
+      if: ${{ inputs.sync-mode == 'no-project' }}
+      shell: bash
+      run: uv sync --locked --no-install-project --group dev
+
+    - name: Sync project & dev dependencies
+      if: ${{ inputs.sync-mode == 'project' }}
+      shell: bash
+      run: uv sync --locked --group dev

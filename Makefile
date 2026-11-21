@@ -1,42 +1,56 @@
-.PHONY: develop build test test-rust test-slow bench lint format docs clean all
+.PHONY: sync develop build sdist package check-release test test-rust test-docs test-slow bench lint format docs clean all
+
+sync:
+	uv sync --locked --group dev
 
 develop:
-	uv run maturin develop --release
+	uv run --no-sync maturin develop --release --locked
 
 build:
-	uv run maturin build --release
+	uv run --no-sync maturin build --release --locked --out dist --compatibility pypi
+
+sdist:
+	uv run --no-sync maturin sdist --out dist
+
+package: build sdist
+
+check-release:
+	uv run --no-sync python .github/scripts/check_release.py
 
 test-rust:
-	cargo test --no-default-features --features test-init
+	uv run --no-sync python .github/scripts/run_rust_tests.py
+
+test-docs:
+	PYTHONPATH=src uv run --no-sync pytest tests/test_docs.py -q
+
+docs: test-docs
 
 test: test-rust
-	uv run pytest
+	uv run --no-sync pytest
 
 test-slow:
-	uv run pytest -m slow -o addopts=""
+	uv run --no-sync pytest -m slow -o addopts=""
 
 bench:
 	for f in benchmarks/benchmark_pull_model.py benchmarks/bench_multithread_loops.py; do \
-		uv run python "$$f"; \
+		uv run --no-sync python "$$f"; \
 	done
 
-lint:
-	uv run ruff check .
-	uv run ruff format --check .
-	uv run mypy --strict src/multiloop
-	uv run pyright src/multiloop
-	cargo clippy -- -D warnings
+lint: check-release
+	uv run --no-sync ruff check .
+	uv run --no-sync ruff format --check .
+	MYPYPATH=src uv run --no-sync mypy --strict src/multiloop
+	uv run --no-sync pyright src/multiloop
+	cargo clippy --locked -- -D warnings
 	cargo fmt --check
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --locked
 
 format:
-	uv run ruff format .
+	uv run --no-sync ruff format .
 	cargo fmt
-
-docs:
-	uv run --with sphinx --with sphinx-rtd-theme sphinx-build -b html docs docs/sphinx_html
 
 clean:
 	cargo clean
-	rm -rf .pytest_cache .ruff_cache .mypy_cache
+	rm -rf dist dist-check .venv-ci-* .venv-build .venv-dist-* .pytest_cache .ruff_cache .mypy_cache
 
 all: develop lint test

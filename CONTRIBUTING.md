@@ -16,98 +16,105 @@ we expect all contributors to uphold it.
 - [Building the Rust Extension](#building-the-rust-extension)
 - [Testing](#testing)
 - [Linting & Type Checking](#linting--type-checking)
-- [PR Process](#pr-process)
+- [PR & Release Process](#pr--release-process)
 
 ---
 
 ## Development Setup
 
-`multiloop` is a Python 3.14t (free-threaded / no-GIL) library with a Rust core
-built with PyO3 and maturin. All tooling is managed through **`uv`** — please do
-not use `pip`.
+`multiloop` targets **free-threaded Python (`>= 3.14t`, no-GIL)** with a Rust
+core built via PyO3 and `maturin`. All Python tooling is managed through
+**`uv`** — please do not use `pip`.
 
 ### Prerequisites
 
-- **Python** `>= 3.14` (free-threaded build recommended)
-- **Rust** toolchain (stable) — needed to compile the `_multiloop_core` extension
-- **`uv`** — the package/project manager used throughout this repo
+- **Python** `>= 3.14t` (free-threaded build; `uv` will provision `3.14t` from `.python-version`)
+- **Rust** toolchain (`stable`, with `clippy` and `rustfmt`) — needed to compile `_multiloop_core`
+- **`uv`** — the package and environment manager used throughout this repo
 
 ### Install dev dependencies
 
 ```bash
-uv sync --group dev
+make sync             # or: uv sync --locked --group dev
 ```
 
-This installs the dev dependency group from `pyproject.toml`, including
-`maturin`, `mypy`, `pytest`, `pytest-asyncio`, `pytest-repeat`,
-`ruff`, `httpx`, and `winuvloop`.
+This installs the locked `dev` dependency group from `pyproject.toml`, including
+`maturin`, `mypy`, `pyright`, `pytest`, `pytest-asyncio`, `pytest-benchmark`,
+`pytest-repeat`, `pytest-timeout`, and `ruff`.
 
 ---
 
 ## Building the Rust Extension
 
-The core engine (`_multiloop_core`) is a Rust cdylib (PyO3 + `flume` + `parking_lot`)
-that must be compiled before Python code can import `multiloop`.
+The core engine (`_multiloop_core`) is a Rust `cdylib` (`PyO3` + `flume` +
+`parking_lot`) that must be compiled before Python code can import `multiloop`.
 
 Build it with the release profile:
 
 ```bash
-uv run maturin develop --release
+make develop          # or: uv run maturin develop --release --locked
 ```
 
-> The `--release` profile is important — it enables `opt-level = 3`, LTO, and
-> single codegen units as configured in `Cargo.toml`, which is what produces the
-> performance characteristics the benchmarks rely on.
+> The `--release` profile is important — it enables `opt-level = 3`, thin LTO,
+> and single codegen units as configured in `Cargo.toml`, which is what produces
+> the performance characteristics the benchmarks rely on.
 
 ---
 
 ## Testing
 
-The full test suite lives under `tests/` and is driven by `pytest`.
+The repository runs both Rust unit tests (`cargo test`) and the Python test
+suite (`pytest`).
 
-Run the full test suite:
+Run everything:
 
 ```bash
-uv run pytest
+make test             # runs make test-rust + uv run --no-sync pytest
 ```
 
 Useful variations:
 
 ```bash
-# Run a single test file
-uv run pytest tests/test_channels.py
+# Rust unit tests only (sets libpython loader path across Linux/macOS/Windows)
+make test-rust
 
-# Run a specific test
-uv run pytest tests/test_channels.py::test_send_recv
+# Docs & examples parity/syntax checks only
+make test-docs
 
-# Repeat a test to shake out flaky concurrency behavior
-uv run pytest tests/test_pool.py -p no:cacheprovider --count=50
+# Run a single pytest file or specific test
+uv run --no-sync pytest tests/test_channel.py
+uv run --no-sync pytest tests/test_channel.py::test_send_recv
+
+# Repeat a targeted concurrency test to shake out flaky races
+uv run --no-sync pytest tests/test_pool.py -p no:cacheprovider --count=50
 ```
 
-> Because `multiloop` is a concurrency library, `pytest-repeat` (`--count=N`) is
-> your friend for stress-testing channels, pools, and wait groups.
+> Because `multiloop` is a concurrency library, `pytest-repeat` (`--count=N`) on
+> a targeted test file is your friend for stress-testing channels, pools, and
+> wait groups.
 
 ### Quick Start (5 minutes to first run)
 
 ```bash
-uv sync --group dev
-uv run maturin develop --release   # compile the Rust core
-uv run python examples/00_pool_basics.py   # run the first example
+make sync
+make develop          # compile the Rust core in release mode
+uv run --no-sync python examples/00_pool_basics.py
 ```
 
 - Not sure which primitive to use? See the decision table in
   [docs/CHOOSING.md](docs/CHOOSING.md).
 - About to touch concurrency code? Read
-  [docs/CONCURRENCY.md](docs/CONCURRENCY.md) first — it lists the eight
+  [docs/CONCURRENCY.md](docs/CONCURRENCY.md) first — it lists the nine
   race-condition trap patterns and the mandatory pre-change checklist.
 - More runnable examples: [`examples/README.md`](examples/README.md).
 
 ### Documentation (EN/ZH mirrors)
 
-Every doc exists in an English original plus a Chinese mirror:
+Every user-facing doc exists in an English original plus a Chinese mirror:
 `README.md` ↔ `README_ZH.md`, `docs/API.md` ↔ `docs/API_ZH.md`,
 `docs/CHOOSING.md` ↔ `docs/CHOOSING_ZH.md`,
-`docs/CONCURRENCY.md` ↔ `docs/CONCURRENCY_ZH.md` (examples/ same).
+`docs/CONCURRENCY.md` ↔ `docs/CONCURRENCY_ZH.md`, and
+`examples/README.md` ↔ `examples/README_ZH.md`.
 
 - Always edit the English original and the Chinese mirror **in the same PR**.
 - The two versions must stay structurally identical (same sections, same
@@ -120,60 +127,48 @@ Every doc exists in an English original plus a Chinese mirror:
 Performance-sensitive changes should be validated against the benchmark suite:
 
 ```bash
-uv run python benchmarks/bench_multithread_loops.py
-uv run python benchmarks/benchmark_pull_model.py
+make bench
 ```
 
 ---
 
 ## Linting & Type Checking
 
-The CI gates are strict: `ruff` for lint/format, `mypy` in strict mode for
-Python typing, and `clippy`/`fmt` for the Rust side.
+The CI gates and `make lint` share the same checks: `ruff` (lint + format),
+`mypy --strict`, `pyright`, `cargo clippy --locked`, `cargo fmt --check`,
+`cargo doc`, and release manifest parity (`check_release.py`).
 
-### Python lint & format (ruff)
-
-```bash
-uv run ruff check .
-uv run ruff format .
-```
-
-### Python type checking (mypy, strict)
+Run the full lint gate locally:
 
 ```bash
-uv run mypy src/multiloop
+make lint
 ```
 
-`mypy` runs with `strict = true` and `disallow_untyped_defs = true` (see
-`pyproject.toml`) — every public function must be fully typed.
-
-### Rust lint & format
+Auto-format Python and Rust code before committing:
 
 ```bash
-cargo clippy -- -D warnings
-cargo fmt --check
+make format
 ```
-
-`clippy` is run with `-D warnings`, so any warning fails the gate. Run
-`cargo fmt` (without `--check`) to auto-format before submitting.
 
 ### Pre-submission checklist
 
-Before opening a PR, make sure the following all pass:
+Before opening a PR, run the single unified pre-submission target:
 
 ```bash
-uv run maturin develop --release   # builds the Rust core
-cargo clippy -- -D warnings
-cargo fmt --check
-uv run mypy src/multiloop
-uv run ruff check .
-uv run ruff format .
-uv run pytest
+make all              # develop + lint + test
+```
+
+If your PR only edits Markdown docs or files under `examples/`, run:
+
+```bash
+uv run --no-sync ruff check tests/test_docs.py examples
+uv run --no-sync ruff format --check tests/test_docs.py examples
+make test-docs
 ```
 
 ---
 
-## PR Process
+## PR & Release Process
 
 - All changes are submitted as pull requests **to `main`**.
 - **Request before code**: open an issue/feature request first for any
@@ -181,27 +176,22 @@ uv run pytest
   it lets maintainers and other contributors weigh in on the design before
   effort is spent.
 - **Green before merge**: a PR is merged only after **all** required CI
-  checks pass (lint, type checks, tests). A red or incomplete PR is never
-  merged; if a check fails, fix it in follow-up commits and wait for the
-  checks to go green before requesting merge.
-- **Docs-only exception**: PRs touching only `*.md` files or `docs/**` skip
-  the heavy CI matrix — the `Docs Drift Check` job runs `tests/test_docs.py`
-  (EN/ZH mirror parity, code-block syntax, API coverage) instead. The
-  maintainer reviews the diff and merges once that check is green; there is
-  no need to run the full suite for documentation-only changes.
+  checks pass (`Lint & Static Analysis`, `Docs Drift Check`, and the OS-grouped
+  `Build & Test` runners on `ubuntu-latest`, `macos-latest`, and
+  `windows-latest`, each verifying free-threaded `3.14t` and `3.15t`).
+- **Docs/examples-only exception**: PRs touching only `*.md`, `docs/**`, or
+  `examples/**` skip the compiled matrix and run `Docs Drift Check` (`ruff` +
+  `tests/test_docs.py`) instead.
 - Keep PRs focused: one logical change per PR, with a clear title and a
   description of *what* and *why*.
 - **Label the PR** (`feature` / `fix` / `docs` / `chore` / `breaking`):
-  Release Drafter groups release notes and derives the version bump from
-  these labels — an unlabeled PR lands in the default "patch" category.
-- Include tests for new functionality and update existing tests if behavior
-  changes. Concurrency code should be tested with `pytest-repeat` to catch
-  races.
-- Ensure the [pre-submission checklist](#pre-submission-checklist) passes
-  before requesting review.
-- Address review feedback in follow-up commits (do not force-push over review
-  history unless asked).
-- When your PR is approved and green, a maintainer will merge it into `main`.
+  Release Drafter (`release-drafter.yml`) aggregates merged PRs on `main` and
+  derives the next version number from these labels.
+- **Release & PyPI Publish**: publishing a GitHub Release (or manually
+  running `Publish` via `workflow_dispatch` with `pypi` / `testpypi` /
+  `dry-run`) runs pre-release validation, builds `cp314t` and `cp315t` wheels
+  per OS/architecture plus `sdist`, verifies installed wheels and `sdist`
+  across `3.14t` and `3.15t`, and publishes via Trusted Publishing (OIDC).
 
 ---
 

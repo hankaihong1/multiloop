@@ -17,6 +17,8 @@
   - [`create_pool`](#create_pool)
   - [`run_in_pool`](#run_in_pool)
   - [`checkpoint`](#checkpoint)
+  - [`sleep`](#sleep)
+  - [`wait_cancellable`](#wait_cancellable)
   - [`fail_after`](#fail_after)
   - [`move_on_after`](#move_on_after)
   - [`fail_at`](#fail_at)
@@ -56,7 +58,8 @@
 
 可直接复制运行的代码片段。每个示例都是自包含的：导入 `multiloop`，定义
 `async def main()`，用 `asyncio.run(main())` 执行。模拟工作用
-`asyncio.sleep`。
+`asyncio.sleep`（在 `CancelScope`、`TaskGroup` 和 `AsyncContext` 任务中则用
+`multiloop.sleep`）。
 
 ### 1. `EventLoopThreadPool` + `submit`
 
@@ -144,13 +147,18 @@ async def main():
 
         async def slow_work():
             try:
-                await asyncio.sleep(10)
+                await multiloop.sleep(10)
             except asyncio.CancelledError:
-                return "cancelled"
+                # cleanup if needed, then let cancellation propagate
+                raise
 
         fut = ctx.submit(pool, slow_work)
+        await asyncio.sleep(0.01)  # let slow_work start on the pool
         ctx.cancel()  # cascades cancellation to the pool task
-        print(await fut)  # "cancelled"
+        try:
+            await fut
+        except asyncio.CancelledError:
+            print("task cancelled")  # "task cancelled"
         print("ctx cancelled:", ctx.is_cancelled)  # True
 
 
@@ -266,7 +274,7 @@ import multiloop
 
 
 async def worker(name: str) -> str:
-    await asyncio.sleep(0.01)
+    await multiloop.sleep(0.01)
     return f"{name} done"
 
 
@@ -290,7 +298,7 @@ import multiloop
 
 
 async def slow():
-    await asyncio.sleep(10)
+    await multiloop.sleep(10)
 
 
 async def main():
@@ -365,7 +373,8 @@ EventLoopThreadPool(
 - **`pin_to`**：可选地把任务钉到指定 worker 循环（`int` worker 下标或池管理
   的 `AbstractEventLoop`）。为 `None` 时任务进全局共享队列。
 - **`cancel_scope`**：可选地把任务绑定到 `CancelScope`；已取消的 scope
-  会抑制任务结果。
+  会取消返回的 `Future`（`asyncio.CancelledError`），并立即中断路线 3
+  等待点（`multiloop.sleep`、`Channel`、`Lock`、`wait_cancellable` 等）。
 - **抛出**：池已关闭时抛 `ThreadPoolClosedError`，非法 `pin_to` 下标抛
   `ValueError`，传入原生 `asyncio.Future` 或向协程对象传递参数时抛 `TypeError`。
 
@@ -373,8 +382,8 @@ EventLoopThreadPool(
 在单次调度周期内将批量任务并发推入共享全局队列，最大化跨 Worker 线程的吞吐分发。返回与每个任务一一对应的 `asyncio.Future` 列表。
 
 - **`targets`**：协程对象、协程函数或可调用任务的可迭代序列。
-- **`cancel_scope`**：批量任务共享的可选 `CancelScope`。
-- **抛出**：池已关闭时抛 `ThreadPoolClosedError`。
+- **`cancel_scope`**：可选的 `CancelScope`，**仅支持单任务批次（`len <= 1`）**；由于 `CancelScope` 绑定于单一任务/取消栈，在超过 1 个目标时传入非 `None` 的 `cancel_scope` 会关闭全部协程对象并抛出 `ValueError`。
+- **抛出**：池已关闭时抛 `ThreadPoolClosedError`，多目标传入 `cancel_scope` 时抛 `ValueError`。
 
 ##### `get_metrics()` -> `dict[str, Any]`
 返回可 JSON 序列化的健康指标字典：
@@ -401,7 +410,7 @@ EventLoopThreadPool(
 
 ```text
 PoolOptions(
-    num_threads: int = os.cpu_count() or 4,
+    num_threads: int = 0,
     loop_factory: Callable[[], asyncio.AbstractEventLoop] | None = None,
 )
 ```
@@ -424,7 +433,7 @@ async def create_pool(
 ) -> EventLoopThreadPool
 ```
 
-创建并**启动**一个池，返回可直接使用的池（`asyncssh` 风格 facade）。
+创建并**启动**一个池，返回可直接使用的池。
 `num_threads=0` 时通过 `os.cpu_count()` 自动检测。可作异步上下文管理器
 使用，或完成后手动调用 `close()`。
 
@@ -443,12 +452,47 @@ async def run_in_pool(coro: Any, *args: Any, num_threads: int = 0, **kwargs: Any
 async def checkpoint() -> None
 ```
 
-检查有效取消状态：如果当前 scope（或任一未屏蔽的祖先 scope）已被取消，
-抛出 `asyncio.CancelledError`。在无法频繁 `await` 的长运行代码中周期性
-调用。
+检查当前任务的路线 3 纯 Rust 取消栈（`RawTaskCancelState`）：如果当前 scope
+（或任一未屏蔽的祖先 scope）已被取消，抛出 `asyncio.CancelledError`。在无法
+频繁 `await` 的长运行代码中周期性调用。
 
-该 raise 会消费任务挂起的取消计数，使其成为*唯一*投递——在
-`checkpoint()` 的 raise 处被捕获的取消绝不会在下一个 await 处二次投递。
+在路线 3 下，取消检查为**水平触发**，全程绝不读写或修改 CPython 的
+`task.cancelling()` 计数。
+
+### `sleep`
+
+```text
+async def sleep(delay: float) -> None
+```
+
+订阅当前任务的路线 3 `CancelScope` 栈休眠 `delay` 秒。在 `CancelScope`、
+`fail_after`、`move_on_after` 与 `TaskGroup` 内部请优先使用
+`multiloop.sleep(...)` 替代 `asyncio.sleep(...)`，以便取消时立即中断休眠。
+
+- **`delay`** (*float*)：休眠秒数（`delay <= 0` 等价于 `checkpoint()`；`NaN` 抛 `ValueError`）。
+
+```python
+async with fail_after(0.05):
+    await multiloop.sleep(10)  # 到期时立即中断
+```
+
+### `wait_cancellable`
+
+```text
+async def wait_cancellable(awaitable: Awaitable[_T]) -> _T
+```
+
+将外部 asyncio 可等待对象（如 `asyncio.sleep(...)` 或第三方异步 I/O 协程）
+桥接到路线 3 `CancelScope`，使活跃的取消与超时能立即生效。若等待期间
+`CancelScope` 被取消，将自动取消底层任务并等待其结束后再传播
+`asyncio.CancelledError`。
+
+- **`awaitable`** (*Awaitable[_T]*)：需要桥接的外部协程或可等待对象。
+
+```python
+async with fail_after(0.05):
+    await multiloop.wait_cancellable(asyncio.sleep(10))
+```
 
 ### `fail_after`
 
@@ -567,8 +611,7 @@ set_log_level(logging.DEBUG)
 
 ### `Channel`
 
-由 Rust（`flume` crate）支撑的高性能跨线程通道，使用 double-check lock
-模式实现零丢失唤醒信号竞争。
+由 Rust 原生 `RawAsyncChannel` 状态机支撑的高性能跨线程通道，具备防插队 FIFO 顺序保护与零丢失唤醒信号竞争保证。
 
 #### 构造函数
 
@@ -580,9 +623,10 @@ Channel(maxsize: int = 0)
 
 #### 方法
 
-##### `async send(item: Any)` -> `None`
+##### `async send(item: Any, timeout: float | None = None)` -> `None`
 向通道发送一个元素。通道满时挂起直到有空间。
-- **抛出**：通道已关闭时抛 `ChannelClosedError`。
+- **`timeout`** (*float | None*)：可选超时秒数。
+- **抛出**：通道已关闭时抛 `ChannelClosedError`，超时抛 `TimeoutError`。
 
 ##### `send_sync(item: Any, timeout: float | None = None)` -> `None`
 同步阻塞发送，专为在同步工作线程中向通道投递数据设计。
@@ -620,7 +664,7 @@ Channel(maxsize: int = 0)
 
 通道的只发视图（Go `chan<- T` 风格），用于接口隔离。
 
-- **`send(item)`**：向通道发送元素。
+- **`send(item, timeout=None)`**：向通道发送元素。
 - **`send_sync(item, timeout=None)`**：同步阻塞发送。
 - **`try_send(item)` -> `bool`**：非阻塞发送。
 - **`close()`**：关闭底层通道。
@@ -685,8 +729,7 @@ selected_ch, val = await select_channel(ch1, ch2, timeout=2.0)
 
 ### `TaskGroup`
 
-派生并管理子任务的异步上下文管理器，底层由 `CancelScope` 驱动取消传播。
-灵感来自 trio 的 nursery 与 anyio 的 `TaskGroup`。支持通过 `max_concurrency` 或共享 `CapacityLimiter` 进行开箱即用的结构化并发限流。
+派生并管理子任务的异步上下文管理器，底层由 `CancelScope` 驱动取消传播。支持通过 `max_concurrency` 或共享 `CapacityLimiter` 进行开箱即用的结构化并发限流。
 
 ```python
 async with TaskGroup(max_concurrency=10) as tg:
@@ -707,8 +750,8 @@ async with TaskGroup(max_concurrency=10) as tg:
   - **抛出**：组退出后或从外部 Loop/线程调用时抛 `RuntimeError`（TaskGroup 物理限定于单 Loop）；孤儿任务会被取消并消费其异常。
 - **`start(coro_fn, *args)` -> `TaskHandle`**：派生子任务，阻塞直到子任务
   调用 `task_status.started()`。
-  - **抛出**：组退出后或从外部 Loop/线程调用抛 `RuntimeError`（与 `start_soon` 相同的防护）；子任务未调用 `task_status.started()` 即退出也抛 `RuntimeError`（trio/anyio 对齐——静默返回已死任务的句柄会掩盖协议违规）。
-- **抛出**：子任务异常在退出时重抛；多个失败以 `ExceptionGroup` 聚合。被取消的子任务不作为错误上报（trio/anyio 对齐）；宿主在组等待期间被取消时，保证所有子任务完成后再退出块。
+  - **抛出**：组退出后或从外部 Loop/线程调用抛 `RuntimeError`（与 `start_soon` 相同的防护）；子任务未调用 `task_status.started()` 即退出也抛 `RuntimeError`（静默返回已死任务的句柄会掩盖协议违规）。
+- **抛出**：子任务异常在退出时重抛；多个失败以 `ExceptionGroup` 聚合。被取消的子任务不作为错误上报；宿主在组等待期间被取消时，保证所有子任务完成后再退出块。
 
 ### `TaskHandle`
 
@@ -754,30 +797,33 @@ async with TaskGroup() as tg:
 
 ### `CancelScope`
 
-按任务层级传播取消的任务本地取消作用域。
+由路线 3 纯 Rust `RawTaskCancelState` 取消栈驱动的、单次使用的任务本地取消作用域
+（全程绝不修改 CPython `task.cancel()`、`task.uncancel()` 或 `task.cancelling()`）。
 
 ```text
 CancelScope(deadline: float = float("inf"), shield: bool = False)
 ```
 
-- **`deadline`** (*float*)：绝对单调截止时间。`float("inf")` 表示无截止。
-- **`shield`** (*bool*)：快照/恢复式屏蔽：进入时快照并清除任务挂起的取消计数，退出时恢复。只吸收*进入前*已注入的取消；屏蔽*期间*到达的取消**不会**被延迟（与 trio/anyio 不同）——需要在中途取消下完成清理的代码应使用重试循环（见 `Condition.wait`）。
+- **`deadline`** (*float*)：绝对单调截止时间。`float("inf")` 表示无截止。支持动态修改 `.deadline` 重新调度定时器。
+- **`shield`** (*bool*)：路线 3 作用域屏蔽屏障：当 `shield` 为 `True` 时在 Rust 取消栈上遮蔽外层 `CancelScope` 的取消与截止时间（支持在清理块中正常 `await` `multiloop.sleep`、`Channel`、`Lock`、`wait_cancellable` 等），全程不触碰 CPython `task.cancelling()`。注意：外部原生 CPython `task.cancel()` 不受影响。
 
 #### 属性与方法
 
-- **`cancel_called`** -> `bool`：调用过 `cancel()` 后为 `True`。
-- **`cancelled_caught`** -> `bool`：scope 静默吸收了取消（move-on-* scope）
-  为 `True`。
-- **`deadline`** -> `float`：绝对单调截止时间。
-- **`shield`** -> `bool`：是否阻止父取消。
-- **`cancel()`**：把 scope 标记为已取消并向宿主任务注入取消。幂等。
+- **`cancel_called`** -> `bool`：调用过 `cancel()` 或截止时间到期后为 `True`。
+- **`cancelled_caught`** -> `bool`：move-on 作用域（`move_on_after` / `move_on_at`）静默吸收了自身取消时为 `True`。
+- **`deadline`** -> `float`：绝对单调截止时间（可读写）。
+- **`shield`** -> `bool`：是否阻止外层 `CancelScope` 取消（可读写）。
+- **`cancel()`**：在 Rust 中将 scope 标记为已取消并经 `call_soon_threadsafe` 唤醒挂起的路线 3 等待者。幂等且线程安全。
 
-退出时 scope 总是消费自己的注入：*在 body 内被捕获*（或从未投递）的取消
-绝不会把计数泄漏到外层作用域——泄漏的计数会被外层 shield 当作真实取消
-快照，并在其退出后重新注入。
+#### 三模式退出契约
+
+`async with scope:` 在 `__aexit__` 退出时严格执行三种退出模式：
+1. **普通 `CancelScope`（`PLAIN`）**：若已触发取消且代码块正常结束（`exc_type is None`），退出时抛出 `asyncio.CancelledError()`；代码块抛出的非取消业务异常原样传播。
+2. **`move_on_after` / `move_on_at`（`MOVE_ON`）**：静默吸收自身取消，设置 `scope.cancelled_caught = True` 并返回 `True`，不会误吞外部 CPython `task.cancel()` 或业务异常。
+3. **`fail_after` / `fail_at`（`FAIL_AFTER`）**：将自身触发的取消或超时（即使内部捕获了 `CancelledError` 并正常走出块）统一转换为 `multiloop.TimeoutError` 抛出。
 
 #### 上下文管理器
-`async with CancelScope(...) as scope:` 把 scope 压入当前任务的 scope 栈。
+`async with CancelScope(...) as scope:` 把 scope 压入当前任务的 Rust 取消栈（跨任务共享或重复进入抛 `RuntimeError`）。
 
 ---
 
@@ -859,6 +905,7 @@ Condition(lock: Lock | None = None)
 
 - **`acquire()`** / **`release()`**：管理底层锁。
 - **`wait()`**：原子地释放锁并挂起直到被通知。
+- **`wait_for(predicate)`**：重复等待直到 `predicate` 返回真值。调用前必须已持有底层锁。
 - **`notify(n=1)`**：唤醒 `n` 个等待任务。
 - **`notify_all()`**：唤醒所有等待任务。
 
@@ -880,6 +927,8 @@ Barrier(parties: int)
 `Barrier.wait()` 返回的结果对象。
 
 - **`parties`** -> `int`：本回合屏障的 party 总数。
+- **`index`** -> `int`：调用任务的到达次序下标（`0` 到 `parties - 1`）。
+- **`is_leader`** -> `bool`：若当前任务为本回合率先到达者（`index == 0`）则为 `True`。
 
 ### `AsyncContext`
 
@@ -893,7 +942,7 @@ ctx = AsyncContext(parent: AsyncContext | None = None)
   与已提交的 future。
 - **`ctx.submit(pool, target, *args, **kwargs)`**：向池提交绑定到本上下文
   的任务。
-- **`ctx.task_group(pool=None, name=None, max_concurrency=None)`**：创建与本上下文联动的
+- **`ctx.task_group(pool=None, name=None, max_concurrency=None, limiter=None)`**：创建与本上下文联动的
   `TaskGroup`，上下文取消时自动级联取消组内任务。
 - **`ctx.parent`**：父上下文，根上下文为 `None`（只读，构造时固定）。
 - **`ctx.is_cancelled`**：已取消则返回 `True`。

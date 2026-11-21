@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-11-21
+
+### Added & Changed
+- **Rust Sync Primitives & Shared Waiter Infrastructure (`src/sync.rs`, `src/waiter.rs`, `src/errors.rs`)**:
+  - Moved `Lock`, `Semaphore`, `CapacityLimiter`, `Event`, `Condition`, `Barrier`, and `AsyncOnce` state machines into Rust (`RawAsync*` pyclasses) with `WaiterId` generation tickets, out-of-lock wakeups/cancellations, FIFO token forwarding, and automatic broken-state propagation on `Barrier`.
+  - Consolidated Python sync wrappers in `src/multiloop/_sync.py` and typed exception builders in `src/errors.rs`.
+  - Removed legacy `src/multiloop/_channel_base.py` and streamlined Python `Channel`/`select_channel` over `RawAsyncChannel` with anti-barging FIFO ordering.
+- **Route 3 Pure-Rust Cancellation Stack (`src/cancel.rs`, `src/multiloop/_cancel.py`)**:
+  - Replaced CPython `task.cancel()`/`uncancel()`/`cancelling()` ledger mutation with `RawTaskCancelState` (`_TASK_CANCEL_STATES` weak-key tracking), strict `PLAIN` / `MOVE_ON` / `FAIL_AFTER` exit modes, `shield` isolation, `sleep`, `wait_cancellable`, and `checkpoint`.
+  - Hardened `run_in_pool()`, `TaskGroup`, `TaskHandle._await_impl()`, `AsyncContext`, and all primitive wait points for Route 3 cancellation parity and FFI/GC safety.
+- **Free-Threaded CI/CD & Developer Workflow Unification (`.github/`, `Makefile`)**:
+  - Converged CI (`ci.yml`) and PyPI distribution (`publish.yml`) onto OS-grouped runners (`ubuntu-latest`, `macos-latest`, `windows-latest`) testing & packaging free-threaded Python (`3.14t`, `3.15t`) via shared composite actions (`setup-env`, `run-lint`, `build-dist`) and cross-platform scripts (`run_rust_tests.py`, `run_ci_versions.py`, `build_host_wheels.py`, `verify_dist.py`, `check_release.py`).
+  - Added `test_sdist` build/install checks across target Python versions, fixed `test_wheels` `--no-sync` & `site-packages` smoke assertions, tightened `release-drafter.yml`, and aligned `Makefile`, `.pre-commit-config.yaml`, `CONTRIBUTING.md`, `AGENTS.md`, and `tests/test_docs.py`.
+
 ## [0.1.3] - 2026-09-17
 
 ### Added & Optimized

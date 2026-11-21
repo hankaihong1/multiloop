@@ -7,16 +7,21 @@ on:
     branches: [ main ]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # Space-separated free-threaded Python versions tested on every OS runner.
+  # Adding future releases (e.g. 3.16t) never multiplies the CI job matrix.
+  PYTHON_VERSIONS: "3.14t 3.15t"
 
 jobs:
-  # Classify every push/PR before anything heavy runs. Docs-only changes
-  # skip the lint + build/test matrix (their jobs report "skipped", which
-  # GitHub counts as success for required checks) and run only the Docs
-  # Drift Check; anything touching code runs the full suite. The two
-  # filters are exact complements, so a mixed change sets both to true
-  # and gets both gates.
+  # Classify every push/PR before launching heavy builds.
+  # Docs/examples-only changes skip Rust/multi-OS compilation and run the fast
+  # Docs Drift Check; anything touching code/config runs lint + full 3-OS CI.
   changes:
     name: Detect Changed Files
     runs-on: ubuntu-latest
@@ -27,192 +32,93 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
       docs: ${{ steps.filter.outputs.docs }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository (full history for push diffs)
+        if: github.event_name == 'push'
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: dorny/paths-filter@v4
         id: filter
         with:
-          base: main
-          # '!' exclusions only take effect with 'some-with-excludes';
-          # under the default 'some' they are ignored, and a filter made
-          # of negations only never matches anything.
+          # Omit `base` so PRs use the GitHub API diff and pushes to `main`
+          # automatically compare against the pre-push commit range (`before`).
+          # `some-with-excludes` is required for `!` negations to apply.
           predicate-quantifier: 'some-with-excludes'
           filters: |
             docs:
               - '**/*.md'
               - 'docs/**'
+              - 'examples/**'
+              - 'tests/test_docs.py'
             code:
               - '**'
               - '!**/*.md'
               - '!docs/**'
+              - '!examples/**'
 
-  lint:
-    name: Lint & Static Analysis
-    needs: changes
-    # Skipped on docs-only changes; runs when the classifier itself failed
-    # (fail-closed: an unknown change set must not sail through unverified).
-    if: needs.changes.outputs.code == 'true' || needs.changes.result != 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - name: Set up uv & Python 3.14t
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          python-version: "3.14t"
-
-      - name: Install dependencies
-        run: uv sync --group dev
-
-      - name: Cargo Clippy & Format Check
-        run: |
-          cargo clippy -- -D warnings
-          cargo fmt --check
-
-      - name: Python Strict Static Analysis (Mypy, Pyright & Ruff)
-        run: |
-          uv run mypy --strict src/multiloop
-          uv run pyright src/multiloop
-          uv run ruff check .
-
-      - name: Cargo Deny Check
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories
-
-      - name: Rustdoc Check
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-        run: |
-          cargo doc --no-deps --document-private-items
-
-  test:
-    name: Build & Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
-    needs: [changes, lint]
-    # The explicit if replaces the implicit success(): (code == 'true' &&
-    # success()) preserves the old "no matrix when lint failed" behavior,
-    # while the || result != 'success' branch keeps the run fail-closed
-    # when the classifier job itself failed.
-    if: (needs.changes.outputs.code == 'true' && success()) || needs.changes.result != 'success'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.14", "3.14t"]
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up uv & Python ${{ matrix.python-version }}
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install dependencies
-        run: uv sync --group dev
-
-      - name: Build Rust Extension
-        run: |
-          uv run maturin develop --release
-
-      - name: Run Rust Unit Tests
-        shell: bash
-        run: |
-          # WHY: cargo test 的二进制是 standalone 构建（非 extension-module），
-          # 运行时需要加载 libpython。setup-uv 装的解释器不在系统 loader 路径里，
-          # 所以要在执行前把解释器目录加进 loader 路径（Linux 用 LD_LIBRARY_PATH，
-          # macOS 用 DYLD_FALLBACK_LIBRARY_PATH，Windows 用 PATH 找 python3xx.dll）。
-          # 注意 Windows 上 python3xx.dll 在**基础解释器**安装根（venv 的
-          # python.exe 是复制出来的，DLL 不复制）；sys.base_prefix 在 venv 中
-          # 指向基础解释器目录（sys.base_executable 并非跨平台属性，Windows
-          # 上不存在）；且 bash 的 PATH 用冒号分隔，Windows 路径里的冒号会被
-          # 拆断，必须先 cygpath -u 转成 Unix 风格（导出时 Git Bash 会自动
-          # 转回 Windows 格式）。
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            PYDIR="$(uv run python -c 'import sys; print(sys.base_prefix)')"
-            export PATH="$(cygpath -u "$PYDIR" 2>/dev/null || echo "$PYDIR"):$PATH"
-          elif [ "$RUNNER_OS" = "macOS" ]; then
-            export DYLD_FALLBACK_LIBRARY_PATH="$(uv run python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))'):$DYLD_FALLBACK_LIBRARY_PATH"
-          else
-            export LD_LIBRARY_PATH="$(uv run python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))'):$LD_LIBRARY_PATH"
-          fi
-          cargo test --lib --no-default-features --features test-init --locked
-
-      - name: Run Test Suite & Race Checks
-        run: |
-          uv run pytest
-
-  test_dev:
-    name: Build & Test (Python 3.15-dev, ubuntu-latest)
-    needs: [changes, lint]
-    if: (needs.changes.outputs.code == 'true' && success()) || needs.changes.result != 'success'
-    runs-on: ubuntu-latest
-    continue-on-error: true
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      # WHY: uv 的 Python 下载请求不认 "3.15-dev" 这种写法（uv 0.12 报 invalid
-      # request）；写 "3.15" 会自动解析到最新的 3.15 pre-release（当前 3.15.0b4）。
-      - name: Set up uv & Python 3.15-dev
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          python-version: "3.15"
-
-      - name: Install dependencies
-        run: uv sync --group dev
-
-      - name: Build Rust Extension
-        run: |
-          uv run maturin develop --release
-
-      - name: Run Rust Unit Tests
-        shell: bash
-        run: |
-          # WHY: 同 test job——standalone 测试二进制运行时需要 libpython，
-          # 解释器 LIBDIR 不在系统 loader 路径里（test_dev 只跑 ubuntu，走 Linux 分支）。
-          export LD_LIBRARY_PATH="$(uv run python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))'):$LD_LIBRARY_PATH"
-          cargo test --lib --no-default-features --features test-init --locked
-
-      - name: Run Test Suite & Race Checks
-        run: |
-          uv run pytest
-
-  # Docs-only changes skip the heavy matrix and are gated by this single
-  # cheap job (no Rust build: test_docs.py only imports multiloop from src/,
-  # which works without the extension via graceful fallback).
   docs:
     name: Docs Drift Check
     needs: changes
     if: needs.changes.outputs.docs == 'true' || needs.changes.result != 'success'
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-env
+        with:
+          python-version: "3.14t"
+          install-rust: "false"
+          sync-mode: "no-project"
+          uv-cache: "true"
+
+      - name: Lint & format check docs/examples Python files
+        run: |
+          uv run --no-sync ruff check tests/test_docs.py examples
+          uv run --no-sync ruff format --check tests/test_docs.py examples
+
+      - name: Run docs parity & syntax guard
+        env:
+          PYTHONPATH: src
+        run: uv run --no-sync pytest tests/test_docs.py -q
+
+  lint:
+    name: Lint & Static Analysis
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || needs.changes.result != 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-env
+        with:
+          python-version: "3.14t"
+          rust-components: "clippy, rustfmt"
+          sync-mode: "no-project"
+          cache-key: "lint"
+          uv-cache: "true"
+
+      - uses: ./.github/actions/run-lint
+
+  test:
+    name: Build & Test (${{ matrix.os }})
+    needs: [changes, lint]
+    if: (needs.changes.outputs.code == 'true' && success()) || needs.changes.result != 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Set up uv & Python 3.14t
-        uses: astral-sh/setup-uv@v5
+      - uses: ./.github/actions/setup-env
         with:
-          enable-cache: true
           python-version: "3.14t"
+          sync-mode: "none"
+          cache-key: ${{ matrix.os }}
+          uv-cache: "true"
 
-      - name: Install dev dependencies (skip project build)
-        run: uv sync --no-install-project --group dev
-
-      - name: Run docs drift guard
-        run: PYTHONPATH=src uv run --no-sync pytest tests/test_docs.py -q
+      - name: Run Rust & Python suites across free-threaded versions
+        run: uv run --no-project python .github/scripts/run_ci_versions.py

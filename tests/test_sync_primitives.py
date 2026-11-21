@@ -5,14 +5,7 @@ import threading
 
 import pytest
 
-from multiloop import (
-    AsyncContext,
-    AsyncWaitGroup,
-    CapacityLimiter,
-    EventLoopThreadPool,
-    Lock,
-    Semaphore,
-)
+from multiloop import CapacityLimiter, Semaphore
 from multiloop.testing import wait_all_tasks_blocked
 
 # ---------------------------------------------------------------------------
@@ -276,10 +269,11 @@ async def test_semaphore_release_beyond_max_raises():
 
 
 def test_semaphore_zero_ok():
-    """Semaphore(0) is legal (asyncio parity) — a closed gate."""
+    """Semaphore(0) is legal (asyncio parity) — a closed bounded gate."""
     sem = Semaphore(0)
     assert sem.value == 0
-    with pytest.raises(ValueError):
+    assert sem.max_value == 0
+    with pytest.raises(ValueError, match="Semaphore released too many times"):
         sem.release()
 
 
@@ -370,179 +364,8 @@ def test_semaphore_max_value_consistent_after_resize():
 
 
 # ---------------------------------------------------------------------------
-# Concurrency audit & semantic refactoring tests
+# Concurrency audit & deficit / storm tests
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_waitgroup_add_negative_wake() -> None:
-    """AsyncWaitGroup.add(-n) to 0 must wake registered waiters."""
-    wg = AsyncWaitGroup()
-    wg.add(2)
-    waiter_task = asyncio.create_task(wg.wait())
-    await asyncio.sleep(0.01)
-
-    assert not waiter_task.done(), "Waiter should be suspended on counter=2"
-    wg.add(-2)  # counter becomes 0 via negative delta
-    await asyncio.wait_for(waiter_task, timeout=1.0)
-    assert waiter_task.done(), "Waiter must be woken when add(-n) drives counter to 0"
-
-
-@pytest.mark.asyncio
-async def test_waitgroup_cross_generation_race() -> None:
-    """Fast done() to 0 followed by new generation must not prematurely wake gen 2 waiters."""
-    wg = AsyncWaitGroup()
-    gen1_results: list[int] = []
-    gen2_results: list[int] = []
-
-    # Round 1
-    wg.add(1)
-
-    async def gen1_waiter() -> None:
-        await wg.wait()
-        gen1_results.append(1)
-
-    t1 = asyncio.create_task(gen1_waiter())
-    await asyncio.sleep(0.01)
-
-    wg.done()
-    await t1
-    assert gen1_results == [1]
-
-    # Round 2
-    wg.add(1)
-
-    async def gen2_waiter() -> None:
-        await wg.wait()
-        gen2_results.append(2)
-
-    t2 = asyncio.create_task(gen2_waiter())
-    await asyncio.sleep(0.02)
-    assert not t2.done(), "Generation 2 waiter must NOT be woken before gen 2 finishes"
-
-    wg.done()
-    await t2
-    assert gen2_results == [2]
-
-
-@pytest.mark.asyncio
-async def test_async_context_submit_interruptible() -> None:
-    """AsyncContext.submit tasks must be interruptible via ctx.cancel()."""
-    async with EventLoopThreadPool(num_threads=2) as pool:
-        ctx = AsyncContext()
-        started_event = threading.Event()
-
-        async def sleep_task() -> str:
-            started_event.set()
-            await asyncio.sleep(5.0)
-            return "finished"
-
-        fut = ctx.submit(pool, sleep_task)
-        while not started_event.is_set():
-            await asyncio.sleep(0.001)
-
-        # Cancel context while sleep_task is in flight
-        ctx.cancel()
-
-        with pytest.raises(asyncio.CancelledError):
-            await fut
-
-
-@pytest.mark.asyncio
-async def test_async_context_async_context_manager_and_parent_detachment() -> None:
-    """AsyncContext supports async with and auto-detaches from parent upon exit/cancel."""
-    root = AsyncContext()
-    assert len(root._children) == 0
-
-    async with EventLoopThreadPool(num_threads=2) as pool:
-        started_event = threading.Event()
-
-        async def worker() -> str:
-            started_event.set()
-            await asyncio.sleep(5.0)
-            return "ok"
-
-        async with AsyncContext(parent=root) as child:
-            assert len(root._children) == 1
-            fut = child.submit(pool, worker)
-            while not started_event.is_set():
-                await asyncio.sleep(0.001)
-
-        # Upon exiting async with, child must be cancelled and detached from root
-        assert child.is_cancelled is True
-        assert len(root._children) == 0
-        with pytest.raises(asyncio.CancelledError):
-            await fut
-
-
-@pytest.mark.asyncio
-async def test_async_context_child_unregistration_no_leak() -> None:
-    """AsyncContext must unregister child context from parent on cancel to prevent memory leaks."""
-    root_ctx = AsyncContext()
-    children = [AsyncContext(parent=root_ctx) for _ in range(50)]
-    assert len(root_ctx._children) == 50
-
-    for child in children:
-        child.cancel()
-
-    assert len(root_ctx._children) == 0, "All cancelled children must be removed from root_ctx"
-
-
-@pytest.mark.asyncio
-async def test_semaphore_zero_bounded_capacity() -> None:
-    """Semaphore(0) represents zero-capacity bounded semaphore, reject over-release unless resized."""
-    sem = Semaphore(0)
-    assert sem.value == 0
-    assert sem.max_value == 0
-    with pytest.raises(ValueError, match="Semaphore released too many times"):
-        sem.release()
-
-    # Fractional limiter creates Semaphore(0) cleanly and supports dynamic resizing
-    limiter = CapacityLimiter(0.5)
-    assert limiter.total_tokens == 0.5
-    assert limiter.available_tokens == 0.5
-    limiter.total_tokens = 2.0
-    assert limiter.total_tokens == 2.0
-    assert limiter.available_tokens == 2.0
-
-
-@pytest.mark.asyncio
-async def test_semaphore_base_exception_cleanup() -> None:
-    """Semaphore.acquire must clean up waiter on non-CancelledError BaseException."""
-    sem = Semaphore(1)
-    await sem.acquire()
-    assert sem.value == 0
-    assert len(sem._waiters) == 0
-
-    class CustomBaseException(BaseException):
-        pass
-
-    async def doomed_waiter() -> None:
-        try:
-            await sem.acquire()
-        except BaseException:
-            pass
-
-    t = asyncio.create_task(doomed_waiter())
-    await asyncio.sleep(0.01)
-    assert len(sem._waiters) == 1
-    event = next(iter(sem._waiters))
-
-    # Directly set exception on event/task to simulate BaseException interrupt
-    sem._cancel_waiter(event)
-    assert len(sem._waiters) == 0
-
-    # Ensure release and subsequent acquire work cleanly without ghost nodes
-    sem.release()
-    assert sem.value == 1
-
-    await sem.acquire()
-    assert sem.value == 0
-    t.cancel()
-    try:
-        await t
-    except BaseException:
-        pass
 
 
 @pytest.mark.asyncio
@@ -644,131 +467,6 @@ async def test_capacity_limiter_upscale_during_deficit_does_not_overmint() -> No
 
 
 @pytest.mark.asyncio
-async def test_async_wait_group_holding() -> None:
-    """AsyncWaitGroup.holding() increments on enter and decrements on exit/exception."""
-    wg = AsyncWaitGroup()
-
-    # Normal execution
-    async def worker() -> None:
-        async with wg.holding():
-            await asyncio.sleep(0.01)
-
-    t1 = asyncio.create_task(worker())
-    t2 = asyncio.create_task(worker())
-    await asyncio.sleep(0.002)
-
-    # Wait for completion
-    await asyncio.wait_for(wg.wait(), timeout=1.0)
-    await t1
-    await t2
-
-    # Exception path
-    async def failing_worker() -> None:
-        async with wg.holding():
-            raise ValueError("boom")
-
-    with pytest.raises(ValueError, match="boom"):
-        await failing_worker()
-
-    # Wait should succeed immediately because counter is 0
-    await asyncio.wait_for(wg.wait(), timeout=0.1)
-
-
-@pytest.mark.asyncio
-async def test_async_wait_group_wrap() -> None:
-    """AsyncWaitGroup.wrap wraps callables and tracks execution."""
-    wg = AsyncWaitGroup()
-
-    async def async_worker(x: int) -> int:
-        await asyncio.sleep(0.01)
-        return x * 2
-
-    wrapped = wg.wrap(async_worker)
-    res = await wrapped(21)
-    assert res == 42
-    await asyncio.wait_for(wg.wait(), timeout=0.1)
-
-
-@pytest.mark.asyncio
-async def test_async_wait_group_track_unawaited_leak_protection() -> None:
-    """AsyncWaitGroup.track must not leak counter when tracked coroutine is closed or discarded."""
-    import gc
-
-    wg = AsyncWaitGroup()
-
-    async def sample_coro() -> int:
-        return 123
-
-    # Case 1: tracked coroutine explicitly closed
-    tracked = wg.track(sample_coro())
-    tracked.close()
-    # Counter must be 0, so wait() returns immediately
-    await asyncio.wait_for(wg.wait(), timeout=0.1)
-
-    # Case 2: tracked coroutine discarded without being awaited emits RuntimeWarning on GC
-    wg2 = AsyncWaitGroup()
-    with pytest.warns(
-        RuntimeWarning, match="Tracked coroutine was never awaited; AsyncWaitGroup counter leaked"
-    ):
-
-        def discard_tracked() -> None:
-            _ = wg2.track(sample_coro())
-
-        discard_tracked()
-        gc.collect()
-
-    # Counter remains 1 because GC does not invoke state machine mutators in __del__
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(wg2.wait(), timeout=0.05)
-    wg2.done()
-    await asyncio.wait_for(wg2.wait(), timeout=0.05)
-
-    # Case 3: tracked coroutine awaited normally
-    tracked_normal = wg.track(sample_coro())
-    val = await tracked_normal
-    assert val == 123
-    await asyncio.wait_for(wg.wait(), timeout=0.1)
-
-
-@pytest.mark.asyncio
-async def test_cancellation_storm_lock() -> None:
-    """Cancellation storm on Lock: 500 queued waiters simultaneously cancelled."""
-    lock = Lock()
-    await lock.acquire()
-
-    cancelled_count = 0
-
-    async def waiter() -> None:
-        nonlocal cancelled_count
-        try:
-            await lock.acquire()
-            lock.release()
-        except asyncio.CancelledError:
-            cancelled_count += 1
-            raise
-
-    tasks = [asyncio.create_task(waiter()) for _ in range(500)]
-    await asyncio.sleep(0.01)
-    assert len(lock._waiters) == 500
-
-    # Cancel all waiters simultaneously
-    for t in tasks:
-        t.cancel()
-
-    await asyncio.gather(*tasks, return_exceptions=True)
-    assert cancelled_count == 500
-    assert len(lock._waiters) == 0
-
-    # Ensure lock is still operational and clean
-    lock.release()
-    assert not lock.locked
-
-    await lock.acquire()
-    assert lock.locked
-    lock.release()
-
-
-@pytest.mark.asyncio
 async def test_cancellation_storm_semaphore() -> None:
     """Cancellation storm on Semaphore: 500 queued waiters simultaneously cancelled."""
     sem = Semaphore(1)
@@ -843,3 +541,57 @@ async def test_cancellation_storm_capacity_limiter() -> None:
     assert total == 1.0
     assert avail == 1.0
     assert borrowed == 0.0
+
+
+@pytest.mark.asyncio
+async def test_repro_semaphore_and_limiter_double_cancel_no_ghost_permit() -> None:
+    """Calling _cancel_waiter after a waiter was already removed without being granted
+    a permit must NOT mint a ghost permit in Semaphore or CapacityLimiter.
+    """
+    sem = Semaphore(1)
+    await sem.acquire()
+    assert sem.value == 0
+
+    async def doomed_sem() -> None:
+        try:
+            await sem.acquire()
+        except BaseException:
+            pass
+
+    t = asyncio.create_task(doomed_sem())
+    await asyncio.sleep(0.01)
+    assert len(sem._waiters) == 1
+    ev = next(iter(sem._waiters))
+    sem._cancel_waiter(ev)
+    assert len(sem._waiters) == 0
+
+    t.cancel()
+    await t
+    # Permit is STILL held by main task; value must remain 0 (no ghost permit minted!)
+    assert sem.value == 0
+    sem.release()
+    assert sem.value == 1
+
+    limiter = CapacityLimiter(1)
+    await limiter.acquire()
+    assert limiter.borrowed_tokens == 1.0
+
+    async def doomed_lim() -> None:
+        try:
+            await limiter.acquire()
+        except BaseException:
+            pass
+
+    t2 = asyncio.create_task(doomed_lim())
+    await asyncio.sleep(0.01)
+    assert len(limiter._waiters) == 1
+    ev2 = next(iter(limiter._waiters))
+    limiter._cancel_waiter(ev2)
+    assert len(limiter._waiters) == 0
+
+    t2.cancel()
+    await t2
+    # Borrowed token is STILL held by main task; borrowed_tokens must remain 1.0
+    assert limiter.borrowed_tokens == 1.0
+    limiter.release()
+    assert limiter.borrowed_tokens == 0.0

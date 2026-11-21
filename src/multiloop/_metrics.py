@@ -40,6 +40,8 @@ class MetricsCollector:
     for monitoring thread-pool performance, worker saturation, and work-stealing efficiency.
     """
 
+    __slots__ = ("_metrics", "_num_threads")
+
     def __init__(self, num_threads: int) -> None:
         self._num_threads = num_threads
         self._metrics: _MetricsProtocol | None = None
