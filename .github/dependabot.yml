@@ -19,3 +19,13 @@ updates:
           - "pyo3"
           - "flume"
           - "parking_lot"
+
+  # GitHub Actions workflows & composite actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"

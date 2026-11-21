@@ -7,18 +7,20 @@ and :class:`AsyncOnce`.
 from __future__ import annotations
 
 import asyncio
-import builtins
-import collections
+import copy
 import threading
 import time
 import warnings
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Generator
-from contextlib import asynccontextmanager
+import weakref
+from collections.abc import AsyncIterator, Callable, Coroutine, Generator
+from contextlib import AbstractAsyncContextManager
 from typing import Any, Protocol, Self
 
-from multiloop._channel_base import _CHANNEL_CLOSED_MSG, _discard_waiter, _wake_all
+from multiloop._cancel import _await_cancellable, _check_not_cancelled, fail_after
 from multiloop._rust import _try_import_rust_class
 from multiloop.exceptions import ChannelClosedError, TimeoutError, WouldBlock
+
+_CHANNEL_CLOSED_MSG = "Channel is closed"
 
 __all__ = [
     "AsyncOnce",
@@ -29,32 +31,40 @@ __all__ = [
     "select_channel",
 ]
 
+_select_tls = threading.local()
+
+
+def _next_select_index(num_channels: int) -> int:
+    idx: int = getattr(_select_tls, "counter", 0)
+    _select_tls.counter = idx + 1
+    return idx % num_channels
+
 
 class _RawAsyncChannelProtocol(Protocol):
     """Protocol for the native Rust RawAsyncChannel class."""
 
-    def __init__(
-        self,
-        maxsize: int = ...,
-        wake_fn: Any = ...,
-        select_wake_fn: Any = ...,
-    ) -> None: ...
+    def __init__(self, maxsize: int = ...) -> None: ...
     def close(self) -> None: ...
     def is_closed(self) -> bool: ...
+    def is_drained(self) -> bool: ...
     def qsize(self) -> int: ...
     @property
     def maxsize(self) -> int: ...
     def empty(self) -> bool: ...
     def full(self) -> bool: ...
     def try_send(self, item: Any) -> bool: ...
-    def try_recv(self) -> tuple[bool, Any]: ...
-    def register_getter(self, loop: Any, fut: Any) -> tuple[bool, Any]: ...
-    def unregister_getter(self, fut: Any) -> bool: ...
-    def register_putter(self, loop: Any, fut: Any) -> bool: ...
-    def unregister_putter(self, fut: Any) -> bool: ...
-    def claim_put(self, item: Any) -> bool: ...
-    def register_select_watcher(self, loop: Any, arbiter_fut: Any, channel_token: Any) -> bool: ...
-    def unregister_select_watcher(self, fut: Any) -> bool: ...
+    def send_or_register(self, item: Any, loop: Any, fut: Any) -> int | None: ...
+    def try_recv(self) -> Any: ...
+    def register_getter_ticket(self, loop: Any, fut: Any) -> tuple[int, Any]: ...
+    def claim_get(self, waiter_id: int) -> tuple[bool, Any]: ...
+    def cancel_getter(self, waiter_id: int) -> bool: ...
+    def register_putter_front(self, loop: Any, fut: Any) -> int: ...
+    def cancel_putter(self, waiter_id: int) -> bool: ...
+    def claim_put(self, item: Any, waiter_id: int) -> bool: ...
+    def register_select_watcher_ticket(
+        self, loop: Any, arbiter_fut: Any, channel_weakref: weakref.ReferenceType[Any]
+    ) -> int: ...
+    def cancel_select_watcher(self, waiter_id: int) -> bool: ...
     def forward_select_wakeup(self) -> None: ...
     def send_sync(self, item: Any, timeout: float | None = ...) -> None: ...
     def recv_sync(self, timeout: float | None = ...) -> Any: ...
@@ -64,10 +74,12 @@ class _WaitGroupProtocol(Protocol):
     """Protocol for the native Rust RawAsyncWaitGroup class."""
 
     def __init__(self) -> None: ...
-    def add(self, delta: int) -> Any: ...
-    def done(self) -> Any: ...
-    def register_waiter(self, waiter: Any) -> bool: ...
-    def unregister_waiter(self, fut: Any) -> bool: ...
+    def add(self, delta: int) -> int: ...
+    def done(self) -> int: ...
+    def is_zero(self) -> bool: ...
+    def waiter_count(self) -> int: ...
+    def register_waiter_ticket(self, loop: Any, fut: Any) -> int | None: ...
+    def cancel_waiter_ticket(self, ticket_id: int) -> bool: ...
 
 
 _RustRawAsyncChannel: type[_RawAsyncChannelProtocol] | None = _try_import_rust_class(
@@ -78,55 +90,10 @@ _RawAsyncWaitGroup: type[_WaitGroupProtocol] | None = _try_import_rust_class(
 )
 
 
-def _wake_fut(
-    fut: asyncio.Future[Any],
-    val: Any = None,
-    is_exc: bool = False,
-    has_val: bool = True,
-) -> None:
-    """Complete a future on its owning loop safely, tolerating concurrent cancellations.
-
-    :param fut: The future to fulfill or fail.
-    :param val: The value or exception to set on the future.
-    :param is_exc: Whether ``val`` represents an exception.
-    :param has_val: Whether ``val`` carries an actual payload value.
-    """
-    try:
-        if is_exc:
-            exc = val
-            if not isinstance(exc, ChannelClosedError) and "closed" in str(exc).lower():
-                exc = ChannelClosedError(_CHANNEL_CLOSED_MSG)
-            fut.set_exception(exc)
-        else:
-            fut.set_result(val)
-    except (asyncio.InvalidStateError, RuntimeError):
-        if has_val and not is_exc:
-            ch: Any = getattr(fut, "_ch", None)
-            if ch is not None and not getattr(ch, "is_closed", False):
-                try:
-                    ch.try_send(val)
-                except Exception:
-                    pass
-
-
-def _select_wake(arbiter_fut: asyncio.Future[Any], ch: Any) -> None:
-    """Wake a select arbiter future, forwarding the notification if the arbiter was already fulfilled.
-
-    :param arbiter_fut: The select arbiter future awaiting ready channel signal.
-    :param ch: The ready channel instance.
-    """
-    try:
-        if not arbiter_fut.done():
-            arbiter_fut.set_result(ch)
-        else:
-            if hasattr(ch, "_forward_select_wakeup"):
-                ch._forward_select_wakeup()
-    except (asyncio.InvalidStateError, RuntimeError):
-        pass
-
-
 class _LenShim:
     """Helper enabling len() inspection on Rust-backed waiter queues."""
+
+    __slots__ = ("_len_fn",)
 
     def __init__(self, len_fn: Callable[[], int]) -> None:
         self._len_fn = len_fn
@@ -144,11 +111,13 @@ class Channel:
     :param maxsize: Maximum buffer capacity. 0 indicates an unbounded channel.
     """
 
+    __slots__ = ("__weakref__", "_inner", "_maxsize")
+
     def __init__(self, maxsize: int = 0) -> None:
         self._maxsize = max(0, int(maxsize))
         if _RustRawAsyncChannel is None:
             raise RuntimeError("_multiloop_core Rust extension is not compiled.")
-        self._inner: Any = _RustRawAsyncChannel(self._maxsize, _wake_fut, _select_wake)
+        self._inner: Any = _RustRawAsyncChannel(self._maxsize)
 
     def close(self) -> None:
         """Close the channel, waking all pending senders and receivers with ChannelClosedError."""
@@ -162,6 +131,9 @@ class Channel:
         """Return True if the channel is closed."""
         return bool(self._inner.is_closed())
 
+    def _is_drained(self) -> bool:
+        return bool(self._inner.is_drained())
+
     def try_send(self, item: Any) -> bool:
         """Non-blocking send. Return True if the item was enqueued, False if full.
 
@@ -169,10 +141,7 @@ class Channel:
         :returns: ``True`` if sent immediately, ``False`` if the buffer was full.
         :raises ChannelClosedError: If the channel is closed.
         """
-        try:
-            return bool(self._inner.try_send(item))
-        except RuntimeError as e:
-            raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
+        return bool(self._inner.try_send(item))
 
     def try_recv(self) -> Any:
         """Non-blocking receive. Return the item or raise WouldBlock.
@@ -181,13 +150,7 @@ class Channel:
         :raises WouldBlock: If the channel is empty.
         :raises ChannelClosedError: If the channel is closed and completely drained.
         """
-        try:
-            has_item, item = self._inner.try_recv()
-        except RuntimeError as e:
-            raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
-        if has_item:
-            return item
-        raise WouldBlock("Channel is empty")
+        return self._inner.try_recv()
 
     def qsize(self) -> int:
         """Return the current number of buffered items."""
@@ -214,40 +177,37 @@ class Channel:
         :raises ChannelClosedError: If the channel is closed.
         :raises TimeoutError: If timeout expires before buffer space becomes available.
         """
+        _check_not_cancelled()
+        if self._inner.try_send(item):
+            return
         if timeout is not None:
-            await asyncio.wait_for(self._send_impl(item), timeout=timeout)
+            if timeout <= 0:
+                raise TimeoutError("Channel send timed out")
+            async with fail_after(timeout):
+                await self._send_impl(item)
         else:
             await self._send_impl(item)
 
     async def _send_impl(self, item: Any) -> None:
+        _check_not_cancelled()
         loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        waiter_id = self._inner.send_or_register(item, loop, fut)
+        if waiter_id is None:
+            return
+
         while True:
             try:
-                if self._inner.try_send(item):
-                    return
-            except RuntimeError as e:
-                raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
-
-            fut: asyncio.Future[Any] = loop.create_future()
-            try:
-                if self._inner.register_putter(loop, fut):
-                    if self._inner.try_send(item):
-                        return
-                    continue
-            except RuntimeError as e:
-                raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
-
-            try:
-                await fut
+                await _await_cancellable(loop, fut)
             except BaseException:
-                self._inner.unregister_putter(fut)
+                self._inner.cancel_putter(waiter_id)
                 raise
 
-            try:
-                self._inner.claim_put(item)
+            if self._inner.claim_put(item, waiter_id):
                 return
-            except RuntimeError as e:
-                raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
+
+            fut = loop.create_future()
+            waiter_id = self._inner.register_putter_front(loop, fut)
 
     def send_sync(self, item: Any, timeout: float | None = None) -> None:
         """Synchronously send an item into the channel from a worker or background OS thread.
@@ -257,12 +217,7 @@ class Channel:
         :raises TimeoutError: If timeout expired before buffer space became available.
         :raises ChannelClosedError: If the channel is closed.
         """
-        try:
-            self._inner.send_sync(item, timeout)
-        except builtins.TimeoutError as e:
-            raise TimeoutError("send_sync timed out") from e
-        except RuntimeError as e:
-            raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
+        self._inner.send_sync(item, timeout)
 
     async def recv(self, timeout: float | None = None) -> Any:
         """Receive an item, suspending until one is available or the channel is closed.
@@ -272,8 +227,16 @@ class Channel:
         :raises ChannelClosedError: If the channel is closed and empty.
         :raises TimeoutError: If timeout expires before an item is received.
         """
+        _check_not_cancelled()
+        try:
+            return self._inner.try_recv()
+        except WouldBlock:
+            pass
         if timeout is not None:
-            return await asyncio.wait_for(self._recv_impl(), timeout=timeout)
+            if timeout <= 0:
+                raise TimeoutError("Channel recv timed out")
+            async with fail_after(timeout):
+                return await self._recv_impl()
         return await self._recv_impl()
 
     def recv_sync(self, timeout: float | None = None) -> Any:
@@ -284,52 +247,43 @@ class Channel:
         :raises TimeoutError: If timeout expired before an item became available.
         :raises ChannelClosedError: If the channel is closed and drained.
         """
-        try:
-            return self._inner.recv_sync(timeout)
-        except builtins.TimeoutError as e:
-            raise TimeoutError("recv_sync timed out") from e
-        except RuntimeError as e:
-            raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
+        return self._inner.recv_sync(timeout)
 
     async def _recv_impl(self) -> Any:
+        _check_not_cancelled()
         loop = asyncio.get_running_loop()
         while True:
             try:
-                has_item, item = self._inner.try_recv()
-                if has_item:
-                    return item
-            except RuntimeError as e:
-                raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
+                return self._inner.try_recv()
+            except WouldBlock:
+                pass
 
             fut: asyncio.Future[Any] = loop.create_future()
-            fut._ch = self  # type: ignore[attr-defined]
-            try:
-                has_item, item = self._inner.register_getter(loop, fut)
-                if has_item:
-                    return item
-            except RuntimeError as e:
-                raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
+            waiter_id, item = self._inner.register_getter_ticket(loop, fut)
+            if waiter_id == 0:
+                return item
 
             try:
-                return await fut
+                await _await_cancellable(loop, fut)
             except BaseException:
-                self._inner.unregister_getter(fut)
+                self._inner.cancel_getter(waiter_id)
                 raise
+
+            has_item, claimed_item = self._inner.claim_get(waiter_id)
+            if has_item:
+                return claimed_item
 
     def _register_select_watcher(
         self, loop: asyncio.AbstractEventLoop, arbiter_fut: asyncio.Future[Any]
-    ) -> Any | None:
-        try:
-            registered = self._inner.register_select_watcher(loop, arbiter_fut, self)
-            if registered:
-                return arbiter_fut
-            return None
-        except RuntimeError:
-            return None
+    ) -> int | None:
+        waiter_id: int = self._inner.register_select_watcher_ticket(
+            loop, arbiter_fut, weakref.ref(self)
+        )
+        return waiter_id if waiter_id > 0 else None
 
     def _unregister_select_watcher(self, token: Any) -> None:
         if token is not None:
-            self._inner.unregister_select_watcher(token)
+            self._inner.cancel_select_watcher(token)
 
     def _forward_select_wakeup(self) -> None:
         self._inner.forward_select_wakeup()
@@ -416,7 +370,7 @@ class SendChannel:
 class ReceiveChannel:
     """A receive-only view of a :class:`Channel` for interface segregation (Go ``<-chan T`` style)."""
 
-    __slots__ = ("_ch",)
+    __slots__ = ("__weakref__", "_ch")
 
     def __init__(self, ch: Channel) -> None:
         self._ch = ch
@@ -458,6 +412,24 @@ class ReceiveChannel:
     def qsize(self) -> int:
         """Number of items currently buffered in the underlying channel."""
         return self._ch.qsize()
+
+    def _is_drained(self) -> bool:
+        return self._ch._is_drained()
+
+    def _register_select_watcher(
+        self, loop: asyncio.AbstractEventLoop, arbiter_fut: asyncio.Future[Any]
+    ) -> int | None:
+        waiter_id: int = self._ch._inner.register_select_watcher_ticket(
+            loop, arbiter_fut, weakref.ref(self)
+        )
+        return waiter_id if waiter_id > 0 else None
+
+    def _unregister_select_watcher(self, token: Any) -> None:
+        if token is not None:
+            self._ch._inner.cancel_select_watcher(token)
+
+    def _forward_select_wakeup(self) -> None:
+        self._ch._inner.forward_select_wakeup()
 
     def __aiter__(self) -> Self:
         return self
@@ -503,14 +475,15 @@ async def select_channel(
     if not channels:
         raise ValueError("select_channel requires at least one channel")
 
+    _check_not_cancelled()
     loop = asyncio.get_running_loop()
     if timeout is not None and _deadline is None:
         _deadline = loop.time() + timeout
 
     num_channels = len(channels)
     while True:
-        # Phase 1: Fast Probe (try_recv) with randomized start index for anti-barging fairness
-        start_idx = (time.perf_counter_ns() ^ id(loop)) % num_channels if num_channels > 1 else 0
+        # Phase 1: Fast Probe (try_recv) with round-robin start index for anti-barging fairness
+        start_idx = _next_select_index(num_channels) if num_channels > 1 else 0
         for i in range(num_channels):
             ch = channels[(start_idx + i) % num_channels]
             try:
@@ -522,7 +495,7 @@ async def select_channel(
         if default is not _UNSET:
             return default
 
-        if all(ch.is_closed and ch.qsize() == 0 for ch in channels):
+        if all(ch._is_drained() for ch in channels):
             raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
 
         remaining_timeout: float | None = None
@@ -536,6 +509,7 @@ async def select_channel(
         # Phase 2: Single-Arbiter Registration
         arbiter_fut: asyncio.Future[Any] = loop.create_future()
         registered_channels: list[tuple[Any, Any]] = []
+        consumed_arbiter = False
 
         try:
             start_reg = (
@@ -559,23 +533,37 @@ async def select_channel(
             if stolen:
                 continue
 
-            if all(ch.is_closed and ch.qsize() == 0 for ch in channels):
+            if all(ch._is_drained() for ch in channels):
                 raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
 
             if remaining_timeout is not None:
-                ready_ch = await asyncio.wait_for(arbiter_fut, timeout=remaining_timeout)
+                try:
+                    async with fail_after(remaining_timeout):
+                        ready_ch = await _await_cancellable(loop, arbiter_fut)
+                except TimeoutError:
+                    raise TimeoutError("select_channel timed out") from None
             else:
-                ready_ch = await arbiter_fut
+                ready_ch = await _await_cancellable(loop, arbiter_fut)
 
+            consumed_arbiter = True
             try:
                 return ready_ch, ready_ch.try_recv()
             except (WouldBlock, ChannelClosedError):
                 continue
-        except (builtins.TimeoutError, TimeoutError):
-            raise TimeoutError("select_channel timed out") from None
         finally:
             for ch, token in registered_channels:
                 ch._unregister_select_watcher(token)
+            if not consumed_arbiter:
+                if (
+                    arbiter_fut.done()
+                    and not arbiter_fut.cancelled()
+                    and arbiter_fut.exception() is None
+                ):
+                    unconsumed_ch = arbiter_fut.result()
+                    if hasattr(unconsumed_ch, "_forward_select_wakeup"):
+                        unconsumed_ch._forward_select_wakeup()
+                elif not arbiter_fut.done():
+                    arbiter_fut.cancel()
 
 
 class _TrackedCoroutine(Coroutine[Any, Any, Any]):
@@ -595,6 +583,7 @@ class _TrackedCoroutine(Coroutine[Any, Any, Any]):
         return self._gen
 
     async def _run(self) -> Any:
+        self._stepped = True
         try:
             if asyncio.iscoroutine(self._target) or asyncio.isfuture(self._target):
                 return await self._target
@@ -647,11 +636,33 @@ class _TrackedCoroutine(Coroutine[Any, Any, Any]):
                 self._target.close()
 
 
+class _WaitGroupHoldingGuard(AbstractAsyncContextManager[None]):
+    """Zero-generator RAII async context guard for :meth:`AsyncWaitGroup.holding`."""
+
+    __slots__ = ("_wg",)
+
+    def __init__(self, wg: AsyncWaitGroup) -> None:
+        self._wg = wg
+
+    async def __aenter__(self) -> None:
+        self._wg.add(1)
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        self._wg.done()
+
+
 class AsyncWaitGroup:
     """Cross-thread WaitGroup for coordinating multiple asynchronous tasks (Go sync.WaitGroup style).
 
     Coordinates a collection of parallel tasks across one or multiple event-loop threads.
     """
+
+    __slots__ = ("_inner",)
 
     def __init__(self) -> None:
         if _RawAsyncWaitGroup is None:
@@ -667,27 +678,18 @@ class AsyncWaitGroup:
         :param delta: Integer delta to add (can be negative, but counter must not drop below zero).
         :raises RuntimeError: If delta would drive the counter below zero.
         """
-        waiters = self._inner.add(delta)
-        if waiters:
-            _wake_all(waiters)
+        self._inner.add(delta)
 
     def done(self) -> None:
         """Decrement the task counter by 1. Wakes all waiters if the counter reaches 0.
 
         :raises RuntimeError: If done() is called when the counter is already zero.
         """
-        waiters = self._inner.done()
-        if waiters:
-            _wake_all(waiters)
+        self._inner.done()
 
-    @asynccontextmanager
-    async def holding(self) -> AsyncGenerator[None]:
+    def holding(self) -> AbstractAsyncContextManager[None]:
         """RAII async context manager that increments counter on enter and decrements on exit."""
-        self.add(1)
-        try:
-            yield
-        finally:
-            self.done()
+        return _WaitGroupHoldingGuard(self)
 
     def wrap(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Wrap a callable to automatically track execution inside the waitgroup.
@@ -725,16 +727,22 @@ class AsyncWaitGroup:
 
     async def wait(self) -> None:
         """Suspend execution until the counter reaches zero."""
+        _check_not_cancelled()
+        if self._inner.is_zero():
+            return
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Any] = loop.create_future()
-        already_done = self._inner.register_waiter((loop, fut))
-        if already_done:
+        ticket_id = self._inner.register_waiter_ticket(loop, fut)
+        if ticket_id is None:
             return
         try:
-            await fut
+            await _await_cancellable(loop, fut)
         except BaseException:
-            self._inner.unregister_waiter(fut)
+            self._inner.cancel_waiter_ticket(ticket_id)
             raise
+
+
+_RawAsyncOnce = _try_import_rust_class("multiloop._multiloop_core", "RawAsyncOnce")
 
 
 class AsyncOnce:
@@ -744,15 +752,16 @@ class AsyncOnce:
     by many coroutines across different OS threads.
     """
 
+    __slots__ = ("_raw",)
+
     def __init__(self) -> None:
-        self._thread_lock = threading.Lock()
-        self._done = False
-        self._result: Any = None
-        self._exc: BaseException | None = None
-        self._waiters: collections.OrderedDict[asyncio.Future[Any], asyncio.AbstractEventLoop] = (
-            collections.OrderedDict()
-        )
-        self._executing = False
+        if _RawAsyncOnce is None:
+            raise RuntimeError("_multiloop_core Rust extension is not compiled.")
+        self._raw = _RawAsyncOnce()
+
+    @property
+    def _done(self) -> bool:
+        return bool(self._raw.is_done())
 
     def __repr__(self) -> str:
         return f"<AsyncOnce done={self._done}>"
@@ -765,51 +774,50 @@ class AsyncOnce:
         :param kwargs: Keyword arguments passed to `fn`.
         :returns: The result returned by `fn`.
         """
+        _check_not_cancelled()
+        completed = self._raw.try_get_completed()
+        if completed is not None:
+            is_exc, val_or_exc = completed
+            if is_exc:
+                raise copy.copy(val_or_exc)
+            return val_or_exc
+
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future[Any] | None = None
+        fut: asyncio.Future[Any] = loop.create_future()
+        status, ticket_id, val_or_exc = self._raw.enter_or_register(loop, fut)
 
-        with self._thread_lock:
-            if self._done:
-                if self._exc:
-                    raise self._exc
-                return self._result
+        if status == 2:
+            return val_or_exc
+        if status == 3:
+            raise copy.copy(val_or_exc)
 
-            if not self._executing:
-                self._executing = True
-                is_leader = True
-            else:
-                is_leader = False
-
-            if not is_leader:
-                fut = loop.create_future()
-                self._waiters[fut] = loop
-
-        if not is_leader:
-            assert fut is not None
+        if status == 1:
+            assert ticket_id is not None
             try:
-                await fut
-            finally:
-                with self._thread_lock:
-                    _discard_waiter(self._waiters, fut)
-            if self._exc:
-                raise self._exc
-            return self._result
+                await _await_cancellable(loop, fut)
+            except BaseException:
+                self._raw.cancel_waiter(ticket_id)
+                raise
+            has_exc, out_val = self._raw.outcome()
+            if has_exc:
+                raise copy.copy(out_val)
+            return out_val
 
+        res: Any = None
+        exc_to_store: BaseException | None = None
         try:
             res = fn(*args, **kwargs)
             if asyncio.iscoroutine(res) or asyncio.isfuture(res):
                 res = await res
-            self._result = res
         except BaseException as e:
             if isinstance(e, asyncio.CancelledError):
-                self._exc = RuntimeError("AsyncOnce execution was cancelled")
-                self._exc.__cause__ = e
+                wrapped = RuntimeError("AsyncOnce execution was cancelled")
+                wrapped.__cause__ = e
+                exc_to_store = wrapped
             else:
-                self._exc = e
+                exc_to_store = e
             raise
         finally:
-            with self._thread_lock:
-                self._done = True
-                _wake_all(self._waiters)
+            self._raw.complete(res, exc_to_store)
 
-        return self._result
+        return res

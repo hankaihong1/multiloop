@@ -86,6 +86,7 @@ _MIRROR_PAIRS = [
     ("docs/API.md", "docs/API_ZH.md"),
     ("docs/CHOOSING.md", "docs/CHOOSING_ZH.md"),
     ("docs/CONCURRENCY.md", "docs/CONCURRENCY_ZH.md"),
+    ("examples/README.md", "examples/README_ZH.md"),
 ]
 
 
@@ -111,11 +112,11 @@ def test_api_mirror_symbols_match() -> None:
 
 
 def test_doc_mirror_headings_count_match() -> None:
-    """Each mirror pair must have the same ## / ### heading count (guards against
-    forgetting the mirror when adding/removing large sections)."""
+    """Each mirror pair must have the same # / ## / ### heading count (guards against
+    forgetting the mirror when adding/removing sections)."""
     for en_name, zh_name in _MIRROR_PAIRS:
         en_path, zh_path = ROOT / en_name, ROOT / zh_name
-        for level in (2, 3):
+        for level in (1, 2, 3):
             en_n = len(_count_headings(en_path, level))
             zh_n = len(_count_headings(zh_path, level))
             assert en_n == zh_n, (

@@ -9,19 +9,24 @@ built around a Rust core. Key capabilities:
 - AsyncContext, AsyncWaitGroup, AsyncOnce, AsyncRWMutex primitives
 - Comprehensive synchronization primitives (Lock, Semaphore, Condition, Barrier, CapacityLimiter)
 
-Docs: https://github.com/hankaihong1/multiloop (docs/API.md, docs/sphinx_html/).
+Docs: https://github.com/hankaihong1/multiloop (docs/API.md).
 """
 
+import asyncio
 from typing import Any
 
 from multiloop._cancel import (
     CancelScope,
+    _await_cancellable,
+    _is_current_task_cancelled,
     checkpoint,
     current_effective_deadline,
     fail_after,
     fail_at,
     move_on_after,
     move_on_at,
+    sleep,
+    wait_cancellable,
 )
 from multiloop._logging import get_logger, set_log_level
 from multiloop._sync import (
@@ -57,7 +62,7 @@ from multiloop.primitives import (
 )
 from multiloop.rwlock import AsyncRWMutex
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 
 async def run_in_pool(coro: Any, *args: Any, num_threads: int = 0, **kwargs: Any) -> Any:
@@ -69,13 +74,29 @@ async def run_in_pool(coro: Any, *args: Any, num_threads: int = 0, **kwargs: Any
     :param kwargs: Keyword arguments for ``coro``.
     :returns: Result returned by ``coro``.
     """
+    if _is_current_task_cancelled():
+        if asyncio.iscoroutine(coro):
+            coro.close()
+        raise asyncio.CancelledError()
+
     pool = EventLoopThreadPool(num_threads=num_threads)
-    await pool.start()
+    submitted = False
+    scope = CancelScope()
     try:
-        fut = pool.submit(coro, *args, **kwargs)
-        return await fut
+        await pool.start()
+        loop = asyncio.get_running_loop()
+        fut = pool.submit(coro, *args, cancel_scope=scope, **kwargs)
+        submitted = True
+        try:
+            return await _await_cancellable(loop, fut)
+        except BaseException:
+            scope.cancel()
+            raise
     finally:
-        await pool.close()
+        if not submitted and asyncio.iscoroutine(coro):
+            coro.close()
+        async with CancelScope(shield=True):
+            await pool.close()
 
 
 __all__ = [
@@ -116,4 +137,6 @@ __all__ = [
     "run_in_pool",
     "select_channel",
     "set_log_level",
+    "sleep",
+    "wait_cancellable",
 ]

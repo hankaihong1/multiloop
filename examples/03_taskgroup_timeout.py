@@ -10,7 +10,7 @@ import multiloop
 
 
 async def fetch(name: str, delay: float) -> str:
-    await asyncio.sleep(delay)  # simulate a network request
+    await multiloop.sleep(delay)  # simulate a cancellable network request
     return f"{name}: ok"
 
 
@@ -39,10 +39,11 @@ async def main() -> None:
     async def cancellable() -> None:
         async with scope:
             try:
-                await asyncio.sleep(10)
+                await multiloop.sleep(10)
             finally:
-                # even when cancelled, the cleanup runs to completion
-                # (shield semantics apply internally)
+                # even when cancelled, synchronous/shielded cleanup completes cleanly
+                async with multiloop.CancelScope(shield=True):
+                    await multiloop.sleep(0.005)
                 print("  cleanup code finished")
 
     task = asyncio.create_task(cancellable())

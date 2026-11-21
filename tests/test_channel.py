@@ -121,10 +121,11 @@ async def test_channel_error_recv_from_closed_empty_channel():
 
 @pytest.mark.asyncio
 async def test_channel_error_recv_timeout():
-    """Error 3: Timed recv raises asyncio.TimeoutError"""
+    """Timed recv raises TimeoutError without leaking getter waiters."""
     ch = Channel()
-    with pytest.raises(asyncio.TimeoutError):
+    with pytest.raises((TimeoutError, asyncio.TimeoutError)):
         await ch.recv(timeout=0.02)
+    assert len(ch._getters) == 0
 
 
 def test_wouldblock_is_multiloop_error():
@@ -132,21 +133,21 @@ def test_wouldblock_is_multiloop_error():
     assert isinstance(WouldBlock(), MultiloopError)
 
 
-def test_fast_channel_try_send_recv_roundtrip():
+def test_channel_try_send_recv_roundtrip():
     """try_send + try_recv on Channel should round-trip a value."""
     ch = Channel()
     assert ch.try_send("hello")
     assert ch.try_recv() == "hello"
 
 
-def test_fast_channel_try_recv_empty_raises_wouldblock():
+def test_channel_try_recv_empty_raises_wouldblock():
     """try_recv on an empty Channel should raise WouldBlock."""
     ch = Channel()
     with pytest.raises(WouldBlock):
         ch.try_recv()
 
 
-def test_fast_channel_qsize():
+def test_channel_qsize():
     """qsize() should reflect the number of buffered items."""
     ch = Channel()
     assert ch.qsize() == 0
@@ -160,14 +161,14 @@ def test_fast_channel_qsize():
     assert ch.qsize() == 0
 
 
-def test_fast_channel_try_send_full_bounded():
+def test_channel_try_send_full_bounded():
     """try_send on a full bounded Channel should return False."""
     ch = Channel(maxsize=1)
     assert ch.try_send("first")
     assert not ch.try_send("second")
 
 
-def test_fast_channel_try_recv_closed_raises():
+def test_channel_try_recv_closed_raises():
     """try_recv on a closed empty Channel should raise ChannelClosedError."""
     ch = Channel()
     ch.close()
@@ -175,112 +176,18 @@ def test_fast_channel_try_recv_closed_raises():
         ch.try_recv()
 
 
-def test_fast_channel_try_send_closed_raises():
+def test_channel_try_send_closed_raises():
     """try_send on a closed Channel should raise ChannelClosedError."""
     ch = Channel()
     ch.close()
     with pytest.raises(ChannelClosedError):
         ch.try_send("nope")
-
-
-def test_async_channel_try_send_recv_roundtrip():
-    """try_send + try_recv on Channel should round-trip a value."""
-    ch = Channel()
-    assert ch.try_send("world")
-    assert ch.try_recv() == "world"
-
-
-def test_async_channel_try_recv_empty_raises_wouldblock():
-    """try_recv on an empty Channel should raise WouldBlock."""
-    ch = Channel()
-    with pytest.raises(WouldBlock):
-        ch.try_recv()
-
-
-def test_async_channel_qsize():
-    """qsize() should reflect the number of buffered items."""
-    ch = Channel()
-    assert ch.qsize() == 0
-    ch.try_send("a")
-    assert ch.qsize() == 1
-    ch.try_send("b")
-    assert ch.qsize() == 2
-    ch.try_recv()
-    assert ch.qsize() == 1
-
-
-def test_async_channel_try_send_full_bounded():
-    """try_send on a full bounded Channel should return False."""
-    ch = Channel(maxsize=1)
-    assert ch.try_send("first")
-    assert not ch.try_send("second")
-
-
-def test_async_channel_try_recv_closed_raises():
-    """try_recv on a closed empty Channel should raise ChannelClosedError."""
-    ch = Channel()
-    ch.close()
-    with pytest.raises(ChannelClosedError):
-        ch.try_recv()
-
-
-def test_async_channel_try_send_closed_raises():
-    """try_send on a closed Channel should raise ChannelClosedError."""
-    ch = Channel()
-    ch.close()
-    with pytest.raises(ChannelClosedError):
-        ch.try_send("nope")
-
-
-@pytest.mark.asyncio
-async def test_fast_channel_basic_send_recv():
-    """Test Rust-based Channel basic send/receive"""
-    ch = Channel()
-    await ch.send("rust_fast_data")
-    val = await ch.recv()
-    assert val == "rust_fast_data"
-
-
-@pytest.mark.asyncio
-async def test_fast_channel_capacity_and_block():
-    """Test Channel capacity-based blocking"""
-    ch = Channel(maxsize=1)
-    await ch.send(100)
-
-    send_task = asyncio.create_task(ch.send(200))
-    await wait_all_tasks_blocked()
-    assert not send_task.done()
-
-    val1 = await ch.recv()
-    assert val1 == 100
-    await asyncio.wait_for(send_task, timeout=1.0)
-    val2 = await ch.recv()
-    assert val2 == 200
-
-
-@pytest.mark.asyncio
-async def test_fast_channel_closed_error():
-    """Test Channel raises exception on close"""
-    ch = Channel()
-    ch.close()
-    with pytest.raises(ChannelClosedError):
-        await ch.send("error")
-
-
-@pytest.mark.asyncio
-async def test_select_channel_no_channels():
-    """select_channel raises ValueError when no channels are provided (line 211)."""
-    from multiloop.primitives import select_channel
-
-    with pytest.raises(ValueError, match="at least one channel"):
-        await select_channel()
 
 
 @pytest.mark.asyncio
 async def test_channel_close_with_blocked_waiters():
     """Close Channel while sender and receiver are blocked — covers
-    _channel_base.py _close_waiters putters path (46-48, branch 41->39)
-    and primitives.py BaseException cleanup (124-129, 175, 182-186)."""
+    RawAsyncChannel.close() waking blocked putters/getters and BaseException cleanup."""
     # Blocked sender: fill bounded channel, start sender, close
     send_ch = Channel(maxsize=1)
     await send_ch.send("fill")
@@ -308,13 +215,14 @@ async def test_channel_close_with_blocked_waiters():
 
 
 @pytest.mark.asyncio
-async def test_async_channel_timeout_and_errors():
-    """Test Channel timeout and close edge paths"""
+async def test_channel_timeout_and_close_idempotent():
+    """Timed send cleans up putters, and repeated close() is idempotent while draining."""
     ch = Channel(maxsize=1)
     await ch.send("item1")
 
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(ch.send("item2"), timeout=0.05)
+    with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+        await ch.send("item2", timeout=0.02)
+    assert len(ch._putters) == 0
 
     ch.close()
     ch.close()  # Second close is idempotent
@@ -329,21 +237,6 @@ async def test_async_channel_timeout_and_errors():
 
     with pytest.raises(ChannelClosedError):
         await ch.recv()
-
-
-@pytest.mark.asyncio
-async def test_fast_channel_timeout_and_errors():
-    """Test Channel timeout and edge case error paths"""
-    ch = Channel(maxsize=1)
-    with pytest.raises((TimeoutError, asyncio.TimeoutError)):
-        await ch.recv(timeout=0.05)
-
-    await ch.send("item1")
-    ch.close()
-    assert ch.is_closed
-
-    with pytest.raises(ChannelClosedError):
-        await ch.send("item2")
 
 
 @pytest.mark.asyncio
@@ -411,26 +304,6 @@ async def test_channel_async_for_iteration():
 
 
 @pytest.mark.asyncio
-async def test_fast_channel_async_for_iteration():
-    """1b. Validate Channel async for loop consumption"""
-    ch = Channel()
-
-    async def producer():
-        for item in ["a", "b", "c"]:
-            await ch.send(item)
-            await asyncio.sleep(0.01)
-        ch.close()
-
-    asyncio.create_task(producer())
-
-    received = []
-    async for item in ch:
-        received.append(item)
-
-    assert received == ["a", "b", "c"]
-
-
-@pytest.mark.asyncio
 async def test_select_channel_multi_branch():
     """2. Go parity select: Validate select_channel listening on multiple channels simultaneously"""
     ch1 = Channel()
@@ -487,23 +360,8 @@ async def test_fastchannel_none_after_regular_items() -> None:
     assert await ch.recv() == 2
 
 
-def test_pop_work_rejects_none() -> None:
-    """hardening: pushing a None task into the native pool is a type error."""
-    import multiloop._multiloop_core as core
-
-    pool = core.NativeWorkerPool(2)
-    try:
-        with pytest.raises(TypeError):
-            pool.push_global(None)
-        with pytest.raises(TypeError):
-            pool.push_local(0, None)
-    finally:
-        pool.close()
-
-
 # ---------------------------------------------------------------------------
-# Regression tests
-# — 2026-08-10 audit
+# select_channel contracts
 # ---------------------------------------------------------------------------
 
 
@@ -697,9 +555,10 @@ async def test_getter_cancel_forwards_wakeup_to_next_getter() -> None:
     assert recv_done == ["x"]
 
 
-def test_fastchannel_empty_full_maxsize() -> None:
-    """Channel should correctly report empty(), full(), and maxsize."""
+def test_channel_empty_full_maxsize() -> None:
+    """Channel should correctly report repr(), empty(), full(), and maxsize."""
     ch_unbounded = Channel(0)
+    assert repr(ch_unbounded) == "<Channel is_closed=False>"
     assert ch_unbounded.maxsize == 0
     assert ch_unbounded.empty() is True
     assert ch_unbounded.full() is False
@@ -707,6 +566,8 @@ def test_fastchannel_empty_full_maxsize() -> None:
     ch_unbounded.try_send(1)
     assert ch_unbounded.empty() is False
     assert ch_unbounded.full() is False
+    ch_unbounded.close()
+    assert ch_unbounded.is_closed
 
     ch_bounded = Channel(2)
     assert ch_bounded.maxsize == 2
@@ -758,10 +619,12 @@ async def test_select_channel_deadline_contention_retry() -> None:
     ch2 = Channel()
 
     start = time.monotonic()
-    with pytest.raises(TimeoutError):
-        await select_channel(ch1, ch2, timeout=0.1)
+    with pytest.raises(TimeoutError, match="select_channel timed out"):
+        await select_channel(ch1, ch2, timeout=0.05)
     elapsed = time.monotonic() - start
-    assert 0.08 <= elapsed < 0.5, f"Timeout took {elapsed}s, expected ~0.1s"
+    assert 0.04 <= elapsed < 0.5, f"Timeout took {elapsed}s, expected ~0.05s"
+    assert len(ch1._getters) == 0 and len(ch1._notifiers) == 0
+    assert len(ch2._getters) == 0 and len(ch2._notifiers) == 0
 
 
 @pytest.mark.asyncio
@@ -792,17 +655,6 @@ async def test_select_channel_contention_iterative() -> None:
     await prod_task
     r1, r2 = await asyncio.gather(c1, c2)
     assert len(r1) + len(r2) == 100
-
-
-@pytest.mark.asyncio
-async def test_select_channel_timeout_error_tuple_catch() -> None:
-    """select_channel properly converts asyncio.TimeoutError and passes through custom exceptions."""
-    ch1 = Channel()
-    ch2 = Channel()
-
-    # Normal timeout raises multiloop.exceptions.TimeoutError
-    with pytest.raises(TimeoutError, match="select_channel timed out"):
-        await select_channel(ch1, ch2, timeout=0.05)
 
 
 @pytest.mark.asyncio
@@ -1041,20 +893,6 @@ async def test_channel_send_sync_from_thread() -> None:
 
 
 @pytest.mark.asyncio
-async def test_channel_alias_and_basic_operation() -> None:
-    """Ensure Channel is identical to Channel and functions correctly."""
-    # Channel test
-    ch: Channel = Channel(maxsize=2)
-    assert repr(ch) == "<Channel is_closed=False>"
-    await ch.send("hello")
-    assert not ch.empty()
-    assert await ch.recv() == "hello"
-    assert ch.empty()
-    ch.close()
-    assert ch.is_closed
-
-
-@pytest.mark.asyncio
 async def test_channel_split_send_receive_views() -> None:
     """Ensure Channel.split() produces isolated SendChannel and ReceiveChannel views."""
     ch = Channel(maxsize=3)
@@ -1087,36 +925,6 @@ async def test_channel_split_send_receive_views() -> None:
     assert rx.try_recv() == "item4"
     assert tx.is_closed
     assert rx.is_closed
-
-
-@pytest.mark.asyncio
-async def test_channel_anti_barging_fifo() -> None:
-    """Ensure unqueued senders cannot barge in ahead of queued putters in a bounded channel."""
-    ch = Channel(maxsize=1)
-    await ch.send("initial")
-
-    # Launch a background sender that blocks because channel is full
-    sent_order: list[str] = []
-
-    async def putter1() -> None:
-        await ch.send("p1")
-        sent_order.append("p1")
-
-    task1 = asyncio.create_task(putter1())
-    await asyncio.sleep(0.01)  # Ensure task1 reaches the wait state
-
-    # A receiver consumes 'initial'
-    val = ch.try_recv()
-    assert val == "initial"
-
-    # At this moment, p1 was queued before any barger.
-    # An unqueued sender tries to barge in immediately:
-    barge_succeeded = ch.try_send("barger")
-    # Anti-barging invariant: barger MUST NOT be allowed to barge ahead of queued p1!
-    assert not barge_succeeded, "Barger was allowed to steal slot from queued putter!"
-
-    await task1
-    assert await ch.recv() == "p1"
 
 
 @pytest.mark.asyncio
@@ -1161,3 +969,472 @@ def test_channel_sync_timeout_and_closed() -> None:
 
     with pytest.raises(ChannelClosedError):
         ch.recv_sync()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 TDD Suite: Cancelled getter zero-loss & FIFO preservation + select
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "maxsize", "extra"),
+    [
+        ("bounded_full_fifo", 1, 1),
+        ("bounded_full_fifo", 2, 2),
+        ("bounded_full_fifo", 3, 3),
+        ("bounded_full_fifo", 4, 4),
+        ("bounded_full_fifo", 5, 5),
+        ("closed_after_send", 0, 1),
+        ("closed_after_send", 1, 1),
+        ("closed_after_send", 2, 2),
+        ("post_set_result_cancel", 0, 1),
+        ("post_set_result_cancel", 1, 1),
+        ("post_set_result_cancel", 2, 2),
+        ("forward_to_second_getter", 0, 2),
+        ("forward_to_second_getter", 1, 2),
+        ("select_round_robin", 2, 2),
+        ("select_round_robin", 2, 4),
+    ],
+)
+async def test_channel_cancel_conservation_valid(scenario: str, maxsize: int, extra: int) -> None:
+    """Valid parameterized tests for zero-loss cancelled getter recovery and FIFO order."""
+    if scenario == "bounded_full_fifo":
+        ch = Channel(maxsize=maxsize)
+        recv_task = asyncio.create_task(ch.recv())
+        await wait_all_tasks_blocked()
+
+        # First item wakes recv_task (via call_soon_threadsafe, holding 1 slot in-flight)
+        assert ch.try_send(0) is True
+        # Fill the remaining maxsize - 1 bounded slots; capacity conservation blocks overflow
+        for i in range(1, maxsize):
+            assert ch.try_send(i) is True
+        assert ch.try_send(maxsize) is False
+        # Cancel recv_task before it can consume item 0
+        recv_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await recv_task
+        await asyncio.sleep(0)
+
+        # Every single item [0, ..., maxsize - 1] must be preserved in strict FIFO order without overflow!
+        assert ch.qsize() == maxsize
+        received = [await ch.recv(timeout=0.5) for _ in range(maxsize)]
+        assert received == list(range(maxsize))
+
+    elif scenario == "closed_after_send":
+        ch = Channel(maxsize=maxsize)
+        recv_task = asyncio.create_task(ch.recv())
+        await wait_all_tasks_blocked()
+
+        assert ch.try_send("before_close") is True
+        ch.close()
+        recv_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await recv_task
+        await asyncio.sleep(0)
+
+        # Even though channel was closed, "before_close" was sent prior to close() and must drain!
+        assert await ch.recv(timeout=0.5) == "before_close"
+
+    elif scenario == "post_set_result_cancel":
+        ch = Channel(maxsize=maxsize)
+        recv_task = asyncio.create_task(ch.recv())
+        await wait_all_tasks_blocked()
+
+        assert ch.try_send("first") is True
+        if maxsize == 0 or maxsize >= 2:
+            assert ch.try_send("second") is True
+        else:
+            assert ch.try_send("second") is False
+        # Let _wake_fut run and call fut.set_result("first"), then cancel recv_task in same turn!
+        loop = asyncio.get_running_loop()
+        loop.call_soon(recv_task.cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await recv_task
+
+        assert await ch.recv(timeout=0.5) == "first"
+        if maxsize == 0 or maxsize >= 2:
+            assert await ch.recv(timeout=0.5) == "second"
+
+    elif scenario == "forward_to_second_getter":
+        ch = Channel(maxsize=maxsize)
+        t1 = asyncio.create_task(ch.recv())
+        t2 = asyncio.create_task(ch.recv())
+        await wait_all_tasks_blocked()
+
+        assert ch.try_send("handoff_val") is True
+        t1.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t1
+        assert await asyncio.wait_for(t2, timeout=0.5) == "handoff_val"
+
+    elif scenario == "select_round_robin":
+        chans = [Channel(maxsize=maxsize) for _ in range(extra)]
+        for idx, c in enumerate(chans):
+            c.try_send(idx)
+        seen = set()
+        for _ in range(extra):
+            _chosen, val = await select_channel(*chans)
+            seen.add(val)
+        assert seen == set(range(extra))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("boundary_case", "maxsize", "payload"),
+    [
+        ("sync_try_recv_after_cancel", 1, "imm_1"),
+        ("sync_try_recv_after_cancel", 2, "imm_2"),
+        ("sync_try_recv_after_cancel", 0, "imm_0"),
+        ("falsy_payload", 1, None),
+        ("falsy_payload", 1, False),
+        ("falsy_payload", 1, 0),
+        ("falsy_payload", 1, ""),
+        ("falsy_payload", 1, {}),
+        ("consecutive_cancelled_getters", 1, 2),
+        ("consecutive_cancelled_getters", 1, 3),
+        ("consecutive_cancelled_getters", 2, 5),
+        ("cancelled_putter_forwarding", 1, 0),
+        ("cancelled_putter_forwarding", 1, 1),
+        ("cancelled_putter_forwarding", 1, 2),
+        ("select_default_boundary", 1, "default_sentinel"),
+    ],
+)
+async def test_channel_cancel_conservation_boundary(
+    boundary_case: str, maxsize: int, payload: Any
+) -> None:
+    """Boundary parameterized tests for immediate sync try_recv, falsy payloads, and chained cancels."""
+    if boundary_case == "sync_try_recv_after_cancel":
+        ch = Channel(maxsize=maxsize)
+        t = asyncio.create_task(ch.recv())
+        await wait_all_tasks_blocked()
+        t.cancel()
+        ch.try_send(payload)
+        with pytest.raises(asyncio.CancelledError):
+            await t
+        # Immediately call synchronous try_recv() without an extra asyncio.sleep(0)!
+        assert ch.try_recv() == payload
+
+    elif boundary_case == "falsy_payload":
+        ch = Channel(maxsize=maxsize)
+        t = asyncio.create_task(ch.recv())
+        await wait_all_tasks_blocked()
+        assert ch.try_send(payload) is True
+        # In-flight getter occupies the single slot on maxsize=1
+        assert ch.try_send("after_falsy") is False
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+        assert await ch.recv(timeout=0.5) == payload
+        assert ch.try_send("after_falsy") is True
+        assert await ch.recv(timeout=0.5) == "after_falsy"
+
+    elif boundary_case == "consecutive_cancelled_getters":
+        ch = Channel(maxsize=maxsize)
+        n_cancel = int(payload)
+        tasks = [asyncio.create_task(ch.recv()) for _ in range(n_cancel)]
+        live_task = asyncio.create_task(ch.recv())
+        await wait_all_tasks_blocked()
+
+        for t in tasks:
+            t.cancel()
+        assert ch.try_send("survivor") is True
+        for t in tasks:
+            with pytest.raises(asyncio.CancelledError):
+                await t
+        assert await asyncio.wait_for(live_task, timeout=0.5) == "survivor"
+
+    elif boundary_case == "cancelled_putter_forwarding":
+        ch = Channel(maxsize=maxsize)
+        await ch.send("initial")
+        p1 = asyncio.create_task(ch.send("from_p1"))
+        extra_putters = [
+            asyncio.create_task(ch.send(f"from_extra_{i}")) for i in range(int(payload))
+        ]
+        await wait_all_tasks_blocked()
+
+        # Free space to wake p1, then immediately cancel p1
+        assert ch.try_recv() == "initial"
+        p1.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await p1
+
+        for i, ep in enumerate(extra_putters):
+            await asyncio.wait_for(ep, timeout=0.5)
+            assert await ch.recv(timeout=0.5) == f"from_extra_{i}"
+
+    elif boundary_case == "select_default_boundary":
+        ch = Channel(maxsize=maxsize)
+        assert await select_channel(ch, default=payload) == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_op", "maxsize", "expected_exc"),
+    [
+        ("try_send_closed", 0, ChannelClosedError),
+        ("try_send_closed", 1, ChannelClosedError),
+        ("try_send_closed", 2, ChannelClosedError),
+        ("send_closed", 0, ChannelClosedError),
+        ("send_closed", 1, ChannelClosedError),
+        ("send_closed", 2, ChannelClosedError),
+        ("try_recv_closed_empty", 0, ChannelClosedError),
+        ("try_recv_closed_empty", 1, ChannelClosedError),
+        ("try_recv_closed_empty", 2, ChannelClosedError),
+        ("recv_closed_empty", 0, ChannelClosedError),
+        ("recv_closed_empty", 1, ChannelClosedError),
+        ("try_recv_open_empty", 1, WouldBlock),
+        ("select_no_channels", 0, ValueError),
+        ("select_all_closed", 1, ChannelClosedError),
+        ("select_zero_timeout", 1, TimeoutError),
+    ],
+)
+async def test_channel_cancel_conservation_error(
+    error_op: str, maxsize: int, expected_exc: type[BaseException]
+) -> None:
+    """Error parameterized tests asserting exact exception types for invalid/closed channel ops."""
+    ch = Channel(maxsize=maxsize)
+    if error_op == "try_send_closed":
+        ch.close()
+        with pytest.raises(expected_exc):
+            ch.try_send("x")
+    elif error_op == "send_closed":
+        ch.close()
+        with pytest.raises(expected_exc):
+            await ch.send("x")
+    elif error_op == "try_recv_closed_empty":
+        ch.close()
+        with pytest.raises(expected_exc):
+            ch.try_recv()
+    elif error_op == "recv_closed_empty":
+        ch.close()
+        with pytest.raises(expected_exc):
+            await ch.recv()
+    elif error_op == "try_recv_open_empty":
+        with pytest.raises(expected_exc):
+            ch.try_recv()
+    elif error_op == "select_no_channels":
+        with pytest.raises(expected_exc):
+            await select_channel()
+    elif error_op == "select_all_closed":
+        ch2 = Channel(maxsize=maxsize)
+        ch.close()
+        ch2.close()
+        with pytest.raises(expected_exc):
+            await select_channel(ch, ch2)
+    elif error_op == "select_zero_timeout":
+        with pytest.raises(expected_exc):
+            await select_channel(ch, timeout=0.0)
+
+
+@pytest.mark.asyncio
+async def test_repro_try_send_select_watcher_maxsize_overflow() -> None:
+    """try_send must not overflow maxsize or barge ahead of putters when select_watchers are present."""
+    ch = Channel(maxsize=1)
+    sel1 = asyncio.create_task(select_channel(ch))
+    sel2 = asyncio.create_task(select_channel(ch))
+    await wait_all_tasks_blocked()
+
+    assert ch.try_send("first") is True
+    assert ch.qsize() == 1
+    # Second try_send must return False because maxsize=1 is already full!
+    assert ch.try_send("overflow") is False
+    assert ch.qsize() == 1
+
+    sel1.cancel()
+    sel2.cancel()
+    await asyncio.gather(sel1, sel2, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_repro_send_sync_woken_when_in_flight_putter_cancelled() -> None:
+    """register_getter and in-flight putter cancel must notify condvar so blocked send_sync threads wake up."""
+    ch = Channel(maxsize=1)
+    assert ch.try_send("initial") is True
+
+    send_sync_err: list[BaseException] = []
+
+    def sync_sender() -> None:
+        try:
+            ch.send_sync("sync_item", timeout=0.25)
+        except BaseException as exc:
+            send_sync_err.append(exc)
+
+    t = threading.Thread(target=sync_sender)
+    t.start()
+    await asyncio.sleep(0.03)
+
+    # Consume "initial" via register_getter_ticket fast-path -> must notify condvar to wake sync_sender!
+    loop = asyncio.get_running_loop()
+    res = ch._inner.register_getter_ticket(loop, loop.create_future())
+    assert res == (0, "initial")
+
+    await asyncio.to_thread(t.join, 1.0)
+    assert not send_sync_err, (
+        f"send_sync failed to wake after register_getter drained buffer: {send_sync_err}"
+    )
+    assert ch.try_recv() == "sync_item"
+
+
+@pytest.mark.asyncio
+async def test_repro_select_channel_receive_channel_and_unicast_forwarding() -> None:
+    """select_channel must support ReceiveChannel and forward unicast wakeup if cancelled after arbiter_fut resolves."""
+    ch = Channel(maxsize=2)
+    tx, rx = ch.split()
+
+    sel1 = asyncio.create_task(select_channel(rx))
+    sel2 = asyncio.create_task(select_channel(rx))
+    await wait_all_tasks_blocked()
+
+    assert tx.try_send("only_item") is True
+    # Let _select_wake fulfill sel1's arbiter_fut, and cancel sel1 in the same turn before it steps
+    loop = asyncio.get_running_loop()
+    loop.call_soon(sel1.cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await sel1
+
+    # sel2 must receive the forwarded wakeup and consume "only_item"
+    chosen, val = await asyncio.wait_for(sel2, timeout=0.3)
+    assert chosen is rx
+    assert val == "only_item"
+
+
+@pytest.mark.asyncio
+async def test_select_channel_caller_cancel_cleans_up() -> None:
+    """Cancelling a select_channel caller cleans up channel notifiers immediately."""
+    ch = Channel()
+    sel = asyncio.create_task(select_channel(ch))
+    await wait_all_tasks_blocked()
+    await asyncio.sleep(0)
+    assert len(ch._notifiers) == 1
+
+    sel.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sel
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert len(ch._notifiers) == 0
+
+
+@pytest.mark.asyncio
+async def test_bounded_channel_getter_cancel_respects_maxsize() -> None:
+    """In-flight getter cancel on full Channel(maxsize=1) preserves capacity without exceeding maxsize."""
+    ch = Channel(maxsize=1)
+
+    getter_task = asyncio.create_task(ch.recv())
+    await asyncio.sleep(0)
+
+    p1_task = asyncio.create_task(ch.send("a"))
+    await asyncio.sleep(0)
+    await p1_task
+
+    assert ch.full() is True
+    assert ch.try_send("b") is False
+
+    p2_task = asyncio.create_task(ch.send("b"))
+    await asyncio.sleep(0)
+    assert not p2_task.done()
+
+    getter_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await getter_task
+    await asyncio.sleep(0)
+
+    assert ch.qsize() == 1
+    assert not p2_task.done()
+    assert await ch.recv() == "a"
+    await p2_task
+    assert await ch.recv() == "b"
+
+
+@pytest.mark.asyncio
+async def test_closed_channel_inflight_getter_cancel_retains_item() -> None:
+    """Cancelling an in-flight getter after close() returns item to buffer for subsequent recv()."""
+    ch = Channel()
+    g1 = asyncio.create_task(ch.recv())
+    await asyncio.sleep(0)
+
+    assert ch.try_send("payload") is True
+    ch.close()
+
+    g1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await g1
+
+    assert await ch.recv() == "payload"
+
+
+@pytest.mark.asyncio
+async def test_try_send_no_barge_over_inflight_putter() -> None:
+    """try_send() must return False while a woken putter is still in-flight before claim_put."""
+    ch = Channel(maxsize=1)
+    assert ch.try_send("first") is True
+
+    p2_task = asyncio.create_task(ch.send("second"))
+    await asyncio.sleep(0)
+
+    assert ch.try_recv() == "first"
+    assert ch.try_send("x") is False
+
+    await p2_task
+    assert ch.qsize() == 1
+    assert ch.try_recv() == "second"
+
+
+@pytest.mark.asyncio
+async def test_try_recv_no_barge_over_queued_getters() -> None:
+    """try_recv() raises WouldBlock while queued getters exist during in-flight rollback."""
+    ch = Channel()
+    g1 = asyncio.create_task(ch.recv())
+    await asyncio.sleep(0)
+
+    assert ch.try_send("item1") is True
+    g2 = asyncio.create_task(ch.recv())
+    await asyncio.sleep(0)
+
+    g1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await g1
+
+    with pytest.raises(WouldBlock):
+        ch.try_recv()
+    assert await g2 == "item1"
+
+
+def test_cancel_getter_stale_ticket_idempotent() -> None:
+    """Calling RawAsyncChannel.cancel_getter with a stale waiter_id is a safe no-op."""
+    ch = Channel(maxsize=10)
+    raw = ch._inner
+    assert raw.try_send("buffered_item") is True
+    assert raw.cancel_getter(999_999) is False
+    assert raw.qsize() == 1
+    assert ch.try_recv() == "buffered_item"
+
+
+@pytest.mark.asyncio
+async def test_send_sync_fifo_with_async_putters() -> None:
+    """send_sync() from a worker thread preserves strict FIFO order with async putters."""
+    ch = Channel(maxsize=1)
+    assert ch.try_send("item0") is True
+
+    t1 = asyncio.create_task(ch.send("async_1"))
+    await asyncio.sleep(0)
+
+    def sync_worker() -> None:
+        ch.send_sync("sync_2")
+
+    th = threading.Thread(target=sync_worker, daemon=True)
+    th.start()
+    time.sleep(0.04)
+
+    t3 = asyncio.create_task(ch.send("async_3"))
+    await asyncio.sleep(0)
+
+    assert await ch.recv() == "item0"
+    assert await ch.recv() == "async_1"
+    assert await ch.recv() == "sync_2"
+    assert await ch.recv() == "async_3"
+
+    th.join(timeout=1.0)
+    await t1
+    await t3

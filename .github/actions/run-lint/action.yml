@@ -1,0 +1,44 @@
+name: "Run Lint, Static Analysis & Packaging Checks"
+description: "Execute Rust clippy/fmt/doc/deny, Python ruff/mypy/pyright, release metadata parity, and sdist twine validation."
+
+runs:
+  using: "composite"
+  steps:
+    - name: Cargo Clippy & Format Check
+      shell: bash
+      run: |
+        cargo clippy --locked -- -D warnings
+        cargo fmt --check
+
+    - name: Python Static Analysis & Formatting
+      shell: bash
+      env:
+        MYPYPATH: src
+      run: |
+        uv run --no-sync ruff check .
+        uv run --no-sync ruff format --check .
+        uv run --no-sync mypy --strict src/multiloop
+        uv run --no-sync pyright src/multiloop
+
+    - name: Release Metadata Parity Check
+      shell: bash
+      run: uv run --no-sync python .github/scripts/check_release.py
+
+    - name: Cargo Deny Check
+      uses: EmbarkStudios/cargo-deny-action@v2
+      with:
+        command: check advisories
+
+    - name: Rustdoc Check
+      shell: bash
+      env:
+        RUSTDOCFLAGS: "-D warnings"
+      run: cargo doc --no-deps --document-private-items --locked
+
+    - name: Sdist Packaging & Metadata Check
+      shell: bash
+      run: |
+        rm -rf dist-check
+        uv run --no-sync maturin sdist --out dist-check
+        uvx twine check --strict dist-check/*
+        rm -rf dist-check

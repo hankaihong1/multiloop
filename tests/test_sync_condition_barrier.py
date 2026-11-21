@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from typing import Any
 
 import pytest
 
@@ -558,31 +559,6 @@ async def test_barrier_abort_after_round_graduates_preserved() -> None:
 
 
 @pytest.mark.asyncio
-async def test_barrier_base_exception_cleanup() -> None:
-    """Barrier.wait must clean up waiter on non-CancelledError BaseException."""
-    barrier = Barrier(3)
-    assert barrier.n_waiting == 0
-
-    async def waiter_1() -> None:
-        try:
-            await barrier.wait()
-        except BaseException:
-            pass
-
-    t1 = asyncio.create_task(waiter_1())
-    await asyncio.sleep(0.01)
-    assert barrier.n_waiting == 1
-
-    t1.cancel()
-    try:
-        await t1
-    except BaseException:
-        pass
-
-    assert barrier.n_waiting == 0, "Cancelled/interrupted waiter must be removed from barrier"
-
-
-@pytest.mark.asyncio
 async def test_barrier_broken_on_cancellation() -> None:
     """Barrier automatically enters broken state when a waiting party is cancelled."""
     barrier = Barrier(3)
@@ -631,38 +607,163 @@ async def test_barrier_broken_on_cancellation() -> None:
 async def test_barrier_subsequent_round_broken_does_not_affect_graduated_party() -> None:
     """A party that graduated from round G must not fail if round G+1 is broken concurrently."""
     barrier = Barrier(2)
-    t1_results: list[object] = []
+    t1_results: list[Any] = []
     t1_errors: list[Exception] = []
 
     async def party_1() -> None:
         try:
             res = await barrier.wait()
             t1_results.append(res)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             t1_errors.append(e)
 
-    # Start party 1 (Round 0)
+    # Round 0: party 1 enters and blocks
     t1 = asyncio.create_task(party_1())
     await asyncio.sleep(0.01)
     assert barrier.n_waiting == 1
 
-    # Party 2 completes Round 0 and immediately sets broken on Round 1 while Party 1's generation is 0
-    with barrier._mutex:
-        # Complete Round 0 for party 1
-        waiter_e, (waiter_l, waiter_b) = next(iter(barrier._waiters.items()))
-        waiter_b[0] = 1
-        waiter_l.call_soon_threadsafe(waiter_e.set)
-        barrier._waiters.clear()
-        barrier._generation += 1  # generation is now 1
+    # Party 2 completes Round 0, then Round 1 breaks BEFORE party 1 resumes from Round 0 wakeup
+    res2_r0 = await barrier.wait()
+    r1_waiter = asyncio.create_task(barrier.wait())
+    barrier.abort()
 
-        # Now simulate Round 1 cancellation/broken while party 1 has generation=0
-        barrier._broken = True
-        barrier._generation += 1  # generation is now 2
+    await asyncio.wait_for(t1, timeout=2.0)
 
-    # Now let Party 1 run its post-wait block with generation=0, _broken=True, _generation=2
-    await t1
-
-    # Party 1 had box[0] == 1 (graduated from Round 0), so it must NOT raise broken error!
+    # Party 1 graduated from Round 0 before Round 1 broke
     assert len(t1_errors) == 0, f"Party 1 erroneously failed with: {t1_errors}"
     assert len(t1_results) == 1
-    assert t1_results[0].index == 1
+    assert {t1_results[0].index, res2_r0.index} == {0, 1}
+    assert barrier.broken is True
+
+    # Round 1 waiter must observe the broken barrier error
+    with pytest.raises(RuntimeError, match=r"broken|aborted"):
+        await asyncio.wait_for(r1_waiter, timeout=2.0)
+
+    # Round 2 after reset() must work cleanly
+    barrier.reset()
+    assert barrier.broken is False
+    r2_a = asyncio.create_task(barrier.wait())
+    r2_b = asyncio.create_task(barrier.wait())
+    r2_res_a, r2_res_b = await asyncio.wait_for(asyncio.gather(r2_a, r2_b), timeout=2.0)
+    assert {r2_res_a.index, r2_res_b.index} == {0, 1}
+
+
+@pytest.mark.asyncio
+async def test_condition_notify_consumed_by_cancelled_waiter_forwards() -> None:
+    """A notify() consumed by a cancelled waiter forwards wakeup to the next waiter."""
+    cond = Condition()
+    w3_got = asyncio.Event()
+    results: list[str] = []
+
+    async def waiter(name: str, got: asyncio.Event | None = None) -> None:
+        async with cond:
+            await cond.wait()
+            results.append(name)
+            if got is not None:
+                got.set()
+
+    t2 = asyncio.create_task(waiter("w2"))
+    await asyncio.sleep(0.05)
+    t3 = asyncio.create_task(waiter("w3", w3_got))
+    await asyncio.sleep(0.05)
+
+    cond.notify()
+    t2.cancel()
+
+    await asyncio.wait_for(w3_got.wait(), timeout=1.0)
+    await asyncio.gather(t2, t3, return_exceptions=True)
+    assert results == ["w3"]
+
+
+@pytest.mark.asyncio
+async def test_condition_wait_preserves_body_exc_on_reacquire_cancel() -> None:
+    """Non-cancellation exception from wait future is preserved when cancelled during _reacquire_lock()."""
+    lock = Lock()
+    cond = Condition(lock)
+    loop = asyncio.get_running_loop()
+
+    intercepted_fut: asyncio.Future[Any] | None = None
+    orig_create_future = loop.create_future
+
+    def patched_create_future() -> asyncio.Future[Any]:
+        nonlocal intercepted_fut
+        fut = orig_create_future()
+        intercepted_fut = fut
+        return fut
+
+    loop.create_future = patched_create_future  # type: ignore[method-assign]
+
+    async def worker() -> None:
+        async with lock:
+            await cond.wait()
+
+    worker_task = asyncio.create_task(worker())
+    await asyncio.sleep(0)
+
+    await lock.acquire()
+    assert intercepted_fut is not None
+    intercepted_fut.set_exception(ValueError("original_body_exc"))
+    await asyncio.sleep(0)
+
+    worker_task.cancel()
+    await asyncio.sleep(0)
+    lock.release()
+
+    with pytest.raises(ValueError, match="original_body_exc"):
+        await worker_task
+
+
+@pytest.mark.asyncio
+async def test_repro_condition_wait_cancel_does_not_rearm_spurious_cancel() -> None:
+    """When a task waiting in cond.wait() is cancelled once, re-acquiring the lock
+    under CancelScope(shield=True) inside except BaseException must NOT re-arm a
+    second spurious CancelledError after the first CancelledError is caught.
+    """
+    cond = Condition()
+    cleanup_completed = False
+
+    async def waiter() -> None:
+        nonlocal cleanup_completed
+        async with cond:
+            try:
+                await cond.wait()
+            except asyncio.CancelledError:
+                # Perform async cleanup while still holding cond's re-acquired lock
+                await asyncio.sleep(0.01)
+                cleanup_completed = True
+                raise
+
+    t = asyncio.create_task(waiter())
+    await asyncio.sleep(0.01)
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    assert cleanup_completed is True
+
+
+@pytest.mark.asyncio
+async def test_repro_barrier_abort_records_waiter_outcome() -> None:
+    """When barrier.abort() is called while a party is waiting, and barrier.reset()
+    is called before the party's loop processes the wakeup, the party must still
+    raise 'barrier has been aborted' rather than 'barrier was reset while waiting'.
+    """
+    barrier = Barrier(2)
+    errors: list[Exception] = []
+
+    async def party() -> None:
+        try:
+            await barrier.wait()
+        except Exception as e:
+            errors.append(e)
+
+    t = asyncio.create_task(party())
+    await asyncio.sleep(0.01)
+    assert barrier.n_waiting == 1
+
+    # Abort and immediately reset in the same synchronous tick before t runs
+    barrier.abort()
+    barrier.reset()
+
+    await t
+    assert len(errors) == 1
+    assert "aborted" in str(errors[0])

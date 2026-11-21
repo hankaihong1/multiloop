@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-11-21
+
+### Added & Changed
+- **Rust Sync Primitives & Shared Waiter Infrastructure (`src/sync.rs`, `src/waiter.rs`, `src/errors.rs`)**:
+  - Moved `Lock`, `Semaphore`, `CapacityLimiter`, `Event`, `Condition`, `Barrier`, and `AsyncOnce` state machines into Rust (`RawAsync*` pyclasses) with `WaiterId` generation tickets, out-of-lock wakeups/cancellations, FIFO token forwarding, and automatic broken-state propagation on `Barrier`.
+  - Consolidated Python sync wrappers in `src/multiloop/_sync.py` and typed exception builders in `src/errors.rs`.
+  - Removed legacy `src/multiloop/_channel_base.py` and streamlined Python `Channel`/`select_channel` over `RawAsyncChannel` with anti-barging FIFO ordering.
+- **Route 3 Pure-Rust Cancellation Stack (`src/cancel.rs`, `src/multiloop/_cancel.py`)**:
+  - Replaced CPython `task.cancel()`/`uncancel()`/`cancelling()` ledger mutation with `RawTaskCancelState` (`_TASK_CANCEL_STATES` weak-key tracking), strict `PLAIN` / `MOVE_ON` / `FAIL_AFTER` exit modes, `shield` isolation, `sleep`, `wait_cancellable`, and `checkpoint`.
+  - Hardened `run_in_pool()`, `TaskGroup`, `TaskHandle._await_impl()`, `AsyncContext`, and all primitive wait points for Route 3 cancellation parity and FFI/GC safety.
+- **Free-Threaded CI/CD & Developer Workflow Unification (`.github/`, `Makefile`)**:
+  - Converged CI (`ci.yml`) and PyPI distribution (`publish.yml`) to free-threaded Python (`3.14t` + experimental `3.15t`) using shared composite actions (`setup-env`, `run-lint`, `build-dist`) and cross-platform helper scripts (`run_rust_tests.py`, `check_release.py`).
+  - Added `test_sdist` end-to-end source-package build verification, `--no-sync` wheel smoke assertions, `release-drafter.yml` permission hardening, and aligned `Makefile` / `.pre-commit-config.yaml` / documentation parity tests.
+
 ## [0.1.3] - 2026-09-17
 
 ### Added & Optimized

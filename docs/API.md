@@ -16,6 +16,8 @@ Complete API documentation for `multiloop`: a multi-event-loop engine and concur
   - [`create_pool`](#create_pool)
   - [`run_in_pool`](#run_in_pool)
   - [`checkpoint`](#checkpoint)
+  - [`sleep`](#sleep)
+  - [`wait_cancellable`](#wait_cancellable)
   - [`fail_after`](#fail_after)
   - [`move_on_after`](#move_on_after)
   - [`fail_at`](#fail_at)
@@ -53,7 +55,7 @@ Complete API documentation for `multiloop`: a multi-event-loop engine and concur
 
 ## Quick Examples
 
-Copy-paste runnable snippets. Each example is self-contained: it imports `multiloop`, defines an `async def main()`, and runs it with `asyncio.run(main())`. Simulated work uses `asyncio.sleep`.
+Copy-paste runnable snippets. Each example is self-contained: it imports `multiloop`, defines an `async def main()`, and runs it with `asyncio.run(main())`. Simulated work uses `asyncio.sleep` (or `multiloop.sleep` inside `CancelScope`, `TaskGroup`, and `AsyncContext` tasks).
 
 ### 1. `EventLoopThreadPool` + `submit`
 
@@ -141,13 +143,18 @@ async def main():
 
         async def slow_work():
             try:
-                await asyncio.sleep(10)
+                await multiloop.sleep(10)
             except asyncio.CancelledError:
-                return "cancelled"
+                # cleanup if needed, then let cancellation propagate
+                raise
 
         fut = ctx.submit(pool, slow_work)
+        await asyncio.sleep(0.01)  # let slow_work start on the pool
         ctx.cancel()  # cascades cancellation to the pool task
-        print(await fut)  # "cancelled"
+        try:
+            await fut
+        except asyncio.CancelledError:
+            print("task cancelled")  # "task cancelled"
         print("ctx cancelled:", ctx.is_cancelled)  # True
 
 
@@ -263,7 +270,7 @@ import multiloop
 
 
 async def worker(name: str) -> str:
-    await asyncio.sleep(0.01)
+    await multiloop.sleep(0.01)
     return f"{name} done"
 
 
@@ -287,7 +294,7 @@ import multiloop
 
 
 async def slow():
-    await asyncio.sleep(10)
+    await multiloop.sleep(10)
 
 
 async def main():
@@ -342,7 +349,7 @@ Starts all worker threads and their work-stealing queue dispatchers.
 ##### `async close(timeout: float | None = None)` -> `None`
 Gracefully stops all worker loops, drains pending tasks, and joins worker threads.
 
-Drain timeout is configurable: `close()` waits up to `timeout` seconds (defaults to ~5.0 seconds when `None`) for in-flight tasks to finish, then force-stops every worker loop — tasks still running after the timeout are cancelled and are not guaranteed to complete.
+Drain timeout is configurable: `close()` waits up to `timeout` seconds (defaults to 5.0 seconds when `None`) for in-flight tasks to finish, then force-stops every worker loop — tasks still running after the timeout are cancelled and are not guaranteed to complete.
 
 ##### `async abort()` -> `None`
 Forcefully stops all worker loops without draining pending tasks. Queued but unexecuted work is discarded.
@@ -354,15 +361,15 @@ Waits until the pool has been fully stopped. Returns immediately if the pool is 
 Submits a coroutine function, coroutine object, or callable to the shared work queue. Workers pull tasks as they become idle. Returns an `asyncio.Future` that resolves with the task's result.
 
 - **`pin_to`**: Optionally pins the task to a specific worker loop (an `int` worker index or an `AbstractEventLoop` managed by the pool). When `None`, the task goes to the global shared queue.
-- **`cancel_scope`**: Optionally binds the task to a `CancelScope`; cancelled scopes suppress the task result.
+- **`cancel_scope`**: Optionally binds the task to a `CancelScope`; cancelled scopes cancel the returned future (`asyncio.CancelledError`) and interrupt Route 3 wait points (`multiloop.sleep`, `Channel`, `Lock`, `wait_cancellable`, etc.).
 - **Raises**: `ThreadPoolClosedError` if the pool is closed, `ValueError` for an invalid `pin_to` index, `TypeError` if `target` is an `asyncio.Future` (raw futures are loop-bound) or if arguments are passed to a coroutine object.
 
 ##### `submit_many(targets: Iterable[Callable[..., Any] | Any], cancel_scope: CancelScope | None = None)` -> `list[asyncio.Future]`
 Submits a batch of tasks to the shared global work queue in a single scheduling cycle, maximizing throughput across worker threads. Returns a list of `asyncio.Future` instances corresponding to each submitted task.
 
 - **`targets`**: An iterable of coroutine objects, coroutine functions, or callables.
-- **`cancel_scope`**: Optional `CancelScope` shared across the batch.
-- **Raises**: `ThreadPoolClosedError` if the pool is closed.
+- **`cancel_scope`**: Optional `CancelScope` supported **only for single-target batches (`len <= 1`)**; because `CancelScope` is bound to a single task/stack, passing a non-`None` `cancel_scope` with more than one target closes all coroutine objects and raises `ValueError`.
+- **Raises**: `ThreadPoolClosedError` if the pool is closed, `ValueError` if `len(targets) > 1` with `cancel_scope is not None`.
 
 ##### `get_metrics()` -> `dict[str, Any]`
 Returns a JSON-serializable dictionary containing health metrics:
@@ -388,7 +395,7 @@ A dataclass carrying configuration defaults for `EventLoopThreadPool`.
 
 ```text
 PoolOptions(
-    num_threads: int = os.cpu_count() or 4,
+    num_threads: int = 0,
     loop_factory: Callable[[], asyncio.AbstractEventLoop] | None = None,
 )
 ```
@@ -410,7 +417,7 @@ async def create_pool(
 ) -> EventLoopThreadPool
 ```
 
-Creates and **starts** a pool, returning it ready for use (`asyncssh`-style facade). `num_threads=0` auto-detects via `os.cpu_count()`. Use it as an async context manager, or call `close()` manually when finished.
+Creates and **starts** a pool, returning it ready for use. `num_threads=0` auto-detects via `os.cpu_count()`. Use it as an async context manager, or call `close()` manually when finished.
 
 ### `run_in_pool`
 
@@ -426,9 +433,39 @@ Runs a coroutine in a freshly-created pool (one-shot convenience). Spawns a pool
 async def checkpoint() -> None
 ```
 
-Checks for effective cancellation and raises `asyncio.CancelledError` if the current scope, or any unshielded ancestor, has been cancelled. Call periodically inside long-running code that cannot `await` frequently.
+Checks the current task's Route 3 Rust cancel stack (`RawTaskCancelState`) and raises `asyncio.CancelledError` if the current scope, or any unshielded ancestor, has been cancelled. Call periodically inside long-running code that cannot `await` frequently.
 
-The raise consumes the task's pending cancellation count, making it the *single* delivery — a cancellation caught at the `checkpoint()` raise never double-delivers at the next await.
+Under Route 3, cancellation checks are **level-triggered** and never read or mutate CPython's `task.cancelling()` counter.
+
+### `sleep`
+
+```text
+async def sleep(delay: float) -> None
+```
+
+Sleeps for `delay` seconds while subscribing to the current task's Route 3 `CancelScope` stack. Prefer `multiloop.sleep(...)` over `asyncio.sleep(...)` inside `CancelScope`, `fail_after`, `move_on_after`, and `TaskGroup` tasks so scope cancellation interrupts the sleep immediately.
+
+- **`delay`** (*float*): Sleep duration in seconds (`delay <= 0` delegates to `checkpoint()`; `NaN` raises `ValueError`).
+
+```python
+async with fail_after(0.05):
+    await multiloop.sleep(10)  # interrupted immediately on expiry
+```
+
+### `wait_cancellable`
+
+```text
+async def wait_cancellable(awaitable: Awaitable[_T]) -> _T
+```
+
+Bridges a foreign asyncio awaitable (e.g., `asyncio.sleep(...)` or third-party async I/O coroutines) so it honors active Route 3 `CancelScope` cancellations and deadlines immediately. If a `CancelScope` cancels while waiting, the underlying task is cancelled cleanly and awaited before `asyncio.CancelledError` propagates.
+
+- **`awaitable`** (*Awaitable[_T]*): Foreign coroutine or awaitable to wrap.
+
+```python
+async with fail_after(0.05):
+    await multiloop.wait_cancellable(asyncio.sleep(10))
+```
 
 ### `fail_after`
 
@@ -537,7 +574,7 @@ set_log_level(logging.DEBUG)
 
 ### `Channel`
 
-High-performance cross-thread channel backed by Rust (`flume` crate) with a double-check lock pattern for zero lost-wakeup signal races.
+High-performance cross-thread channel backed by the Rust native `RawAsyncChannel` state machine with anti-barging FIFO ordering protection and zero lost-wakeup signal races.
 
 #### Constructor
 
@@ -549,9 +586,10 @@ Channel(maxsize: int = 0)
 
 #### Methods
 
-##### `async send(item: Any)` -> `None`
+##### `async send(item: Any, timeout: float | None = None)` -> `None`
 Sends an item into the channel. Suspends if the channel is full until space is available.
-- **Raises**: `ChannelClosedError` if the channel is closed.
+- **`timeout`** (*float | None*): Optional timeout in seconds.
+- **Raises**: `ChannelClosedError` if the channel is closed, `TimeoutError` if timeout expires.
 
 ##### `send_sync(item: Any, timeout: float | None = None)` -> `None`
 Synchronous blocking send, designed for worker threads executing synchronous tasks.
@@ -589,7 +627,7 @@ Supports `async for item in ch:` iteration. Automatically terminates when the ch
 
 A send-only view of a `Channel` for interface segregation (Go `chan<- T` style).
 
-- **`send(item)`**: Sends an item into the channel.
+- **`send(item, timeout=None)`**: Sends an item into the channel.
 - **`send_sync(item, timeout=None)`**: Synchronous blocking send.
 - **`try_send(item)` -> `bool`**: Non-blocking send.
 - **`close()`**: Closes the underlying channel.
@@ -646,7 +684,7 @@ selected_ch, val = await select_channel(ch1, ch2, timeout=2.0)
 
 ### `TaskGroup`
 
-An async context manager that spawns and manages child tasks, backed by `CancelScope` for cancellation propagation. Inspired by trio's nursery and anyio's `TaskGroup`. Supports optional structured concurrency throttling via `max_concurrency` or a shared `CapacityLimiter`.
+An async context manager that spawns and manages child tasks, backed by `CancelScope` for cancellation propagation. Supports optional structured concurrency throttling via `max_concurrency` or a shared `CapacityLimiter`.
 
 ```python
 async with TaskGroup(max_concurrency=10) as tg:
@@ -665,8 +703,8 @@ async with TaskGroup(max_concurrency=10) as tg:
 - **`start_soon(coro_fn, *args)` -> `TaskHandle`**: Spawns a child task and returns its handle immediately without blocking. Children spawned before the group is entered are tracked by the first entry.
   - **Raises**: `RuntimeError` if called after the group has exited or called from a foreign event loop/thread (TaskGroup is physically scoped to a single loop); the orphan is cancelled and its exception consumed.
 - **`start(coro_fn, *args)` -> `TaskHandle`**: Spawns a child task, blocking until it calls `task_status.started()`.
-  - **Raises**: `RuntimeError` if called after the group has exited or called from a foreign event loop/thread, or if the child exits without calling `task_status.started()` (trio/anyio parity — a silent handle to a dead task would hide the protocol violation).
-- **Raises**: Child exceptions are re-raised on exit; multiple failures surface as an `ExceptionGroup`. Cancelled children are not reported as errors (trio/anyio parity), and when the host is cancelled while the group waits, all children are guaranteed finished before the block exits.
+  - **Raises**: `RuntimeError` if called after the group has exited or called from a foreign event loop/thread, or if the child exits without calling `task_status.started()` (a silent handle to a dead task would hide the protocol violation).
+- **Raises**: Child exceptions are re-raised on exit; multiple failures surface as an `ExceptionGroup`. Cancelled children are not reported as errors, and when the host is cancelled while the group waits, all children are guaranteed finished before the block exits.
 
 ### `TaskHandle`
 
@@ -707,27 +745,32 @@ async with TaskGroup() as tg:
 
 ### `CancelScope`
 
-A task-local cancellation scope that propagates cancellation hierarchically.
+A task-local, single-use cancellation scope backed by Route 3's pure Rust `RawTaskCancelState` cancel stack (never modifying CPython `task.cancel()`, `task.uncancel()`, or `task.cancelling()`).
 
 ```text
 CancelScope(deadline: float = float("inf"), shield: bool = False)
 ```
 
-- **`deadline`** (*float*): Absolute monotonic deadline. `float("inf")` means no deadline.
-- **`shield`** (*bool*): Snapshot/restore shield: snapshots and clears the task's pending cancellation count on entry, restores it on exit. Absorbs cancellations injected *before* entry; a cancel delivered *while* inside the shield is **not** deferred (unlike trio/anyio) — for cleanup that must survive mid-flight cancellation use a retry loop (see `Condition.wait`).
+- **`deadline`** (*float*): Absolute monotonic deadline. `float("inf")` means no deadline. Mutating `.deadline` reschedules dynamically.
+- **`shield`** (*bool*): Route 3 scope barrier: masks enclosing `CancelScope` cancellations and deadlines on the Rust cancel stack while `shield` is `True` (supporting full async cleanup with `multiloop.sleep`, `Channel`, `Lock`, `wait_cancellable`, etc.), without ever touching CPython's `task.cancelling()`. Note that external CPython `task.cancel()` calls are unaffected.
 
 #### Properties & Methods
 
-- **`cancel_called`** -> `bool`: `True` after `cancel()` has been called.
-- **`cancelled_caught`** -> `bool`: `True` if the scope silently absorbed a cancellation (move-on-* scopes).
-- **`deadline`** -> `float`: The absolute monotonic deadline.
-- **`shield`** -> `bool`: Whether the scope blocks parent cancellation.
-- **`cancel()`**: Marks the scope as cancelled and injects cancellation into the hosting task. Idempotent.
+- **`cancel_called`** -> `bool`: `True` after `cancel()` has been called or deadline expired.
+- **`cancelled_caught`** -> `bool`: `True` if a move-on scope (`move_on_after` / `move_on_at`) absorbed its own cancellation.
+- **`deadline`** -> `float`: The absolute monotonic deadline (read/write).
+- **`shield`** -> `bool`: Whether the scope blocks parent `CancelScope` cancellation (read/write).
+- **`cancel()`**: Marks the scope cancelled in Rust and wakes any parked Route 3 waiter via `call_soon_threadsafe`. Idempotent and thread-safe.
 
-On exit the scope always consumes its own injection: a cancellation *caught inside the body* (or never delivered) never leaks its count into outer scopes — leaked counts would be snapshotted by an enclosing shield as real cancellations and re-injected after it exits.
+#### Three-Mode Exit Contract
+
+When `async with scope:` exits `__aexit__`:
+1. **Plain `CancelScope` (`PLAIN`)**: If cancelled and the body exited normally (`exc_type is None`), raises `asyncio.CancelledError()` on exit; non-cancellation body exceptions pass through untouched.
+2. **`move_on_after` / `move_on_at` (`MOVE_ON`)**: Silently absorbs its own cancellation, sets `scope.cancelled_caught = True`, and returns `True` without swallowing external CPython `task.cancel()` or body errors.
+3. **`fail_after` / `fail_at` (`FAIL_AFTER`)**: Converts its own cancellation/expiry (even if inner `CancelledError` was caught in the body) into `multiloop.TimeoutError`.
 
 #### Context Manager
-`async with CancelScope(...) as scope:` enters the scope on the current task's scope stack.
+`async with CancelScope(...) as scope:` pushes the scope onto the current task's Rust cancel stack (`RuntimeError` if shared across tasks or re-entered).
 
 ---
 
@@ -810,6 +853,7 @@ Condition(lock: Lock | None = None)
 
 - **`acquire()`** / **`release()`**: Manage the underlying lock.
 - **`wait()`**: Atomically releases the lock and suspends until notified.
+- **`wait_for(predicate)`**: Repeatedly waits until `predicate` returns a truthy value. The underlying lock must be held.
 - **`notify(n=1)`**: Wakes `n` waiting tasks.
 - **`notify_all()`**: Wakes all waiting tasks.
 
@@ -831,6 +875,8 @@ Barrier(parties: int)
 Result object returned by `Barrier.wait()`.
 
 - **`parties`** -> `int`: Total number of parties in this barrier round.
+- **`index`** -> `int`: Zero-based arrival index (`0` to `parties - 1`) of the calling task.
+- **`is_leader`** -> `bool`: `True` if this task arrived first in the round (`index == 0`).
 
 ### `AsyncContext`
 
@@ -842,7 +888,7 @@ ctx = AsyncContext(parent: AsyncContext | None = None)
 
 - **`ctx.cancel()`**: Cancels this context and cascades cancellation thread-safely to all child contexts and submitted futures.
 - **`ctx.submit(pool, target, *args, **kwargs)`**: Submits a task to the pool bound to this context.
-- **`ctx.task_group(pool=None, name=None, max_concurrency=None)`**: Creates a `TaskGroup` linked to this context whose tasks cascade cancellation when the context is cancelled.
+- **`ctx.task_group(pool=None, name=None, max_concurrency=None, limiter=None)`**: Creates a `TaskGroup` linked to this context whose tasks cascade cancellation when the context is cancelled.
 - **`ctx.parent`**: The parent context, or `None` for a root context (read-only, fixed at construction).
 - **`ctx.is_cancelled`**: Returns `True` if cancelled.
 

@@ -114,21 +114,6 @@ async def test_pool_error_coro_exception_propagation():
 
 
 @pytest.mark.asyncio
-async def test_pool_error_submit_after_close():
-    """Error 2: Submitting task after closing the thread pool raises RuntimeError"""
-
-    async def dummy():
-        return 1
-
-    pool = EventLoopThreadPool(num_threads=2)
-    await pool.start()
-    await pool.close()
-
-    with pytest.raises(RuntimeError, match="ThreadPool is not running"):
-        pool.submit(dummy)
-
-
-@pytest.mark.asyncio
 async def test_pool_error_invalid_num_threads():
     """Error 3: Invalid thread count initialization raises ValueError"""
     with pytest.raises(ValueError, match="num_threads must not be negative"):
@@ -415,7 +400,7 @@ async def test_run_in_pool_exception_propagation():
 
 @pytest.mark.asyncio
 async def test_resolve_target_worker_lock_concurrent():
-    """_resolve_target_worker holds self._lock during resolution.
+    """_resolve_target_worker reads immutable _loops_snapshot concurrently.
 
     Concurrent access from multiple threads must not crash or produce
     inconsistent loop->index mappings.
@@ -474,27 +459,7 @@ async def test_repr_implementations():
 
 @pytest.mark.asyncio
 async def test_pool_closed_submission():
-    """Test exception on ThreadPool submission after close"""
-    pool = EventLoopThreadPool(num_threads=1)
-    await pool.start()
-    await pool.close()
-
-    assert not pool.is_running
-
-    with pytest.raises(ThreadPoolClosedError):
-        pool.submit(print, "hello")
-
-
-@pytest.mark.asyncio
-async def test_exception_hierarchy():
-    """Verify engineering standard 1: all multiloop custom exceptions inherit from MultiloopError"""
-    assert issubclass(ChannelClosedError, MultiloopError)
-    assert issubclass(ThreadPoolClosedError, MultiloopError)
-
-
-@pytest.mark.asyncio
-async def test_pool_closed_error_type():
-    """Verify engineering standard 1b: submitting on a closed pool raises ThreadPoolClosedError"""
+    """Submitting sync or async tasks on a closed pool raises ThreadPoolClosedError."""
     pool = EventLoopThreadPool(num_threads=1)
     await pool.start()
     metrics = pool.get_metrics()
@@ -502,11 +467,22 @@ async def test_pool_closed_error_type():
     assert "active_tasks" in metrics
     await pool.close()
 
+    assert not pool.is_running
+
     async def dummy():
         pass
 
     with pytest.raises(ThreadPoolClosedError):
+        pool.submit(print, "hello")
+    with pytest.raises(ThreadPoolClosedError):
         pool.submit(dummy)
+
+
+@pytest.mark.asyncio
+async def test_exception_hierarchy():
+    """All multiloop custom exceptions inherit from MultiloopError."""
+    assert issubclass(ChannelClosedError, MultiloopError)
+    assert issubclass(ThreadPoolClosedError, MultiloopError)
 
 
 @pytest.mark.asyncio
@@ -531,40 +507,16 @@ async def test_pool_closed_error_type_native_push_path():
 
 
 @pytest.mark.asyncio
-async def test_vulnerability_submit_coroutine_object():
-    """Vulnerability 2: Submit with an already-instantiated coroutine object should run normally instead of raising TypeError"""
+async def test_submit_coroutine_object():
+    """Submit accepts an already-instantiated coroutine object directly."""
     async with EventLoopThreadPool(num_threads=2) as pool:
 
         async def sample_coro(val):
             await asyncio.sleep(0.01)
             return val * 10
 
-        # Instantiate coroutine object
-        coro_obj = sample_coro(5)
-
-        # Directly submit coroutine object
-        fut = pool.submit(coro_obj)
-        res = await fut
-        assert res == 50
-
-
-@pytest.mark.asyncio
-async def test_context_futures_cleaned():
-    """completed AsyncContext submissions must be
-    dropped from _futures — pre-fix 500/500 stayed behind, so cancel() kept
-    walking stale futures forever."""
-    from multiloop import AsyncContext
-
-    ctx = AsyncContext()
-    async with EventLoopThreadPool(num_threads=2) as pool:
-
-        async def quick() -> int:
-            return 7
-
-        for _ in range(200):
-            fut = ctx.submit(pool, quick)
-            await asyncio.wait_for(fut, timeout=5.0)
-    assert len(ctx._futures) == 0  # type: ignore[attr-defined]
+        fut = pool.submit(sample_coro(5))
+        assert await fut == 50
 
 
 # ───────────────────────────────────────────────────────────
@@ -602,8 +554,8 @@ async def test_abort_completes_all_futures():
 @pytest.mark.asyncio
 async def test_abort_delivery_no_invalid_state(capsys):
     """revision B: abort racing a worker's own delivery must not
-    surface InvalidStateError noise (the guard lives inside the scheduled
-    callback, like _channel_base._set_soon)."""
+    surface InvalidStateError noise (the guard lives inside _safe_complete's
+    scheduled callback)."""
     pool = EventLoopThreadPool(num_threads=1)
     await pool.start()
     try:
@@ -666,13 +618,13 @@ async def test_pool_cancel_scope_completes_future():
     """``pool.submit(coro, cancel_scope=s)`` + ``s.cancel()`` must
     complete the caller's future with CancelledError.
     """
-    from multiloop._cancel import CancelScope
+    from multiloop._cancel import CancelScope, sleep
 
     async with EventLoopThreadPool(num_threads=2) as pool:
         scope = CancelScope()
 
         async def work() -> int:
-            await asyncio.sleep(0.5)
+            await sleep(0.5)
             return 42
 
         fut = pool.submit(work, cancel_scope=scope)
@@ -697,22 +649,24 @@ async def test_pool_close_completes_all_burst_futures():
     for f in pending:
         f.cancel()
     assert not pending, f"{len(pending)} futures left pending after close()"
-    with pool._lock:
-        assert not pool._outstanding, "close() left futures in _outstanding"
+    assert pool._native_pool is not None
+    assert pool._native_pool.outstanding_count() == 0, "close() left tasks in native pool"
+    assert pool._native_pool.is_drained()
 
 
 @pytest.mark.asyncio
 async def test_pool_submit_push_failure_discards_future():
-    """a failed native push must not leave the future registered in
-    ``_outstanding`` (repeated failures would grow the set forever)."""
+    """a failed native push must not increment outstanding count or retain the future."""
     pool = EventLoopThreadPool(num_threads=1)
     await pool.start()
 
     class _FailingPool:
-        """Duck-typed native pool whose push always fails; the idle paths
-        (pop_work / is_closed) stay benign so live workers keep running."""
+        """Duck-typed native pool whose push always fails; idle/drain paths stay benign."""
 
         def push_global(self, task: object) -> None:  # noqa: ARG002
+            raise RuntimeError("boom")
+
+        def push_global_batch(self, tasks: list[object]) -> int:  # noqa: ARG002
             raise RuntimeError("boom")
 
         def push_local(self, index: int, task: object) -> None:  # noqa: ARG002
@@ -724,22 +678,41 @@ async def test_pool_submit_push_failure_discards_future():
         def is_closed(self) -> bool:
             return False
 
+        def is_drained(self) -> bool:
+            return True
+
         def close(self) -> None:
             pass
 
         def set_metrics(self, metrics: object) -> None:  # noqa: ARG002
             pass
 
+        def mark_worker_idle(self, index: int) -> None:  # noqa: ARG002
+            pass
+
+        def clear_worker_idle(self, index: int) -> None:  # noqa: ARG002
+            pass
+
+        def claim_one_idle_worker(self) -> int | None:
+            return None
+
+        def complete_task(self) -> None:
+            pass
+
+        def outstanding_count(self) -> int:
+            return 0
+
+        def wait_drained(self, timeout_secs: float) -> bool:  # noqa: ARG002
+            return True
+
+        def drain_all(self) -> list[object]:
+            return []
+
     try:
         pool._native_pool = _FailingPool()  # type: ignore[assignment]
         with pytest.raises(RuntimeError, match="boom"):
             pool.submit(lambda: 1)
-        # WHY: snapshot under the lock, assert OUTSIDE it — pytest's
-        # assertion rewriting reprs the failed expression, and repr(pool)
-        # takes the same non-reentrant lock (self-deadlock on failure).
-        with pool._lock:
-            outstanding = bool(pool._outstanding)
-        assert not outstanding
+        assert pool._native_pool.outstanding_count() == 0
     finally:
         await pool.close()
 
@@ -915,29 +888,6 @@ async def test_pool_abort_unstepped_coroutine_cleanup() -> None:
     assert not runtime_warnings, f"Unexpected warnings: {runtime_warnings}"
 
 
-@pytest.mark.asyncio
-async def test_pool_submit_many_basic():
-    """submit_many correctly dispatches an iterable of tasks across worker threads."""
-    async with EventLoopThreadPool(num_threads=4) as pool:
-
-        async def worker(idx: int) -> int:
-            await asyncio.sleep(0.01)
-            return idx * 2
-
-        futs = pool.submit_many([worker(i) for i in range(20)])
-        assert len(futs) == 20
-        results = await asyncio.gather(*futs)
-        assert results == [i * 2 for i in range(20)]
-
-
-@pytest.mark.asyncio
-async def test_pool_submit_many_empty():
-    """submit_many with empty iterable returns empty list immediately."""
-    async with EventLoopThreadPool(num_threads=2) as pool:
-        futs = pool.submit_many([])
-        assert futs == []
-
-
 def test_atomic_metrics_add_global_pull():
     from multiloop._metrics import AtomicMetrics
 
@@ -955,3 +905,373 @@ def test_atomic_metrics_add_global_pull():
     # out of bounds should be safe (no-op)
     m.add_global_pull(99, 10)
     assert m.get_global_pull(99) == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_closed_event_driven_instant_wakeup() -> None:
+    """wait_closed() wakes up promptly on pool close via threading.Event without 10ms polling jitter."""
+    pool = EventLoopThreadPool(num_threads=2)
+    await pool.start()
+
+    waiter_task = asyncio.create_task(pool.wait_closed())
+    await asyncio.sleep(0.01)
+    assert not waiter_task.done()
+
+    await pool.close()
+    await asyncio.wait_for(waiter_task, timeout=1.0)
+    assert waiter_task.done()
+    assert not pool.is_running
+
+
+@pytest.mark.asyncio
+async def test_pool_submit_pin_to_strict_affinity_no_drift() -> None:
+    """Submitting large batches of tasks (>256) with pin_to must strictly run on target worker thread with 0 drift."""
+    async with EventLoopThreadPool(num_threads=4) as pool:
+        w0_ident = await pool.submit(threading.get_ident, pin_to=0)
+
+        threads_seen: list[int] = []
+        lock = threading.Lock()
+
+        async def worker_job() -> None:
+            await asyncio.sleep(0.001)
+            with lock:
+                threads_seen.append(threading.get_ident())
+
+        futs = [pool.submit(worker_job, pin_to=0) for _ in range(350)]
+        await asyncio.gather(*futs)
+
+        assert len(threads_seen) == 350
+        assert all(ident == w0_ident for ident in threads_seen)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 TDD Suite: submit_many batching, closed-pool coroutine cleanup & drain
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("num_threads", "batch_kind", "count"),
+    [
+        (2, "coro_objs", 2),
+        (2, "sync_fns", 4),
+        (4, "async_fns", 8),
+        (2, "mixed", 6),
+        (2, "generator", 5),
+        (3, "with_scope", 1),
+        (4, "large_batch", 16),
+        (2, "diverse_types", 4),
+        (2, "native_batch", 6),
+    ],
+)
+async def test_submit_many_valid(num_threads: int, batch_kind: str, count: int) -> None:
+    """Valid table-driven tests for batch submission and NativeWorkerPool.push_global_batch."""
+    from multiloop import CancelScope
+
+    async with EventLoopThreadPool(num_threads=num_threads) as pool:
+        assert hasattr(pool._native_pool, "push_global_batch")
+
+        async def _coro(v: Any) -> Any:
+            await asyncio.sleep(0.001)
+            return v
+
+        if batch_kind == "coro_objs":
+            futs = pool.submit_many([_coro(i) for i in range(count)])
+            assert await asyncio.gather(*futs) == list(range(count))
+        elif batch_kind == "sync_fns":
+            futs = pool.submit_many([lambda idx=i: idx + 10 for i in range(count)])
+            assert await asyncio.gather(*futs) == [i + 10 for i in range(count)]
+        elif batch_kind == "async_fns":
+            futs = pool.submit_many([lambda idx=i: _coro(idx * 3) for i in range(count)])
+            assert await asyncio.gather(*futs) == [i * 3 for i in range(count)]
+        elif batch_kind == "mixed":
+            items = [_coro(i) if i % 2 == 0 else (lambda idx=i: idx) for i in range(count)]
+            futs = pool.submit_many(items)
+            assert await asyncio.gather(*futs) == list(range(count))
+        elif batch_kind == "generator":
+            futs = pool.submit_many(_coro(i) for i in range(count))
+            assert await asyncio.gather(*futs) == list(range(count))
+        elif batch_kind == "with_scope":
+            scope = CancelScope()
+            futs = pool.submit_many(tuple(_coro(i) for i in range(count)), cancel_scope=scope)
+            assert await asyncio.gather(*futs) == list(range(count))
+        elif batch_kind == "large_batch":
+            futs = pool.submit_many([_coro(i) for i in range(count)])
+            assert await asyncio.gather(*futs) == list(range(count))
+        elif batch_kind == "diverse_types":
+            payloads: list[Any] = [None, 42, "ok", {"k": 1}]
+            futs = pool.submit_many([_coro(p) for p in payloads])
+            assert await asyncio.gather(*futs) == payloads
+        elif batch_kind == "native_batch":
+            assert pool._native_pool is not None
+            pushed = pool._native_pool.push_global_batch([lambda: None for _ in range(count)])
+            assert pushed == count
+            # Drain them so pool closes cleanly
+            for _ in range(count):
+                _ = pool._native_pool.pop_work(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("num_threads", "case_id"),
+    [
+        (1, "empty_list"),
+        (2, "empty_tuple"),
+        (2, "empty_gen"),
+        (1, "single_coro"),
+        (4, "single_sync"),
+        (4, "exact_threads"),
+        (4, "threads_plus_one"),
+        (2, "precancelled_scope"),
+        (2, "chained_drain"),
+    ],
+)
+async def test_submit_many_boundary(num_threads: int, case_id: str) -> None:
+    """Boundary table-driven tests for submit_many and multi-worker drain."""
+    from multiloop import CancelScope
+
+    async with EventLoopThreadPool(num_threads=num_threads) as pool:
+        assert hasattr(pool._native_pool, "push_global_batch")
+
+        async def _echo(x: int) -> int:
+            return x
+
+        if case_id == "empty_list":
+            assert pool.submit_many([]) == []
+        elif case_id == "empty_tuple":
+            assert pool.submit_many(()) == []
+        elif case_id == "empty_gen":
+            assert pool.submit_many(x for x in ()) == []
+        elif case_id == "single_coro":
+            futs = pool.submit_many([_echo(7)])
+            assert await asyncio.gather(*futs) == [7]
+        elif case_id == "single_sync":
+            futs = pool.submit_many([lambda: 99])
+            assert await asyncio.gather(*futs) == [99]
+        elif case_id == "exact_threads":
+            futs = pool.submit_many([_echo(i) for i in range(num_threads)])
+            assert await asyncio.gather(*futs) == list(range(num_threads))
+        elif case_id == "threads_plus_one":
+            futs = pool.submit_many([_echo(i) for i in range(num_threads + 1)])
+            assert await asyncio.gather(*futs) == list(range(num_threads + 1))
+        elif case_id == "precancelled_scope":
+            scope = CancelScope()
+            scope.cancel()
+            futs = pool.submit_many([_echo(1)], cancel_scope=scope)
+            with pytest.raises(asyncio.CancelledError):
+                await futs[0]
+        elif case_id == "chained_drain":
+            futs = pool.submit_many([_echo(i) for i in range(10)])
+            assert await asyncio.gather(*futs) == list(range(10))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_case", "expected_exc"),
+    [
+        ("submit_unstarted_coro", ThreadPoolClosedError),
+        ("submit_closed_coro", ThreadPoolClosedError),
+        ("submit_many_unstarted_coros", ThreadPoolClosedError),
+        ("submit_many_closed_coros", ThreadPoolClosedError),
+        ("submit_many_future_first", TypeError),
+        ("submit_many_future_middle", TypeError),
+        ("submit_bad_pin_index_coro", ValueError),
+        ("submit_bad_pin_type_coro", TypeError),
+        ("submit_many_multi_target_cancel_scope", ValueError),
+        ("native_batch_none", TypeError),
+    ],
+)
+async def test_submit_many_error(error_case: str, expected_exc: type[BaseException]) -> None:
+    """Error table-driven tests verifying exact exception and zero unawaited coroutine leaks."""
+
+    async def _dummy() -> int:
+        return 1
+
+    if error_case == "submit_unstarted_coro":
+        pool = EventLoopThreadPool(num_threads=1)
+        c = _dummy()
+        with pytest.raises(expected_exc):
+            pool.submit(c)
+        assert c.cr_frame is None
+    elif error_case == "submit_closed_coro":
+        pool = EventLoopThreadPool(num_threads=1)
+        await pool.start()
+        await pool.close()
+        c = _dummy()
+        with pytest.raises(expected_exc):
+            pool.submit(c)
+        assert c.cr_frame is None
+    elif error_case == "submit_many_unstarted_coros":
+        pool = EventLoopThreadPool(num_threads=1)
+        coros = [_dummy(), _dummy()]
+        with pytest.raises(expected_exc):
+            pool.submit_many(coros)
+        assert all(c.cr_frame is None for c in coros)
+    elif error_case == "submit_many_closed_coros":
+        pool = EventLoopThreadPool(num_threads=1)
+        await pool.start()
+        await pool.close()
+        coros = [_dummy(), _dummy()]
+        with pytest.raises(expected_exc):
+            pool.submit_many(coros)
+        assert all(c.cr_frame is None for c in coros)
+    elif error_case == "submit_many_future_first":
+        async with EventLoopThreadPool(num_threads=1) as pool:
+            fut = asyncio.get_running_loop().create_future()
+            with pytest.raises(expected_exc):
+                pool.submit_many([fut])
+    elif error_case == "submit_many_future_middle":
+        async with EventLoopThreadPool(num_threads=1) as pool:
+            c1 = _dummy()
+            c2 = _dummy()
+            fut = asyncio.get_running_loop().create_future()
+            with pytest.raises(expected_exc):
+                pool.submit_many([c1, fut, c2])
+            assert c1.cr_frame is None
+            assert c2.cr_frame is None
+    elif error_case == "submit_bad_pin_index_coro":
+        async with EventLoopThreadPool(num_threads=1) as pool:
+            c = _dummy()
+            with pytest.raises(expected_exc):
+                pool.submit(c, pin_to=99)
+            assert c.cr_frame is None
+    elif error_case == "submit_bad_pin_type_coro":
+        async with EventLoopThreadPool(num_threads=1) as pool:
+            c = _dummy()
+            with pytest.raises(expected_exc):
+                pool.submit(c, pin_to="invalid")  # type: ignore[arg-type]
+            assert c.cr_frame is None
+    elif error_case == "submit_many_multi_target_cancel_scope":
+        from multiloop import CancelScope
+
+        async with EventLoopThreadPool(num_threads=1) as pool:
+            c1 = _dummy()
+            c2 = _dummy()
+            with pytest.raises(expected_exc):
+                pool.submit_many([c1, c2], cancel_scope=CancelScope())
+            assert c1.cr_frame is None
+            assert c2.cr_frame is None
+    elif error_case == "native_batch_none":
+        async with EventLoopThreadPool(num_threads=1) as pool:
+            assert pool._native_pool is not None
+            with pytest.raises(expected_exc):
+                pool._native_pool.push_global_batch([None])
+
+
+def test_repro_pool_drain_hoarding_and_work_stealing() -> None:
+    """When pool is draining or a worker batch-pulled into its private buffer,
+    idle workers must steal from non-empty sibling buffers instead of starving
+    or prematurely raising ThreadPoolClosedError while is_drained() is False.
+    """
+    from multiloop.pool import NativeWorkerPool
+
+    assert NativeWorkerPool is not None
+    np = NativeWorkerPool(4)
+    np.push_global_batch([f"task-{i}" for i in range(20)])
+    np.close()
+
+    # Worker 0 pulls first item
+    first = np.pop_work(0)
+    assert first == "task-0"
+    assert not np.is_drained()
+
+    # Worker 1, 2, 3 must be able to pull/steal work during drain and MUST NOT
+    # prematurely raise ThreadPoolClosedError while 19 tasks remain!
+    second = np.pop_work(1)
+    assert second is not None
+    third = np.pop_work(2)
+    assert third is not None
+    fourth = np.pop_work(3)
+    assert fourth is not None
+
+    # Drain all remaining items across worker 1 (including stealing from worker 0's buffer)
+    collected = [first, second, third, fourth]
+    while not np.is_drained():
+        item = np.pop_work(1)
+        assert item is not None
+        collected.append(item)
+
+    assert len(collected) == 20
+    assert set(collected) == {f"task-{i}" for i in range(20)}
+
+    # Only now that all buffers and queues are completely empty may pop_work raise ThreadPoolClosedError
+    with pytest.raises(ThreadPoolClosedError):
+        np.pop_work(1)
+
+
+def test_pop_work_rejects_none() -> None:
+    """Pushing a None task into NativeWorkerPool raises TypeError."""
+    import multiloop._multiloop_core as core
+
+    native = core.NativeWorkerPool(2)
+    try:
+        with pytest.raises(TypeError):
+            native.push_global(None)
+        with pytest.raises(TypeError):
+            native.push_local(0, None)
+    finally:
+        native.close()
+
+
+@pytest.mark.asyncio
+async def test_pool_missing_rust_extension_raises() -> None:
+    """EventLoopThreadPool.start() raises an actionable RuntimeError when NativeWorkerPool is missing."""
+    import multiloop.pool
+
+    multiloop.pool.NativeWorkerPool = None
+    pool = EventLoopThreadPool(num_threads=1)
+    try:
+        with pytest.raises(RuntimeError, match="not installed"):
+            await pool.start()
+    finally:
+        await pool.close()
+        try:
+            from multiloop._multiloop_core import NativeWorkerPool as _restore  # noqa: N813
+        except ImportError:
+            _restore = None
+        multiloop.pool.NativeWorkerPool = _restore
+
+
+@pytest.mark.asyncio
+async def test_pool_submit_from_non_asyncio_thread_raises() -> None:
+    """Calling pool.submit() from a non-asyncio thread raises a clear RuntimeError."""
+    pool = EventLoopThreadPool(num_threads=1)
+    await pool.start()
+
+    errors: list[Exception] = []
+
+    def call_submit() -> None:
+        try:
+            pool.submit(asyncio.sleep, 0.01)
+        except RuntimeError as e:
+            errors.append(e)
+
+    t = threading.Thread(target=call_submit)
+    t.start()
+    t.join()
+
+    assert len(errors) == 1
+    assert str(errors[0]) == (
+        "submit() must be called from a thread with a running asyncio event loop"
+    )
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_pool_over_64_workers_idle_wakeup() -> None:
+    """Pools with >64 workers wake both pinned (pin_to=68) and global idle workers cleanly."""
+    pool = EventLoopThreadPool(num_threads=70)
+    await pool.start()
+    try:
+        await asyncio.sleep(0.3)
+
+        async def work() -> int:
+            return 42
+
+        fut_pinned = pool.submit(work, pin_to=68)
+        fut_global = pool.submit(work)
+
+        assert await asyncio.wait_for(fut_pinned, timeout=1.0) == 42
+        assert await asyncio.wait_for(fut_global, timeout=1.0) == 42
+    finally:
+        await pool.close()

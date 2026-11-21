@@ -1,0 +1,58 @@
+name: "Build, Verify & Upload Distribution Artifacts"
+description: "Build wheel or sdist via maturin-action, run strict twine metadata check, and upload artifacts."
+
+inputs:
+  command:
+    description: "Build mode: build | sdist."
+    required: false
+    default: "build"
+  target:
+    description: "Target architecture for wheel builds (e.g. x86_64, aarch64)."
+    required: false
+    default: ""
+  manylinux:
+    description: "Manylinux policy for Linux wheel builds (e.g. 2_17 or auto)."
+    required: false
+    default: "auto"
+  args:
+    description: "Additional arguments passed to maturin."
+    required: true
+  artifact-name:
+    description: "Artifact name to upload."
+    required: true
+  maturin-version:
+    description: "Pinned maturin release matching uv.lock."
+    required: false
+    default: "v1.14.1"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Build sdist
+      if: ${{ inputs.command == 'sdist' }}
+      uses: PyO3/maturin-action@v1
+      with:
+        command: sdist
+        maturin-version: ${{ inputs.maturin-version }}
+        args: ${{ inputs.args }}
+        rust-toolchain: stable
+
+    - name: Build wheels
+      if: ${{ inputs.command != 'sdist' }}
+      uses: PyO3/maturin-action@v1
+      with:
+        maturin-version: ${{ inputs.maturin-version }}
+        target: ${{ inputs.target }}
+        manylinux: ${{ inputs.manylinux }}
+        args: ${{ inputs.args }}
+
+    - name: Check distribution metadata
+      shell: bash
+      run: uvx twine check --strict dist/*
+
+    - name: Upload distribution artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: dist
+        if-no-files-found: error

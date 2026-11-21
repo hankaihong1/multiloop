@@ -6,7 +6,8 @@ from typing import Any
 
 import pytest
 
-from multiloop._taskgroup import TaskGroup, TaskHandle, TaskStatus, _TaskStatus
+from multiloop import Event, current_effective_deadline, sleep
+from multiloop._taskgroup import TaskGroup, TaskHandle, TaskStatus, _TaskStatus, _TGState
 
 
 async def _worker(value: Any) -> Any:
@@ -15,7 +16,7 @@ async def _worker(value: Any) -> Any:
 
 
 async def _worker_slow(value: Any, delay: float = 0.1) -> Any:
-    await asyncio.sleep(delay)
+    await sleep(delay)
     return value
 
 
@@ -25,7 +26,7 @@ async def _worker_fail(msg: str) -> None:
 
 
 async def _worker_fail_slow(msg: str, delay: float = 0.1) -> None:
-    await asyncio.sleep(delay)
+    await sleep(delay)
     raise ValueError(msg)
 
 
@@ -202,7 +203,7 @@ async def test_taskgroup_start_child_crash_cleans_up():
     async def innocent_child() -> int:
         nonlocal cleanup_called
         try:
-            await asyncio.sleep(10)
+            await sleep(10)
         except asyncio.CancelledError:
             cleanup_called = True
             raise
@@ -243,41 +244,19 @@ async def test_body_and_child_exceptions_both_visible() -> None:
 
 @pytest.mark.asyncio
 async def test_body_cancel_propagates_without_merge() -> None:
-    """Cancellation wins: a cancelled body must propagate CancelledError, not a group."""
+    """Cancelling a TaskGroup body cancels stuck children promptly and propagates CancelledError without merging."""
 
     async def stuck() -> None:
-        await asyncio.Event().wait()
+        await Event().wait()
 
     async def run() -> None:
         async with TaskGroup() as tg:
             tg.start_soon(stuck)
-            await asyncio.Event().wait()
+            await Event().wait()
 
     task = asyncio.create_task(run())
     await asyncio.sleep(0.05)  # let the group body park
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=2.0)
-
-
-@pytest.mark.asyncio
-async def test_cancel_cancels_stuck_child() -> None:
-    """cancelling a TaskGroup body must cancel stuck children so the
-    group exits promptly instead of hanging forever."""
-
-    async def stuck() -> None:
-        await asyncio.Event().wait()
-
-    async def run() -> None:
-        async with TaskGroup() as tg:
-            tg.start_soon(stuck)
-            await asyncio.Event().wait()
-
-    task = asyncio.create_task(run())
-    await asyncio.sleep(0.05)  # let the group body park
-    task.cancel()
-    # The external cancel must pass through (group exits promptly instead of
-    # hanging). Pre-fix this times out: the group never exits.
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=2.0)
 
@@ -401,18 +380,7 @@ async def _child_fails_before_started(_ts: TaskStatus) -> None:
 
 @pytest.mark.asyncio
 async def test_start_child_failure_raises_not_hangs() -> None:
-    """a child that raises before calling ``started()`` must surface
-    its exception from ``start()`` — pre-fix ``start()`` blocked forever
-    (the started-event is never set)."""
-    with pytest.raises(ValueError, match="boom before started"):
-        async with TaskGroup() as tg:
-            await asyncio.wait_for(tg.start(_child_fails_before_started), timeout=2.0)
-
-
-@pytest.mark.asyncio
-async def test_start_child_failure_reported_once() -> None:
-    """the same child exception must not be reported twice (start()
-    raises it AND the group re-collects it into an ExceptionGroup)."""
+    """A child raising before calling started() surfaces the single exception from start() without hanging."""
     with pytest.raises(ValueError, match="boom before started") as excinfo:
         async with TaskGroup() as tg:
             await asyncio.wait_for(tg.start(_child_fails_before_started), timeout=2.0)
@@ -447,7 +415,7 @@ async def test_cancel_all_then_normal_exit_is_silent() -> None:
     """
 
     async def child() -> None:
-        await asyncio.sleep(30)
+        await sleep(30)
 
     async with TaskGroup() as tg:
         tg.start_soon(child)
@@ -471,7 +439,7 @@ async def test_start_failure_siblings_not_reported() -> None:
         raise ValueError("boom after started")
 
     async def sibling() -> None:
-        await asyncio.sleep(30)
+        await sleep(30)
 
     async with TaskGroup() as tg:
         tg.start_soon(sibling)
@@ -516,7 +484,7 @@ async def test_host_cancel_waits_for_children_to_finish() -> None:
 
     async def slow_child() -> None:
         try:
-            await asyncio.sleep(30)
+            await sleep(30)
         finally:
             child_finally_ran.set()
 
@@ -607,7 +575,7 @@ async def test_start_child_cancelled_before_started_cancels_siblings() -> None:
 
     async def sibling() -> None:
         try:
-            await asyncio.sleep(10)
+            await sleep(10)
         except asyncio.CancelledError:
             sibling_cancelled.set()
             raise
@@ -795,7 +763,7 @@ async def test_taskgroup_cross_loop_pool_failure_cascading_cancel() -> None:
     async def slow_worker() -> None:
         nonlocal cancelled_slow
         try:
-            await asyncio.sleep(1.0)
+            await sleep(1.0)
         except asyncio.CancelledError:
             cancelled_slow = True
             raise
@@ -842,7 +810,7 @@ async def test_async_context_task_group_integration() -> None:
     async def worker() -> None:
         nonlocal cancelled_task
         try:
-            await asyncio.sleep(1.0)
+            await sleep(1.0)
         except asyncio.CancelledError:
             cancelled_task = True
             raise
@@ -855,3 +823,244 @@ async def test_async_context_task_group_integration() -> None:
                 ctx.cancel()
 
         assert cancelled_task is True
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_cross_loop_concurrent_start_safety() -> None:
+    """Concurrent TaskGroup(pool=pool).start across multiple OS threads with started() values."""
+    from multiloop.pool import EventLoopThreadPool
+
+    async def worker(task_status: TaskStatus, item_id: int) -> int:
+        await asyncio.sleep(0.005)
+        task_status.started()
+        await asyncio.sleep(0.01)
+        return item_id * 2
+
+    async with (
+        EventLoopThreadPool(num_threads=4) as pool,
+        TaskGroup(pool=pool) as tg,
+    ):
+        handles = await asyncio.gather(*(tg.start(worker, i) for i in range(10)))
+        for handle in handles:
+            assert handle.status in (_TaskStatus.STARTED, _TaskStatus.FINISHED)
+        results = await asyncio.gather(*handles)
+        assert results == [i * 2 for i in range(10)]
+
+
+@pytest.mark.asyncio
+async def test_async_context_taskgroup_weakref_gc_reclaim() -> None:
+    """TaskGroup instances registered in AsyncContext must be reclaimed by GC via WeakSet when dropped."""
+    import gc
+    import weakref
+
+    from multiloop.context import AsyncContext
+
+    ctx = AsyncContext()
+
+    def create_tg() -> weakref.ref[TaskGroup]:
+        tg = ctx.task_group()
+        ref = weakref.ref(tg)
+        assert len(ctx._task_groups) == 1
+        return ref
+
+    tg_ref = create_tg()
+    gc.collect()
+
+    assert tg_ref() is None
+    assert len(ctx._task_groups) == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 TDD: TaskGroup._cancel_scope cleanup (P0-2) & AsyncContext.task_group(limiter=...)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limit_val", "total_tasks"),
+    [
+        (1, 4),
+        (2, 6),
+        (3, 6),
+    ],
+)
+async def test_taskgroup_context_limiter_valid(limit_val: int, total_tasks: int) -> None:
+    """Valid parameterized tests verifying AsyncContext.task_group(limiter=...) enforces concurrency budget."""
+    from multiloop._sync import CapacityLimiter
+    from multiloop.context import AsyncContext
+
+    ctx = AsyncContext()
+    limiter = CapacityLimiter(limit_val)
+    active = 0
+    peak = 0
+
+    async def worker(idx: int) -> int:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return idx
+
+    async with ctx.task_group(limiter=limiter) as tg:
+        handles = [tg.start_soon(worker, i) for i in range(total_tasks)]
+
+    assert [await h for h in handles] == list(range(total_tasks))
+    assert 1 <= peak <= limit_val
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exc_cls", "num_children"),
+    [
+        (asyncio.CancelledError, 1),
+        (asyncio.CancelledError, 3),
+        (RuntimeError, 1),
+        (RuntimeError, 2),
+    ],
+)
+async def test_taskgroup_wait_children_abort_cleans_scope_boundary(
+    exc_cls: type[BaseException], num_children: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boundary parameterized tests verifying TaskGroup._cancel_scope.__aexit__ runs if _wait_children raises."""
+    tg = TaskGroup()
+    orig_wait = TaskGroup._wait_children
+
+    async def raising_wait(self_tg: TaskGroup, pre_cancelled: Any = None) -> list[BaseException]:
+        await orig_wait(self_tg, pre_cancelled)
+        raise exc_cls("abort inside _wait_children")
+
+    monkeypatch.setattr(TaskGroup, "_wait_children", raising_wait)
+
+    deadline_before = current_effective_deadline()
+    with pytest.raises(exc_cls):
+        async with tg:
+            for i in range(num_children):
+                tg.start_soon(_worker, i)
+
+    assert current_effective_deadline() == deadline_before
+    assert tg._state == _TGState.EXITED_CLEAN
+    assert tg._cancel_scope._state is None
+    assert tg._cancel_scope._entry_id is None
+    assert tg._wake_fut is None
+    await sleep(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("max_concurrency", "use_limiter", "expected_exc"),
+    [
+        (2, True, ValueError),
+        (0, False, ValueError),
+        (-1, False, ValueError),
+    ],
+)
+async def test_taskgroup_context_limiter_error(
+    max_concurrency: int | None, use_limiter: bool, expected_exc: type[BaseException]
+) -> None:
+    """Error parameterized tests verifying AsyncContext.task_group rejects invalid limiter configurations."""
+    from multiloop._sync import CapacityLimiter
+    from multiloop.context import AsyncContext
+
+    ctx = AsyncContext()
+    limiter = CapacityLimiter(2) if use_limiter else None
+    with pytest.raises(expected_exc):
+        ctx.task_group(max_concurrency=max_concurrency, limiter=limiter)
+
+
+@pytest.mark.asyncio
+async def test_repro_child_crash_immediately_cancels_blocked_host_body() -> None:
+    """A child task raising a non-cancellation exception must immediately interrupt a blocked host body."""
+
+    async def crashing_child() -> None:
+        await asyncio.sleep(0.01)
+        raise ValueError("child boom")
+
+    async def run_group() -> None:
+        async with TaskGroup() as tg:
+            tg.start_soon(crashing_child)
+            await sleep(10.0)
+
+    with pytest.raises(ValueError, match="child boom"):
+        await asyncio.wait_for(run_group(), timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_repro_cancel_all_cancels_host_scope() -> None:
+    """Calling tg.cancel_all() must also cancel the host task's _cancel_scope."""
+
+    async def trigger_cancel(tg: TaskGroup) -> None:
+        await asyncio.sleep(0.01)
+        tg.cancel_all()
+
+    async def run_group() -> None:
+        async with TaskGroup() as tg:
+            tg.start_soon(trigger_cancel, tg)
+            await sleep(10.0)
+
+    await asyncio.wait_for(run_group(), timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_repro_host_cancel_during_wait_children_preserves_child_exception() -> None:
+    """External host_task.cancel() while draining siblings in _wait_children must not discard child failures."""
+    in_sibling_cleanup = asyncio.Event()
+    sibling_cleanup_done = asyncio.Event()
+
+    async def crashing_child() -> None:
+        await asyncio.sleep(0.005)
+        raise ValueError("critical child failure")
+
+    async def slow_cleanup_sibling() -> None:
+        try:
+            await sleep(10.0)
+        finally:
+            in_sibling_cleanup.set()
+            await asyncio.sleep(0.03)
+            sibling_cleanup_done.set()
+
+    async def host() -> None:
+        async with TaskGroup() as tg:
+            tg.start_soon(crashing_child)
+            tg.start_soon(slow_cleanup_sibling)
+
+    host_task = asyncio.create_task(host())
+    await in_sibling_cleanup.wait()
+    host_task.cancel()
+
+    with pytest.raises(ValueError, match="critical child failure"):
+        await asyncio.wait_for(host_task, timeout=1.0)
+    assert sibling_cleanup_done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_limiter_cancel_closes_unstepped_coro() -> None:
+    """Cancelling TaskGroup while a coroutine object awaits CapacityLimiter closes it without RuntimeWarning."""
+    import gc
+    import warnings
+
+    async def blocker() -> None:
+        await sleep(10.0)
+
+    async def unstepped_target() -> None:
+        await sleep(10.0)
+
+    coro2 = unstepped_target()
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        async with TaskGroup(max_concurrency=1) as tg:
+            tg.start_soon(blocker)
+            await asyncio.sleep(0)
+
+            tg.start_soon(coro2)
+            await asyncio.sleep(0)
+
+            tg.cancel_all()
+
+        assert coro2.cr_frame is None
+        del coro2
+        gc.collect()
+
+        coro_warnings = [w for w in recorded if "never awaited" in str(w.message)]
+        assert len(coro_warnings) == 0

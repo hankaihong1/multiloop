@@ -175,7 +175,7 @@ import multiloop
 
 
 async def fetch(name: str, delay: float) -> str:
-    await asyncio.sleep(delay)  # simulated network latency
+    await multiloop.sleep(delay)  # simulated cancellable work
     return f"{name}: ok"
 
 
@@ -221,7 +221,7 @@ graph TD
     end
     
     subgraph Golang Concurrency Toolkit
-        RustCore <--> FastChan[Channel / flume]
+        RustCore <--> FastChan[Channel / RawAsyncChannel]
         FastChan <--> Select[multiloop.select_channel]
         FastChan <--> Context[AsyncContext]
         RustCore <--> WaitGroup[AsyncWaitGroup]
@@ -238,7 +238,7 @@ make develop
 # 2. Run all linter & type checks (0 warnings, strict typing)
 make lint
 
-# 3. Run complete test suite (320+ tests)
+# 3. Run complete test suite (490+ tests)
 make test
 ```
 
@@ -251,11 +251,11 @@ make test
 | Invariant / Primitive | Physical Concurrency Guarantee | Underlying State Machine |
 |---|---|---|
 | Python 3.14t Free-Threading | Physical multi-core parallelism across isolated event loops | Lock-free Rust queues + OS mutex protected waiter lists |
-| `Barrier` Cancellation | Auto-healing: cancelled party immediately breaks round & wakes all waiters | Monotonic generation counter + atomic `_broken` state machine |
+| `Barrier` Cancellation | Auto-healing: cancelled party immediately breaks round & wakes all waiters | Monotonic generation counter + Rust `RawAsyncBarrier` state machine |
 | `select_channel` Arbitration | 100% deterministic arbitration without message loss or starvation | Two-phase arbiter: uniform random probe + single-arbiter registration |
-| Waiter Unregistration | $O(1)$ constant time cancellation per waiter | `collections.OrderedDict` hash lookup & removal |
+| Waiter Cancellation | Safe ticketed cancellation immune to ABA pointer reuse | Monotonic Rust `WaiterId (u64)` tickets + out-of-lock `call_soon_threadsafe` |
 | `AsyncContext.cancel()` | Directly cancels active coroutines on worker OS threads | Injected `CancelScope` cross-thread cancellation |
-| `CancelScope` Shielding | Zero-leak symmetric cancellation accounting | CPython 3.11+ `task.cancelling()` snapshot & restore |
+| `CancelScope` Shielding | Zero-leak scope isolation without touching `task.cancelling()` | Route 3 pure Rust `RawTaskCancelState` task cancel stack |
 
 For formal invariants and concurrency design principles, see [docs/CONCURRENCY.md](docs/CONCURRENCY.md).
 

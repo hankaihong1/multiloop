@@ -30,7 +30,13 @@ pytestmark = [
 
 pytest.importorskip("multiloop")
 
-from multiloop import Barrier, CancelScope, CapacityLimiter, EventLoopThreadPool  # noqa: E402
+from multiloop import (  # noqa: E402
+    Barrier,
+    CancelScope,
+    CapacityLimiter,
+    EventLoopThreadPool,
+    sleep,
+)
 from multiloop.testing import wait_all_tasks_blocked  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -43,7 +49,7 @@ async def test_cancel_scope_cross_thread_stress():
     """CancelScope.cancel() from multiple threads while reading cancel_called.
 
     On free-threaded builds, cancel() may interleave with cancel_called
-    reads — the internal _cancel_lock must keep the flag consistent.
+    reads — the internal _lock keeps the flag consistent alongside RawTaskCancelState.
     """
     scope = CancelScope()
     read_values: list[bool] = []
@@ -55,7 +61,7 @@ async def test_cancel_scope_cross_thread_stress():
         # worker completes normally, `await task` never raises, and the
         # pytest.raises(CancelledError) assertion below contradicts itself.
         async with scope:
-            await asyncio.sleep(5)
+            await sleep(5)
 
     task = asyncio.create_task(worker())
     await asyncio.sleep(0)
@@ -99,7 +105,7 @@ async def test_capacity_limiter_concurrent_mutations():
     """CapacityLimiter.total_tokens reads/writes are consistent under
     concurrent access from multiple threads.
 
-    On free-threaded builds, the _total_lock must serialise mutations.
+    On free-threaded builds, Rust RawAsyncCapacityLimiter mutex serialises mutations.
     """
     limiter = CapacityLimiter(100.0)
     errors: list[Exception] = []
@@ -110,8 +116,8 @@ async def test_capacity_limiter_concurrent_mutations():
             for i in range(200):
                 new_total = float(50 + ((i + seed) % 50))
                 limiter.total_tokens = new_total
-                # snapshot() reads all three values under a single
-                # _total_lock acquisition — reading the three properties
+                # snapshot() reads all three values under a single Rust
+                # mutex acquisition — reading the three properties
                 # separately lets another thread change total_tokens between
                 # two reads, mixing values computed against different totals
                 # (cross-lock-region snapshot inconsistency, not a data race).
@@ -148,7 +154,7 @@ async def test_barrier_cross_loop_abort_stress():
     """Barrier.abort() from a non-asyncio thread while parties are waiting.
 
     On free-threaded builds, abort() must use call_soon_threadsafe
-    to wake waiters, and the _mutex must prevent torn state.
+    to wake waiters, and the Rust RawAsyncBarrier mutex prevents torn state.
     """
     barrier = Barrier(parties=4)
     errors_in_waiters: list[type[Exception]] = []
@@ -190,8 +196,8 @@ async def test_barrier_cross_loop_abort_stress():
 async def test_pool_concurrent_submit_close():
     """Pool.submit() concurrent with close() must not crash.
 
-    On free-threaded builds the internal locks (_resolve_target_worker,
-    _groups_lock) serialise access across threads.
+    On free-threaded builds, _lifecycle_lock, immutable loop snapshots, and
+    NativeWorkerPool synchronize concurrent submit() vs close() safely.
     """
     pool = EventLoopThreadPool(num_threads=2)
     await pool.start()
