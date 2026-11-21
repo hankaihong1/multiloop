@@ -13,10 +13,15 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Space-separated free-threaded Python versions tested on every OS runner.
+  # Adding future releases (e.g. 3.16t) never multiplies the CI job matrix.
+  PYTHON_VERSIONS: "3.14t 3.15t"
+
 jobs:
   # Classify every push/PR before launching heavy builds.
   # Docs/examples-only changes skip Rust/multi-OS compilation and run the fast
-  # Docs Drift Check; anything touching code/config runs lint + full 3.14t/3.15t CI.
+  # Docs Drift Check; anything touching code/config runs lint + full 3-OS CI.
   changes:
     name: Detect Changed Files
     runs-on: ubuntu-latest
@@ -96,20 +101,13 @@ jobs:
       - uses: ./.github/actions/run-lint
 
   test:
-    name: Build & Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    name: Build & Test (${{ matrix.os }})
     needs: [changes, lint]
     if: (needs.changes.outputs.code == 'true' && success()) || needs.changes.result != 'success'
-    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.14t"]
-        experimental: [false]
-        include:
-          - os: ubuntu-latest
-            python-version: "3.15t"
-            experimental: true
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -117,16 +115,10 @@ jobs:
 
       - uses: ./.github/actions/setup-env
         with:
-          python-version: ${{ matrix.python-version }}
-          sync-mode: "no-project"
-          cache-key: ${{ matrix.os }}-${{ matrix.python-version }}
+          python-version: "3.14t"
+          sync-mode: "none"
+          cache-key: ${{ matrix.os }}
           uv-cache: "true"
 
-      - name: Build Rust Extension
-        run: uv run --no-sync maturin develop --release --locked
-
-      - name: Run Rust Unit Tests
-        run: uv run --no-sync python .github/scripts/run_rust_tests.py
-
-      - name: Run Python Test Suite & Race Checks
-        run: uv run --no-sync pytest
+      - name: Run Rust & Python suites across free-threaded versions
+        run: uv run --no-project python .github/scripts/run_ci_versions.py

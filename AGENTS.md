@@ -67,7 +67,7 @@ multiloop/
 ├── Makefile                  # Convenience targets (sync, develop, test, lint, package, bench, all)
 ├── .github/
 │   ├── actions/              # Shared composite actions (setup-env, run-lint, build-dist)
-│   ├── scripts/              # Shared CI/Makefile helpers (run_rust_tests.py, check_release.py)
+│   ├── scripts/              # Shared CI/Makefile helpers (_common.py, run_rust_tests.py, check_release.py, run_ci_versions.py, build_host_wheels.py, verify_dist.py)
 │   └── workflows/            # CI (ci.yml), Publish (publish.yml), Release Drafter
 └── CONTRIBUTING.md           # Human-oriented dev setup guide
 ```
@@ -115,7 +115,7 @@ searches, never modify.
 
 ### General
 
-- **Python version**: `>= 3.14t` (free-threaded / no-GIL only; CI tests `3.14t` + experimental `3.15t`, release wheels target `3.14t`).
+- **Python version**: `>= 3.14t` (free-threaded / no-GIL only; OS-grouped CI and release builds both target `3.14t` and `3.15t` across Linux, macOS, and Windows).
 - **Package manager**: `uv` exclusively — do not use `pip`.
 - **Rust toolchain**: stable (via rustup).
 - **Rust extension optional**: every Python module that depends on the Rust

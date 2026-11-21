@@ -34,6 +34,7 @@ def main(argv: list[str]) -> int:
     env = os.environ.copy()
     existing = env.get(env_var, "")
     env[env_var] = f"{lib_dir}{os.pathsep}{existing}" if existing else lib_dir
+    env.setdefault("PYO3_PYTHON", sys.executable)
 
     cmd = [
         "cargo",

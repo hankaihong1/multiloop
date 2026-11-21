@@ -51,6 +51,6 @@ format:
 
 clean:
 	cargo clean
-	rm -rf dist dist-check .pytest_cache .ruff_cache .mypy_cache
+	rm -rf dist dist-check .venv-ci-* .venv-build .venv-dist-* .pytest_cache .ruff_cache .mypy_cache
 
 all: develop lint test

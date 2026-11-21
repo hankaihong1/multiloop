@@ -17,6 +17,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Space-separated free-threaded Python versions built & tested per OS runner.
+  PYTHON_VERSIONS: "3.14t 3.15t"
+  MATURIN_VERSION: "v1.14.1"
+
 jobs:
   # Pre-flight gate: verify version parity, CHANGELOG, lint/type/clippy/doc checks,
   # and sdist metadata before spinning up multi-OS wheel runners.
@@ -44,7 +49,7 @@ jobs:
 
       - uses: ./.github/actions/run-lint
 
-  # Free-threaded cp314t wheels across Linux, macOS, and Windows.
+  # Build all target free-threaded wheels grouped by OS / architecture runner.
   build_wheels:
     name: Build wheels (${{ matrix.name }})
     needs: validate
@@ -55,45 +60,37 @@ jobs:
         include:
           - name: linux-x86_64
             os: ubuntu-latest
-            target: x86_64
-            manylinux: "2_17"
-            setup_python: "false"
+            mode: container-wheels
+            manylinux: "2_28"
+            target: ""
+            rust_target: ""
           - name: linux-aarch64
-            os: ubuntu-latest
-            target: aarch64
-            manylinux: "2_17"
-            setup_python: "false"
+            os: ubuntu-24.04-arm
+            mode: container-wheels
+            manylinux: "2_28"
+            target: ""
+            rust_target: ""
           - name: macos-x86_64
             os: macos-latest
-            target: x86_64
+            mode: host-wheels
             manylinux: "auto"
-            setup_python: "true"
+            target: x86_64
+            rust_target: x86_64-apple-darwin
           - name: macos-aarch64
             os: macos-latest
-            target: aarch64
+            mode: host-wheels
             manylinux: "auto"
-            setup_python: "true"
+            target: aarch64
+            rust_target: aarch64-apple-darwin
           - name: windows-x86_64
             os: windows-latest
-            target: x86_64
+            mode: host-wheels
             manylinux: "auto"
-            setup_python: "true"
+            target: x86_64
+            rust_target: x86_64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@v6
-
-      - name: Set up Python 3.14t (macOS)
-        if: ${{ matrix.setup_python == 'true' && matrix.os == 'macos-latest' }}
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.14t"
-
-      - name: Set up Python 3.14t (Windows)
-        if: ${{ matrix.setup_python == 'true' && matrix.os == 'windows-latest' }}
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.14t"
-          architecture: x64
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v10.4.0
@@ -102,11 +99,14 @@ jobs:
 
       - uses: ./.github/actions/build-dist
         with:
-          command: build
+          mode: ${{ matrix.mode }}
           target: ${{ matrix.target }}
+          rust-target: ${{ matrix.rust_target }}
           manylinux: ${{ matrix.manylinux }}
-          args: --release --locked --out dist --interpreter 3.14t --compatibility pypi
+          python-versions: ${{ env.PYTHON_VERSIONS }}
+          cache-key: ${{ matrix.name }}
           artifact-name: dist-wheels-${{ matrix.name }}
+          maturin-version: ${{ env.MATURIN_VERSION }}
 
   sdist:
     name: Build source distribution
@@ -122,29 +122,27 @@ jobs:
 
       - uses: ./.github/actions/build-dist
         with:
-          command: sdist
-          args: --out dist
+          mode: sdist
           artifact-name: dist-sdist
+          maturin-version: ${{ env.MATURIN_VERSION }}
 
-  # Install built wheels strictly from dist/ (--no-index, --only-binary, --no-sync)
-  # and verify site-packages origin + disabled GIL before running pytest.
+  # Verify all built wheels per OS/arch runner across every free-threaded version.
   test_wheels:
-    name: Test wheel on ${{ matrix.os }} (Python ${{ matrix.python-version }})
+    name: Test wheels (${{ matrix.os }})
     needs: build_wheels
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.14t"]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
 
       - uses: ./.github/actions/setup-env
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.14t"
           install-rust: "false"
-          sync-mode: "no-project"
+          sync-mode: "none"
 
       - name: Download built wheels
         uses: actions/download-artifact@v4
@@ -153,21 +151,12 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Install wheel (no index)
-        run: |
-          uv pip install multiloop --no-index --no-deps --only-binary :all: --find-links dist --reinstall
+      - name: Verify all free-threaded wheels on ${{ matrix.os }}
+        run: uv run --no-project python .github/scripts/verify_dist.py --mode wheels
 
-      - name: Smoke test wheel (site-packages & no-GIL)
-        run: |
-          uv run --no-sync python -c "import sys, multiloop, multiloop._multiloop_core as m; assert 'site-packages' in multiloop.__file__; assert 'site-packages' in m.__file__; assert hasattr(sys, '_is_gil_enabled') and not sys._is_gil_enabled(); print('ok:', m.__file__)"
-
-      - name: Run test suite against installed wheel
-        run: uv run --no-sync pytest -m "not slow"
-
-  # Build and install directly from the packaged sdist tarball to prove every
-  # source file, lockfile, and doc asset required for building is included.
+  # Build and install from the packaged sdist across every free-threaded version.
   test_sdist:
-    name: Test sdist build & install (ubuntu-latest, Python 3.14t)
+    name: Test sdist build & install (ubuntu-latest)
     needs: sdist
     runs-on: ubuntu-latest
     steps:
@@ -176,7 +165,7 @@ jobs:
       - uses: ./.github/actions/setup-env
         with:
           python-version: "3.14t"
-          sync-mode: "no-project"
+          sync-mode: "none"
           cache-key: "sdist-test"
 
       - name: Download sdist
@@ -185,15 +174,8 @@ jobs:
           name: dist-sdist
           path: dist
 
-      - name: Build & install from sdist
-        run: uv pip install --no-index --no-build-isolation --no-deps --reinstall dist/*.tar.gz
-
-      - name: Smoke test sdist install (site-packages & no-GIL)
-        run: |
-          uv run --no-sync python -c "import sys, multiloop, multiloop._multiloop_core as m; assert 'site-packages' in multiloop.__file__; assert 'site-packages' in m.__file__; assert hasattr(sys, '_is_gil_enabled') and not sys._is_gil_enabled(); print('ok:', m.__file__)"
-
-      - name: Run test suite against sdist install
-        run: uv run --no-sync pytest -m "not slow"
+      - name: Verify sdist build & tests across free-threaded versions
+        run: uv run --no-project python .github/scripts/verify_dist.py --mode sdist
 
   publish:
     name: Publish to PyPI

@@ -16,8 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Replaced CPython `task.cancel()`/`uncancel()`/`cancelling()` ledger mutation with `RawTaskCancelState` (`_TASK_CANCEL_STATES` weak-key tracking), strict `PLAIN` / `MOVE_ON` / `FAIL_AFTER` exit modes, `shield` isolation, `sleep`, `wait_cancellable`, and `checkpoint`.
   - Hardened `run_in_pool()`, `TaskGroup`, `TaskHandle._await_impl()`, `AsyncContext`, and all primitive wait points for Route 3 cancellation parity and FFI/GC safety.
 - **Free-Threaded CI/CD & Developer Workflow Unification (`.github/`, `Makefile`)**:
-  - Converged CI (`ci.yml`) and PyPI distribution (`publish.yml`) to free-threaded Python (`3.14t` + experimental `3.15t`) using shared composite actions (`setup-env`, `run-lint`, `build-dist`) and cross-platform helper scripts (`run_rust_tests.py`, `check_release.py`).
-  - Added `test_sdist` end-to-end source-package build verification, `--no-sync` wheel smoke assertions, `release-drafter.yml` permission hardening, and aligned `Makefile` / `.pre-commit-config.yaml` / documentation parity tests.
+  - Converged CI (`ci.yml`) and PyPI distribution (`publish.yml`) onto OS-grouped runners (`ubuntu-latest`, `macos-latest`, `windows-latest`) testing & packaging free-threaded Python (`3.14t`, `3.15t`) via shared composite actions (`setup-env`, `run-lint`, `build-dist`) and cross-platform scripts (`run_rust_tests.py`, `run_ci_versions.py`, `build_host_wheels.py`, `verify_dist.py`, `check_release.py`).
+  - Added `test_sdist` build/install checks across target Python versions, fixed `test_wheels` `--no-sync` & `site-packages` smoke assertions, tightened `release-drafter.yml`, and aligned `Makefile`, `.pre-commit-config.yaml`, `CONTRIBUTING.md`, `AGENTS.md`, and `tests/test_docs.py`.
 
 ## [0.1.3] - 2026-09-17
 

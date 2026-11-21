@@ -1,22 +1,30 @@
 name: "Build, Verify & Upload Distribution Artifacts"
-description: "Build wheel or sdist via maturin-action, run strict twine metadata check, and upload artifacts."
+description: "Build wheels (container or host) or sdist, run strict twine metadata check, and upload artifacts."
 
 inputs:
-  command:
-    description: "Build mode: build | sdist."
-    required: false
-    default: "build"
+  mode:
+    description: "Build mode: container-wheels | host-wheels | sdist."
+    required: true
   target:
-    description: "Target architecture for wheel builds (e.g. x86_64, aarch64)."
+    description: "Target architecture for host wheel builds (e.g. x86_64, aarch64)."
+    required: false
+    default: ""
+  rust-target:
+    description: "Rust target triple for host wheel builds (e.g. x86_64-apple-darwin)."
     required: false
     default: ""
   manylinux:
-    description: "Manylinux policy for Linux wheel builds (e.g. 2_17 or auto)."
+    description: "Manylinux policy for Linux container wheel builds (e.g. 2_28)."
     required: false
-    default: "auto"
-  args:
-    description: "Additional arguments passed to maturin."
-    required: true
+    default: "2_28"
+  python-versions:
+    description: "Space-separated Python versions for wheels (e.g. '3.14t 3.15t')."
+    required: false
+    default: "3.14t 3.15t"
+  cache-key:
+    description: "Optional Rust cache key suffix for host wheel builds."
+    required: false
+    default: ""
   artifact-name:
     description: "Artifact name to upload."
     required: true
@@ -29,22 +37,38 @@ runs:
   using: "composite"
   steps:
     - name: Build sdist
-      if: ${{ inputs.command == 'sdist' }}
+      if: ${{ inputs.mode == 'sdist' }}
       uses: PyO3/maturin-action@v1
       with:
         command: sdist
         maturin-version: ${{ inputs.maturin-version }}
-        args: ${{ inputs.args }}
+        args: --out dist
         rust-toolchain: stable
 
-    - name: Build wheels
-      if: ${{ inputs.command != 'sdist' }}
+    - name: Build Linux wheels in manylinux container
+      if: ${{ inputs.mode == 'container-wheels' }}
       uses: PyO3/maturin-action@v1
       with:
         maturin-version: ${{ inputs.maturin-version }}
-        target: ${{ inputs.target }}
         manylinux: ${{ inputs.manylinux }}
-        args: ${{ inputs.args }}
+        args: --release --locked --out dist --interpreter ${{ inputs.python-versions }} --compatibility pypi
+
+    - name: Install Rust toolchain for host wheel builds
+      if: ${{ inputs.mode == 'host-wheels' }}
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.rust-target }}
+
+    - name: Restore Rust cache for host wheel builds
+      if: ${{ inputs.mode == 'host-wheels' }}
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: dist-${{ inputs.cache-key }}
+
+    - name: Build host wheels across target Python versions
+      if: ${{ inputs.mode == 'host-wheels' }}
+      shell: bash
+      run: uv run --no-project python .github/scripts/build_host_wheels.py --target "${{ inputs.target }}" --out dist ${{ inputs.python-versions }}
 
     - name: Check distribution metadata
       shell: bash

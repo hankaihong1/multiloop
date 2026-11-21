@@ -176,9 +176,9 @@ make test-docs
   it lets maintainers and other contributors weigh in on the design before
   effort is spent.
 - **Green before merge**: a PR is merged only after **all** required CI
-  checks pass (`Lint & Static Analysis` and the free-threaded `Build & Test`
-  matrix across Ubuntu/macOS/Windows on `3.14t`, plus experimental `3.15t` on
-  Ubuntu).
+  checks pass (`Lint & Static Analysis`, `Docs Drift Check`, and the OS-grouped
+  `Build & Test` runners on `ubuntu-latest`, `macos-latest`, and
+  `windows-latest`, each verifying free-threaded `3.14t` and `3.15t`).
 - **Docs/examples-only exception**: PRs touching only `*.md`, `docs/**`, or
   `examples/**` skip the compiled matrix and run `Docs Drift Check` (`ruff` +
   `tests/test_docs.py`) instead.
@@ -189,9 +189,9 @@ make test-docs
   derives the next version number from these labels.
 - **Release & PyPI Publish**: publishing a GitHub Release (or manually
   running `Publish` via `workflow_dispatch` with `pypi` / `testpypi` /
-  `dry-run`) runs pre-release validation, builds `cp314t` wheels and `sdist`,
-  tests both installed wheels and the `sdist` tarball on free-threaded Python,
-  and publishes via Trusted Publishing (OIDC).
+  `dry-run`) runs pre-release validation, builds `cp314t` and `cp315t` wheels
+  per OS/architecture plus `sdist`, verifies installed wheels and `sdist`
+  across `3.14t` and `3.15t`, and publishes via Trusted Publishing (OIDC).
 
 ---
 
