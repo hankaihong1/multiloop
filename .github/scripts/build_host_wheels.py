@@ -19,6 +19,8 @@ def main(argv: list[str]) -> int:
     with ci_group(f"Build wheels ({', '.join(versions)})"):
         interpreters = [find_managed_python(ver) for ver in versions]
         venv_py, env = ensure_venv(versions[0], ROOT / ".venv-build")
+        # Let maturin configure PYO3_PYTHON independently per --interpreter.
+        env.pop("PYO3_PYTHON", None)
         cmd = [
             "uv",
             "run",

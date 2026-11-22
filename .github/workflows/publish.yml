@@ -62,31 +62,26 @@ jobs:
             os: ubuntu-latest
             mode: container-wheels
             manylinux: "2_28"
-            target: ""
             rust_target: ""
           - name: linux-aarch64
             os: ubuntu-24.04-arm
             mode: container-wheels
             manylinux: "2_28"
-            target: ""
             rust_target: ""
           - name: macos-x86_64
             os: macos-latest
             mode: host-wheels
             manylinux: "auto"
-            target: x86_64
             rust_target: x86_64-apple-darwin
           - name: macos-aarch64
             os: macos-latest
             mode: host-wheels
             manylinux: "auto"
-            target: aarch64
             rust_target: aarch64-apple-darwin
           - name: windows-x86_64
             os: windows-latest
             mode: host-wheels
             manylinux: "auto"
-            target: x86_64
             rust_target: x86_64-pc-windows-msvc
 
     steps:
@@ -100,7 +95,6 @@ jobs:
       - uses: ./.github/actions/build-dist
         with:
           mode: ${{ matrix.mode }}
-          target: ${{ matrix.target }}
           rust-target: ${{ matrix.rust_target }}
           manylinux: ${{ matrix.manylinux }}
           python-versions: ${{ env.PYTHON_VERSIONS }}
@@ -182,9 +176,6 @@ jobs:
     needs: [validate, test_wheels, test_sdist]
     if: ${{ inputs.target != 'dry-run' }}
     runs-on: ubuntu-latest
-    environment:
-      name: ${{ inputs.target == 'testpypi' && 'testpypi' || 'pypi' }}
-      url: ${{ inputs.target == 'testpypi' && 'https://test.pypi.org/p/multiloop' || 'https://pypi.org/p/multiloop' }}
     permissions:
       id-token: write
 
