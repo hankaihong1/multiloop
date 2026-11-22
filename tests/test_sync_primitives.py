@@ -485,14 +485,14 @@ async def test_cancellation_storm_semaphore() -> None:
 
     tasks = [asyncio.create_task(waiter()) for _ in range(500)]
     await asyncio.sleep(0.01)
-    assert len(sem._waiters) == 500
+    assert sem._raw.waiter_count() == 500
 
     for t in tasks:
         t.cancel()
 
     await asyncio.gather(*tasks, return_exceptions=True)
     assert cancelled_count == 500
-    assert len(sem._waiters) == 0
+    assert sem._raw.waiter_count() == 0
     assert sem.value == 0
 
     # Release permit and ensure new acquire succeeds
@@ -522,14 +522,14 @@ async def test_cancellation_storm_capacity_limiter() -> None:
 
     tasks = [asyncio.create_task(waiter()) for _ in range(500)]
     await asyncio.sleep(0.01)
-    assert len(limiter._waiters) == 500
+    assert limiter._raw.waiter_count() == 500
 
     for t in tasks:
         t.cancel()
 
     await asyncio.gather(*tasks, return_exceptions=True)
     assert cancelled_count == 500
-    assert len(limiter._waiters) == 0
+    assert limiter._raw.waiter_count() == 0
 
     total, avail, borrowed = limiter.snapshot()
     assert total == 1.0
@@ -545,7 +545,7 @@ async def test_cancellation_storm_capacity_limiter() -> None:
 
 @pytest.mark.asyncio
 async def test_repro_semaphore_and_limiter_double_cancel_no_ghost_permit() -> None:
-    """Calling _cancel_waiter after a waiter was already removed without being granted
+    """Calling cancel_waiter after a waiter was already removed without being granted
     a permit must NOT mint a ghost permit in Semaphore or CapacityLimiter.
     """
     sem = Semaphore(1)
@@ -560,10 +560,10 @@ async def test_repro_semaphore_and_limiter_double_cancel_no_ghost_permit() -> No
 
     t = asyncio.create_task(doomed_sem())
     await asyncio.sleep(0.01)
-    assert len(sem._waiters) == 1
-    ev = next(iter(sem._waiters))
-    sem._cancel_waiter(ev)
-    assert len(sem._waiters) == 0
+    assert sem._raw.waiter_count() == 1
+    ev = sem._raw.waiter_tickets()[0]
+    sem._raw.cancel_waiter(ev)
+    assert sem._raw.waiter_count() == 0
 
     t.cancel()
     await t
@@ -584,10 +584,10 @@ async def test_repro_semaphore_and_limiter_double_cancel_no_ghost_permit() -> No
 
     t2 = asyncio.create_task(doomed_lim())
     await asyncio.sleep(0.01)
-    assert len(limiter._waiters) == 1
-    ev2 = next(iter(limiter._waiters))
-    limiter._cancel_waiter(ev2)
-    assert len(limiter._waiters) == 0
+    assert limiter._raw.waiter_count() == 1
+    ev2 = limiter._raw.waiter_tickets()[0]
+    limiter._raw.cancel_waiter(ev2)
+    assert limiter._raw.waiter_count() == 0
 
     t2.cancel()
     await t2

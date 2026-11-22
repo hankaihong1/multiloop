@@ -1,10 +1,12 @@
 use parking_lot::{Condvar, Mutex};
 use pyo3::prelude::*;
+use pyo3::pyclass::{PyTraverseError, PyVisit};
 use pyo3::types::PyWeakrefReference;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::errors::{channel_closed_err, timeout_err, would_block_err};
+use crate::timeout::deadline_from_opt_secs;
 use crate::waiter::{
     _complete_select_watcher, get_complete_select_watcher_fn, wake_waiter_outside_lock,
     WaiterEntry, WaiterId,
@@ -69,6 +71,20 @@ impl ChannelWaiter {
     }
 }
 
+fn visit_channel_waiter(
+    waiter: &ChannelWaiter,
+    visit: &PyVisit<'_>,
+) -> Result<(), PyTraverseError> {
+    if let ChannelWaiter::Async(entry) = waiter {
+        visit.call(&entry.event_loop)?;
+        visit.call(&entry.future)?;
+        if let Some(ref token) = entry.channel_token {
+            visit.call(token)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct SelectWatcherEntry {
     pub(crate) id: WaiterId,
     pub(crate) event_loop: Py<PyAny>,
@@ -104,6 +120,28 @@ impl ChannelState {
     #[inline]
     pub(crate) fn can_accept_put(&self) -> bool {
         self.putters.is_empty() && (self.maxsize == 0 || self.occupied() < self.maxsize)
+    }
+
+    #[inline]
+    pub(crate) fn deliver_or_buffer_locked(
+        &mut self,
+        item: Py<PyAny>,
+        to_wake: &mut Vec<WakeTarget>,
+    ) {
+        if let Some(getter) = self.getters.pop_front() {
+            let gid = getter.id();
+            self.in_flight_getters.push_back((gid, item));
+            to_wake.push(WakeTarget::Waiter {
+                waiter: getter,
+                closed: false,
+                kind: Some(WakeKind::Getter(gid)),
+            });
+        } else {
+            self.buffer.push_back(item);
+            if let Some(watcher) = self.select_watchers.pop_front() {
+                to_wake.push(WakeTarget::SelectWatcher(watcher));
+            }
+        }
     }
 
     #[inline]
@@ -270,30 +308,22 @@ impl RawAsyncChannel {
         let mut to_wake = Vec::new();
         let step = {
             let mut guard = self.state.lock();
-            if let Some(pos) = guard
+            let was_in_flight = if let Some(pos) = guard
                 .in_flight_putters
                 .iter()
                 .position(|id| *id == waiter_id)
             {
                 guard.in_flight_putters.remove(pos);
-            }
+                true
+            } else {
+                false
+            };
+            let has_capacity = guard.maxsize == 0 || guard.occupied() < guard.maxsize;
+            let allowed = was_in_flight || guard.putters.is_empty();
             if guard.is_closed {
                 Step::Closed(item)
-            } else if let Some(getter) = guard.getters.pop_front() {
-                let gid = getter.id();
-                guard.in_flight_getters.push_back((gid, item));
-                to_wake.push(WakeTarget::Waiter {
-                    waiter: getter,
-                    closed: false,
-                    kind: Some(WakeKind::Getter(gid)),
-                });
-                guard.wake_putters_locked(&mut to_wake);
-                Step::Done
-            } else if guard.maxsize == 0 || guard.buffer.len() < guard.maxsize {
-                guard.buffer.push_back(item);
-                if let Some(watcher) = guard.select_watchers.pop_front() {
-                    to_wake.push(WakeTarget::SelectWatcher(watcher));
-                }
+            } else if has_capacity && allowed {
+                guard.deliver_or_buffer_locked(item, &mut to_wake);
                 guard.wake_putters_locked(&mut to_wake);
                 Step::Done
             } else {
@@ -399,24 +429,8 @@ impl RawAsyncChannel {
             let mut guard = ch.state.lock();
             if guard.is_closed {
                 Step::Closed(item)
-            } else if (guard.maxsize == 0 || guard.occupied() < guard.maxsize)
-                && !guard.getters.is_empty()
-            {
-                let getter = guard.getters.pop_front().unwrap();
-                let gid = getter.id();
-                guard.in_flight_getters.push_back((gid, item));
-                to_wake.push(WakeTarget::Waiter {
-                    waiter: getter,
-                    closed: false,
-                    kind: Some(WakeKind::Getter(gid)),
-                });
-                guard.wake_putters_locked(&mut to_wake);
-                Step::Sent
             } else if guard.can_accept_put() {
-                guard.buffer.push_back(item);
-                if let Some(watcher) = guard.select_watchers.pop_front() {
-                    to_wake.push(WakeTarget::SelectWatcher(watcher));
-                }
+                guard.deliver_or_buffer_locked(item, &mut to_wake);
                 Step::Sent
             } else {
                 Step::Full(item)
@@ -456,24 +470,8 @@ impl RawAsyncChannel {
             let mut guard = ch.state.lock();
             if guard.is_closed {
                 Step::Closed(item, loop_obj, fut)
-            } else if (guard.maxsize == 0 || guard.occupied() < guard.maxsize)
-                && !guard.getters.is_empty()
-            {
-                let getter = guard.getters.pop_front().unwrap();
-                let gid = getter.id();
-                guard.in_flight_getters.push_back((gid, item));
-                to_wake.push(WakeTarget::Waiter {
-                    waiter: getter,
-                    closed: false,
-                    kind: Some(WakeKind::Getter(gid)),
-                });
-                guard.wake_putters_locked(&mut to_wake);
-                Step::Done(loop_obj, fut)
             } else if guard.can_accept_put() {
-                guard.buffer.push_back(item);
-                if let Some(watcher) = guard.select_watchers.pop_front() {
-                    to_wake.push(WakeTarget::SelectWatcher(watcher));
-                }
+                guard.deliver_or_buffer_locked(item, &mut to_wake);
                 Step::Done(loop_obj, fut)
             } else {
                 let id = guard.alloc_id();
@@ -543,8 +541,7 @@ impl RawAsyncChannel {
         timeout: Option<f64>,
     ) -> PyResult<()> {
         let ch = slf.get();
-        let deadline = timeout
-            .map(|t| std::time::Instant::now() + std::time::Duration::from_secs_f64(t.max(0.0)));
+        let deadline = deadline_from_opt_secs(timeout)?;
         let mut to_wake = Vec::new();
         enum InitialSend {
             Sent,
@@ -556,24 +553,8 @@ impl RawAsyncChannel {
             let mut guard = ch.state.lock();
             if guard.is_closed {
                 InitialSend::Closed(item)
-            } else if (guard.maxsize == 0 || guard.occupied() < guard.maxsize)
-                && !guard.getters.is_empty()
-            {
-                let getter = guard.getters.pop_front().unwrap();
-                let gid = getter.id();
-                guard.in_flight_getters.push_back((gid, item));
-                to_wake.push(WakeTarget::Waiter {
-                    waiter: getter,
-                    closed: false,
-                    kind: Some(WakeKind::Getter(gid)),
-                });
-                guard.wake_putters_locked(&mut to_wake);
-                InitialSend::Sent
             } else if guard.can_accept_put() {
-                guard.buffer.push_back(item);
-                if let Some(watcher) = guard.select_watchers.pop_front() {
-                    to_wake.push(WakeTarget::SelectWatcher(watcher));
-                }
+                guard.deliver_or_buffer_locked(item, &mut to_wake);
                 InitialSend::Sent
             } else if deadline.is_some_and(|dl| std::time::Instant::now() >= dl) {
                 InitialSend::TimedOut(item)
@@ -665,8 +646,7 @@ impl RawAsyncChannel {
         timeout: Option<f64>,
     ) -> PyResult<Py<PyAny>> {
         let ch = slf.get();
-        let deadline = timeout
-            .map(|t| std::time::Instant::now() + std::time::Duration::from_secs_f64(t.max(0.0)));
+        let deadline = deadline_from_opt_secs(timeout)?;
         loop {
             let mut to_wake = Vec::new();
             enum InitialRecv {
@@ -1023,5 +1003,47 @@ impl RawAsyncChannel {
 
     pub fn notifiers_len(&self) -> usize {
         self.state.lock().select_watchers.len()
+    }
+
+    pub fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let Some(guard) = self.state.try_lock() else {
+            return Ok(());
+        };
+        for item in &guard.buffer {
+            visit.call(item)?;
+        }
+        for waiter in &guard.getters {
+            visit_channel_waiter(waiter, &visit)?;
+        }
+        for waiter in &guard.putters {
+            visit_channel_waiter(waiter, &visit)?;
+        }
+        for watcher in &guard.select_watchers {
+            visit.call(&watcher.event_loop)?;
+            visit.call(&watcher.arbiter_fut)?;
+            visit.call(&watcher.channel_weakref)?;
+        }
+        for (_, item) in &guard.in_flight_getters {
+            visit.call(item)?;
+        }
+        Ok(())
+    }
+
+    pub fn __clear__(&self) {
+        let mut guard = self.state.lock();
+        guard.is_closed = true;
+        guard.in_flight_putters.clear();
+        let buffer = std::mem::take(&mut guard.buffer);
+        let getters = std::mem::take(&mut guard.getters);
+        let putters = std::mem::take(&mut guard.putters);
+        let select_watchers = std::mem::take(&mut guard.select_watchers);
+        let in_flight_getters = std::mem::take(&mut guard.in_flight_getters);
+        drop(guard);
+
+        drop(buffer);
+        drop(getters);
+        drop(putters);
+        drop(select_watchers);
+        drop(in_flight_getters);
     }
 }

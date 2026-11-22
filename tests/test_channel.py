@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import time
+from typing import Any
 
 import pytest
 
@@ -125,7 +126,7 @@ async def test_channel_error_recv_timeout():
     ch = Channel()
     with pytest.raises((TimeoutError, asyncio.TimeoutError)):
         await ch.recv(timeout=0.02)
-    assert len(ch._getters) == 0
+    assert ch._inner.getters_len() == 0
 
 
 def test_wouldblock_is_multiloop_error():
@@ -222,7 +223,7 @@ async def test_channel_timeout_and_close_idempotent():
 
     with pytest.raises((TimeoutError, asyncio.TimeoutError)):
         await ch.send("item2", timeout=0.02)
-    assert len(ch._putters) == 0
+    assert ch._inner.putters_len() == 0
 
     ch.close()
     ch.close()  # Second close is idempotent
@@ -497,10 +498,10 @@ async def test_putter_cancel_forwards_wakeup_to_next_putter() -> None:
         puts_done.append("c")
 
     a = asyncio.create_task(put_b())
-    await asyncio.sleep(0)  # A registers in _putters
+    await asyncio.sleep(0)  # A registers in putters
     c = asyncio.create_task(put_c())
-    await asyncio.sleep(0)  # C registers in _putters
-    assert len(ch._putters) == 2
+    await asyncio.sleep(0)  # C registers in putters
+    assert ch._inner.putters_len() == 2
 
     # Consumer takes the buffered item; this pops putter A's entry and
     # queues fut.set_result for A.
@@ -536,10 +537,10 @@ async def test_getter_cancel_forwards_wakeup_to_next_getter() -> None:
         recv_done.append(await ch.recv())
 
     a = asyncio.create_task(recv_a())
-    await asyncio.sleep(0)  # A registers in _getters
+    await asyncio.sleep(0)  # A registers in getters
     b = asyncio.create_task(recv_b())
-    await asyncio.sleep(0)  # B registers in _getters
-    assert len(ch._getters) == 2
+    await asyncio.sleep(0)  # B registers in getters
+    assert ch._inner.getters_len() == 2
 
     # Sender puts an item; this pops getter A's entry and queues
     # set_result for A.
@@ -623,8 +624,8 @@ async def test_select_channel_deadline_contention_retry() -> None:
         await select_channel(ch1, ch2, timeout=0.05)
     elapsed = time.monotonic() - start
     assert 0.04 <= elapsed < 0.5, f"Timeout took {elapsed}s, expected ~0.05s"
-    assert len(ch1._getters) == 0 and len(ch1._notifiers) == 0
-    assert len(ch2._getters) == 0 and len(ch2._notifiers) == 0
+    assert ch1._inner.getters_len() == 0 and ch1._inner.notifiers_len() == 0
+    assert ch2._inner.getters_len() == 0 and ch2._inner.notifiers_len() == 0
 
 
 @pytest.mark.asyncio
@@ -730,14 +731,14 @@ async def test_fastchannel_cancellation_storm() -> None:
 
     tasks = [asyncio.create_task(getter()) for _ in range(500)]
     await asyncio.sleep(0.01)
-    assert len(ch._getters) == 500
+    assert ch._inner.getters_len() == 500
 
     for t in tasks:
         t.cancel()
 
     await asyncio.gather(*tasks, return_exceptions=True)
     assert cancelled_count == 500
-    assert len(ch._getters) == 0
+    assert ch._inner.getters_len() == 0
 
     # Normal recv/send works without leftover corruption
     await ch.send("post_storm")
@@ -761,16 +762,16 @@ async def test_select_channel_cancellation_storm() -> None:
 
     tasks = [asyncio.create_task(select_watcher()) for _ in range(200)]
     await asyncio.sleep(0.01)
-    assert len(ch1._notifiers) == 200
-    assert len(ch2._notifiers) == 200
+    assert ch1._inner.notifiers_len() == 200
+    assert ch2._inner.notifiers_len() == 200
 
     for t in tasks:
         t.cancel()
 
     await asyncio.gather(*tasks, return_exceptions=True)
     assert cancelled_count == 200
-    assert len(ch1._notifiers) == 0
-    assert len(ch2._notifiers) == 0
+    assert ch1._inner.notifiers_len() == 0
+    assert ch2._inner.notifiers_len() == 0
 
     # Send an item and select immediately works
     await ch1.send("healthy")
@@ -795,7 +796,7 @@ async def test_fastchannel_anti_barging_fifo() -> None:
     t2 = asyncio.create_task(queued_receiver(2))
     t3 = asyncio.create_task(queued_receiver(3))
     await wait_all_tasks_blocked()
-    assert len(ch._getters) == 3
+    assert ch._inner.getters_len() == 3
 
     # Send 3 items in sequence
     for i in range(1, 4):
@@ -813,7 +814,7 @@ async def test_fastchannel_anti_barging_try_recv_rejection_when_getters_queued()
     # Queue an async getter
     recv_task = asyncio.create_task(ch.recv())
     await wait_all_tasks_blocked()
-    assert len(ch._getters) == 1
+    assert ch._inner.getters_len() == 1
 
     # Send item into channel
     ch.try_send("queued_item")
@@ -836,7 +837,7 @@ async def test_fastchannel_anti_barging_try_send_rejection_when_putters_queued()
     # Queue an async putter
     put_task = asyncio.create_task(ch.send("item2"))
     await wait_all_tasks_blocked()
-    assert len(ch._putters) == 1
+    assert ch._inner.putters_len() == 1
 
     # Concurrent try_send must be rejected due to anti-barging gate
     assert ch.try_send("barge_item") is False
@@ -855,7 +856,7 @@ async def test_channel_none_payload_cancellation_preservation() -> None:
     # 1. Receiver 1 starts waiting
     recv_task1 = asyncio.create_task(ch.recv())
     await wait_all_tasks_blocked()
-    assert len(ch._getters) == 1
+    assert ch._inner.getters_len() == 1
 
     # 2. Cancel receiver 1 and immediately send None
     recv_task1.cancel()
@@ -1306,14 +1307,14 @@ async def test_select_channel_caller_cancel_cleans_up() -> None:
     sel = asyncio.create_task(select_channel(ch))
     await wait_all_tasks_blocked()
     await asyncio.sleep(0)
-    assert len(ch._notifiers) == 1
+    assert ch._inner.notifiers_len() == 1
 
     sel.cancel()
     with pytest.raises(asyncio.CancelledError):
         await sel
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    assert len(ch._notifiers) == 0
+    assert ch._inner.notifiers_len() == 0
 
 
 @pytest.mark.asyncio
@@ -1438,3 +1439,174 @@ async def test_send_sync_fifo_with_async_putters() -> None:
     th.join(timeout=1.0)
     await t1
     await t3
+
+
+@pytest.mark.asyncio
+async def test_channel_occupied_protects_inflight_putter_forwarding_and_try_send() -> None:
+    """In-flight putter reservations and cancellation forwarding must block try_send() barging."""
+    ch = Channel(maxsize=2)
+    assert ch.try_send("a") is True
+    assert ch.try_send("b") is True
+
+    p1 = asyncio.create_task(ch.send("p1"))
+    p2 = asyncio.create_task(ch.send("p2"))
+    await wait_all_tasks_blocked()
+    assert ch._inner.putters_len() == 2
+
+    # Consuming "a" wakes p1 into in_flight_putters; capacity remains occupied (1 buffered + 1 in-flight).
+    assert ch.try_recv() == "a"
+    assert ch.full() is True
+    assert ch.try_send("barge_before_cancel") is False
+
+    # Cancelling p1 forwards the in-flight slot reservation to p2 without exposing a free slot.
+    p1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await p1
+
+    assert ch.full() is True
+    assert ch.try_send("barge_after_forward") is False
+
+    await asyncio.wait_for(p2, timeout=1.0)
+    assert ch.qsize() == 2
+    assert ch.try_send("overflow") is False
+    assert await ch.recv() == "b"
+    assert await ch.recv() == "p2"
+
+
+@pytest.mark.asyncio
+async def test_channel_claim_put_respects_occupied_over_inflight_reservations() -> None:
+    """claim_put must check occupied() rather than buffer.len() so maxsize is never exceeded."""
+    # Case 1: in-flight getter occupies the sole slot of maxsize=1 while buffer is empty.
+    ch1 = Channel(maxsize=1)
+    g1 = asyncio.create_task(ch1.recv())
+    await wait_all_tasks_blocked()
+
+    assert ch1.try_send("only") is True
+    assert ch1.qsize() == 0
+    assert ch1.full() is True
+    assert ch1.try_send("barge") is False
+    assert ch1._inner.claim_put("overflow", 999_999) is False
+
+    g1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await g1
+    assert ch1.qsize() == 1
+    assert await ch1.recv() == "only"
+    assert ch1.empty() is True
+
+    # Case 2: in-flight getter + in-flight putter occupy both slots of maxsize=2 while buffer is empty.
+    ch2 = Channel(maxsize=2)
+    g2_loop = asyncio.new_event_loop()
+    try:
+        g2_fut = g2_loop.create_future()
+        gid, fast_item = ch2._inner.register_getter_ticket(g2_loop, g2_fut)
+        assert gid > 0 and fast_item is None
+
+        # Hold "first" deterministically in in_flight_getters on the un-ticked g2_loop.
+        assert ch2.try_send("first") is True
+        assert ch2.try_send("second") is True
+        p2 = asyncio.create_task(ch2.send("third"))
+        await wait_all_tasks_blocked()
+
+        # Pop "second" from buffer -> wakes p2 into in_flight_putters; buffer is now empty, occupied == 2.
+        assert ch2.try_recv() == "second"
+        assert ch2.qsize() == 0
+        assert ch2.full() is True
+        assert ch2.try_send("barge") is False
+        assert ch2._inner.claim_put("overflow", 999_999) is False
+
+        # Cancel g2 -> "first" returns to buffer; p2 completes -> "third" enters buffer (total 2 == maxsize).
+        assert ch2._inner.cancel_getter(gid) is True
+        await asyncio.wait_for(p2, timeout=1.0)
+        assert ch2.qsize() == 2
+        assert await ch2.recv() == "first"
+        assert await ch2.recv() == "third"
+    finally:
+        g2_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_channel_inflight_putter_cancel_chain_blocks_try_send_until_empty() -> None:
+    """Chained putter cancellations keep slots reserved until no putters remain."""
+    ch = Channel(maxsize=1)
+    assert ch.try_send("init") is True
+
+    p1 = asyncio.create_task(ch.send("v1"))
+    p2 = asyncio.create_task(ch.send("v2"))
+    await wait_all_tasks_blocked()
+
+    assert ch.try_recv() == "init"
+    assert ch.try_send("barge_1") is False
+
+    p1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await p1
+    assert ch.try_send("barge_2") is False
+
+    p2.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await p2
+
+    # Only after both reservations are cancelled can an external try_send succeed.
+    assert ch.full() is False
+    assert ch.try_send("final") is True
+    assert await ch.recv() == "final"
+
+
+@pytest.mark.asyncio
+@pytest.mark.free_threading
+async def test_channel_occupied_boundary_multithread_cancel_and_try_send_race() -> None:
+    """Stress bounded maxsize invariant under concurrent send/recv/try_send/send_sync/cancel."""
+    maxsize = 3
+    ch = Channel(maxsize=maxsize)
+    total_target = 120
+    received: list[int] = []
+    recv_lock = threading.Lock()
+    sent_count = 0
+    sent_lock = threading.Lock()
+    max_observed_qsize = 0
+
+    def next_seq() -> int:
+        nonlocal sent_count
+        with sent_lock:
+            val = sent_count
+            sent_count += 1
+            return val
+
+    async with EventLoopThreadPool(num_threads=4) as pool:
+
+        async def async_producer(rounds: int) -> None:
+            nonlocal max_observed_qsize
+            for i in range(rounds):
+                q = ch.qsize()
+                if q > max_observed_qsize:
+                    max_observed_qsize = q
+                assert q <= maxsize
+                if i % 3 == 0:
+                    val = next_seq()
+                    while not ch.try_send(val):
+                        await asyncio.sleep(0)
+                elif i % 3 == 1:
+                    val = next_seq()
+                    try:
+                        await ch.send(val, timeout=0.002)
+                    except TimeoutError:
+                        # Retry with unbounded send so total sent stays accounted for.
+                        await ch.send(val)
+                else:
+                    val = next_seq()
+                    await ch.send(val)
+
+        async def consumer(count: int) -> None:
+            for _ in range(count):
+                item = await ch.recv()
+                with recv_lock:
+                    received.append(item)
+
+        producers = [pool.submit(async_producer, 30) for _ in range(4)]
+        consumers = [pool.submit(consumer, 30) for _ in range(4)]
+        await asyncio.gather(*producers, *consumers)
+
+    assert max_observed_qsize <= maxsize
+    assert ch.qsize() == 0
+    assert sorted(received) == list(range(total_target))

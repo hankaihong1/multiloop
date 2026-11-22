@@ -5,6 +5,7 @@ pub mod metrics;
 pub mod pool;
 pub mod rwlock;
 pub mod sync;
+pub(crate) mod timeout;
 pub mod waiter;
 pub mod waitgroup;
 

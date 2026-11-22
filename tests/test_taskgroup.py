@@ -6,8 +6,8 @@ from typing import Any
 
 import pytest
 
-from multiloop import Event, current_effective_deadline, sleep
-from multiloop._taskgroup import TaskGroup, TaskHandle, TaskStatus, _TaskStatus, _TGState
+from multiloop import Event, TaskState, current_effective_deadline, sleep
+from multiloop._taskgroup import TaskGroup, TaskHandle, TaskStatus, _TGState
 
 
 async def _worker(value: Any) -> Any:
@@ -46,9 +46,9 @@ async def test_all_succeed() -> None:
     assert await h1 == 1
     assert await h2 == 2
     assert await h3 == 3
-    assert h1.status == _TaskStatus.FINISHED
-    assert h2.status == _TaskStatus.FINISHED
-    assert h3.status == _TaskStatus.FINISHED
+    assert h1.status == TaskState.FINISHED
+    assert h2.status == TaskState.FINISHED
+    assert h3.status == TaskState.FINISHED
 
 
 # ---------------------------------------------------------------------------
@@ -72,13 +72,14 @@ async def test_one_fails_cancels_others() -> None:
 
     # h1 has the ValueError.
     assert h1 is not None
-    assert h1.status == _TaskStatus.FINISHED
+    assert h1.status == TaskState.FINISHED
     assert isinstance(h1.exception, ValueError)
 
     # h2 should have been cancelled by the sibling-cancel.
     assert h2 is not None
-    assert h2.status == _TaskStatus.FINISHED
-    assert isinstance(h2.exception, asyncio.CancelledError)
+    assert h2.status == TaskState.FINISHED
+    with pytest.raises(asyncio.CancelledError):
+        _ = h2.exception
 
 
 # ---------------------------------------------------------------------------
@@ -129,9 +130,9 @@ async def test_start_with_task_status() -> None:
         handle = await tg.start(child)
         # By the time start() returns, started() has been called.
         assert started_flag is True
-        assert handle.status == _TaskStatus.STARTED
+        assert handle.status == TaskState.STARTED
 
-    assert handle.status == _TaskStatus.FINISHED
+    assert handle.status == TaskState.FINISHED
     assert handle.result == "done"
 
 
@@ -155,7 +156,8 @@ async def test_cancelled_children_filtered() -> None:
     # The slow task was cancelled by sibling-cancel — that CancelledError
     # is filtered and should NOT be in the raised exception.
     assert h_slow is not None
-    assert isinstance(h_slow.exception, asyncio.CancelledError)
+    with pytest.raises(asyncio.CancelledError):
+        _ = h_slow.exception
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +296,7 @@ async def test_cancel_all_concurrent_start_soon() -> None:
         try:
             for _ in range(500):
                 tg.cancel_all()
-        except BaseException as e:  # noqa: BLE001
+        except BaseException as e:
             errors.append(e)
         finally:
             stop.set()
@@ -793,7 +795,7 @@ async def test_taskgroup_cross_loop_start_status() -> None:
         TaskGroup(pool=pool) as tg,
     ):
         handle = await tg.start(init_worker, 5)
-        assert handle.status in (_TaskStatus.STARTED, _TaskStatus.FINISHED)
+        assert handle.status in (TaskState.STARTED, TaskState.FINISHED)
         res = await handle
         assert res == 50
 
@@ -842,7 +844,7 @@ async def test_taskgroup_cross_loop_concurrent_start_safety() -> None:
     ):
         handles = await asyncio.gather(*(tg.start(worker, i) for i in range(10)))
         for handle in handles:
-            assert handle.status in (_TaskStatus.STARTED, _TaskStatus.FINISHED)
+            assert handle.status in (TaskState.STARTED, TaskState.FINISHED)
         results = await asyncio.gather(*handles)
         assert results == [i * 2 for i in range(10)]
 
@@ -1064,3 +1066,69 @@ async def test_taskgroup_limiter_cancel_closes_unstepped_coro() -> None:
 
         coro_warnings = [w for w in recorded if "never awaited" in str(w.message)]
         assert len(coro_warnings) == 0
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_pool_externally_cancelled_child_is_silent() -> None:
+    """External fut.cancel() on a TaskGroup(pool=pool) child must not fail the group or cancel siblings."""
+    from multiloop.pool import EventLoopThreadPool
+
+    sibling_finished = False
+    child_started = threading.Event()
+    child_cancelled = threading.Event()
+
+    async def slow_child() -> None:
+        child_started.set()
+        try:
+            await sleep(10.0)
+        except asyncio.CancelledError:
+            child_cancelled.set()
+            raise
+
+    async def ok_sibling() -> int:
+        nonlocal sibling_finished
+        await sleep(0.05)
+        sibling_finished = True
+        return 42
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        async with TaskGroup(pool=pool) as tg:
+            h_cancel = tg.start_soon(slow_child)
+            h_ok = tg.start_soon(ok_sibling)
+            await asyncio.to_thread(child_started.wait, 2.0)
+            assert child_started.is_set()
+            h_cancel._task.cancel()
+
+        assert sibling_finished is True
+        assert await h_ok == 42
+        assert h_cancel._task.cancelled() is True
+        await asyncio.to_thread(child_cancelled.wait, 2.0)
+        assert child_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_pool_child_manual_cancelled_error_propagates() -> None:
+    """A TaskGroup(pool=pool) child that manually raises CancelledError triggers sibling cancel and propagates."""
+    from multiloop.pool import EventLoopThreadPool
+
+    sibling_cancelled = threading.Event()
+
+    async def manual_cancel_child() -> None:
+        await asyncio.sleep(0.01)
+        raise asyncio.CancelledError()
+
+    async def slow_sibling() -> None:
+        try:
+            await sleep(10.0)
+        except asyncio.CancelledError:
+            sibling_cancelled.set()
+            raise
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        with pytest.raises(asyncio.CancelledError):
+            async with TaskGroup(pool=pool) as tg:
+                tg.start_soon(manual_cancel_child)
+                tg.start_soon(slow_sibling)
+
+        await asyncio.to_thread(sibling_cancelled.wait, 2.0)
+        assert sibling_cancelled.is_set()

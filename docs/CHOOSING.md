@@ -33,12 +33,12 @@
 | Wait until a group of tasks all finish | `AsyncWaitGroup` | Go `sync.WaitGroup` semantics, cross-thread |
 | Run exactly-once initialization (singleton) | `AsyncOnce` | Concurrency-safe, runs once, shares result |
 | Read-mostly shared state | `AsyncRWMutex` | `async with rw.reader():` parallel readers, `async with rw.writer():` exclusive |
-| Structured concurrency: children always reaped | `TaskGroup` (`tg.start_soon()` + `TaskHandle`) | All children guaranteed finished when leaving the scope |
+| Structured concurrency: children always reaped | `TaskGroup` (`tg.start_soon()` + `TaskHandle` / `TaskState`) | All children guaranteed finished when leaving the scope |
 | Overall deadline, raise on timeout | `fail_after(sec)` / `fail_at(deadline)` | Raises `TimeoutError` on expiry |
 | Overall deadline, exit silently on timeout | `move_on_after(sec)` / `move_on_at(deadline)` | Exits silently; check `scope.cancelled_caught` |
 | Fine-grained cancellation (manual / shielded) | `CancelScope(deadline=..., shield=...)` | Pure Rust task cancel stack (three exit modes); `shield` blocks parent scope cancellation |
-| Sleep honoring `CancelScope` cancellation | `sleep(delay)` | Zero-overhead Route 3 cancellable sleep (`multiloop.sleep`) |
-| Bridge foreign asyncio awaitables into `CancelScope` | `wait_cancellable(coro)` | Wraps `asyncio.sleep` / 3rd-party coroutines for immediate Route 3 cancellation |
+| Sleep honoring `CancelScope` cancellation | `sleep(delay)` | Zero-overhead cancellable sleep (`multiloop.sleep`) |
+| Bridge foreign asyncio awaitables into `CancelScope` | `wait_cancellable(coro)` | Wraps `asyncio.sleep` / 3rd-party coroutines for immediate `CancelScope` cancellation |
 | Periodically check cancellation in a long loop | `checkpoint()` | Level-triggered cancellation checkpoint without altering `task.cancelling()` |
 | Query the tightest effective deadline | `current_effective_deadline()` | Shield truncates outer deadlines |
 | Cross-thread cascading cancellation / timeout broadcast | `AsyncContext` | Tree-propagated cancellation |
@@ -67,7 +67,7 @@
 - **`TaskGroup`** — exits `async with` only after all children finish; a
   failing child cancels the rest and failures aggregate into
   `BaseExceptionGroup`.
-- **`CancelScope`** — Route 3 pure Rust task cancel stack (`RawTaskCancelState`)
+- **`CancelScope`** — pure Rust task cancel stack (`RawTaskCancelState`)
   never mutating CPython `task.cancelling()`; supports `shield=True`, strict
   three-mode exit (`PLAIN` / `MOVE_ON` / `FAIL_AFTER`), `sleep()`, and
   `wait_cancellable()` (`fail_after`/`move_on_after` are convenience wrappers).

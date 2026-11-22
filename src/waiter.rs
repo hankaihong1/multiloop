@@ -107,18 +107,6 @@ pub fn _complete_waiter(
     }
 }
 
-/// Backwards compatibility alias for _complete_waiter.
-#[pyfunction]
-#[pyo3(signature = (fut, val = None, is_exc = false))]
-pub fn _complete_waiter_future(
-    py: Python<'_>,
-    fut: &Bound<'_, PyAny>,
-    val: Option<Bound<'_, PyAny>>,
-    is_exc: bool,
-) {
-    _complete_waiter(py, fut, val, is_exc)
-}
-
 #[inline]
 pub fn get_complete_waiter_fn(py: Python<'_>) -> &Bound<'_, PyAny> {
     COMPLETE_WAITER_FN

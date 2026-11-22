@@ -32,7 +32,7 @@ test-slow:
 	uv run --no-sync pytest -m slow -o addopts=""
 
 bench:
-	for f in benchmarks/benchmark_pull_model.py benchmarks/bench_multithread_loops.py; do \
+	set -e; for f in benchmarks/benchmark_pull_model.py benchmarks/bench_multithread_loops.py; do \
 		uv run --no-sync python "$$f"; \
 	done
 

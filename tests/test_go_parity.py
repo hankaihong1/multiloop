@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from contextlib import suppress
 
 import pytest
 
@@ -9,6 +10,8 @@ from multiloop import (
     AsyncWaitGroup,
     EventLoopThreadPool,
 )
+from multiloop._cancel import _task_token
+from multiloop.testing import wait_all_tasks_blocked
 
 
 @pytest.mark.asyncio
@@ -187,14 +190,17 @@ async def test_waitgroup_cancelled_wait_unregisters() -> None:
     wg = AsyncWaitGroup()
     wg.add(1)
     tasks = [asyncio.create_task(wg.wait()) for _ in range(5)]
-    await asyncio.sleep(0)
+    await wait_all_tasks_blocked()
+    assert wg._inner.waiter_count() == 5
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+    assert all(t.cancelled() for t in tasks)
 
-    waiters = wg._inner.done()  # returns the handed-over waiter list
-    n = len(waiters) if waiters else 0
+    n = wg._inner.waiter_count()
     assert n == 0, f"{n} stale waiter entries left after cancellation"
+    wg.done()
+    assert wg._inner.is_zero()
 
 
 # ---------------------------------------------------------------------------
@@ -538,29 +544,220 @@ async def test_rwmutex_cancelled_waiter_preserves_holder_and_grants() -> None:
 async def test_writer_cancel_wakes_blocked_readers() -> None:
     """Cancelling a pending writer immediately wakes readers queued behind it."""
     rw = AsyncRWMutex()
-    reader_done = asyncio.Event()
+    t1_acquired = asyncio.Event()
+    t1_release = asyncio.Event()
+    t3_acquired = asyncio.Event()
 
-    async def reader(done: asyncio.Event) -> None:
+    async def holder_reader() -> None:
         async with rw.reader():
-            done.set()
+            t1_acquired.set()
+            await t1_release.wait()
 
-    async def writer_stuck() -> None:
-        try:
-            async with rw.writer():
-                await asyncio.Event().wait()
-        except asyncio.CancelledError:
+    async def pending_writer() -> None:
+        async with rw.writer():
             pass
 
-    t1 = asyncio.create_task(reader(asyncio.Event()))
-    await asyncio.sleep(0.05)
-    t2 = asyncio.create_task(writer_stuck())
-    await asyncio.sleep(0.05)
-    t3 = asyncio.create_task(reader(reader_done))
-    await asyncio.sleep(0.05)
+    async def blocked_reader() -> None:
+        async with rw.reader():
+            t3_acquired.set()
 
-    t2.cancel()
-    await asyncio.wait_for(reader_done.wait(), timeout=1.0)
-    await asyncio.gather(t1, t2, t3, return_exceptions=True)
+    t1 = asyncio.create_task(holder_reader())
+    t2: asyncio.Task[None] | None = None
+    t3: asyncio.Task[None] | None = None
+    try:
+        await t1_acquired.wait()
+
+        t2 = asyncio.create_task(pending_writer())
+        await wait_all_tasks_blocked()
+        assert rw._pending_writers == 1
+
+        t3 = asyncio.create_task(blocked_reader())
+        await wait_all_tasks_blocked()
+        assert not t3.done()
+        assert not t3_acquired.is_set()
+
+        t2.cancel()
+        with suppress(asyncio.CancelledError):
+            await t2
+        assert t2.cancelled()
+        assert rw._pending_writers == 0
+        assert rw._readers == 2
+        assert not t1.done()
+
+        await asyncio.wait_for(t3, timeout=0.5)
+        assert t3_acquired.is_set()
+        assert rw._readers == 1
+    finally:
+        t1_release.set()
+        for task in (t2, t3):
+            if task is not None and not task.done():
+                task.cancel()
+        tasks = [task for task in (t1, t2, t3) if task is not None]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=1.0,
+            )
+        except TimeoutError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    assert rw._readers == 0
+
+
+@pytest.mark.asyncio
+async def test_writer_cancel_multiple_writers_and_blocked_readers() -> None:
+    """Cancelling multiple queued writers keeps readers blocked until the last writer cancels, then admits all blocked readers and blocks subsequent writers until all release."""
+    rw = AsyncRWMutex()
+    holder_acquired = asyncio.Event()
+    holder_release = asyncio.Event()
+    promoted_release = asyncio.Event()
+    r_acquired = [asyncio.Event() for _ in range(3)]
+    w3_acquired = asyncio.Event()
+
+    async def holder_reader() -> None:
+        async with rw.reader():
+            holder_acquired.set()
+            await holder_release.wait()
+
+    async def pending_writer() -> None:
+        async with rw.writer():
+            pass
+
+    async def blocked_reader(idx: int) -> None:
+        async with rw.reader():
+            r_acquired[idx].set()
+            await promoted_release.wait()
+
+    async def subsequent_writer() -> None:
+        async with rw.writer():
+            w3_acquired.set()
+
+    holder = asyncio.create_task(holder_reader())
+    w1: asyncio.Task[None] | None = None
+    w2: asyncio.Task[None] | None = None
+    w3: asyncio.Task[None] | None = None
+    readers: list[asyncio.Task[None]] = []
+    try:
+        await holder_acquired.wait()
+
+        w1 = asyncio.create_task(pending_writer())
+        w2 = asyncio.create_task(pending_writer())
+        await wait_all_tasks_blocked()
+        assert rw._pending_writers == 2
+
+        readers = [asyncio.create_task(blocked_reader(i)) for i in range(3)]
+        await wait_all_tasks_blocked()
+        assert all(not ev.is_set() for ev in r_acquired)
+        assert rw._readers == 1
+
+        # Cancelling w1 while w2 remains queued preserves writer preference.
+        w1.cancel()
+        with suppress(asyncio.CancelledError):
+            await w1
+        assert w1.cancelled()
+        assert rw._pending_writers == 1
+        assert rw._readers == 1
+        await wait_all_tasks_blocked()
+        assert all(not ev.is_set() for ev in r_acquired)
+
+        # Cancelling the last queued writer promotes all 3 blocked readers concurrently.
+        w2.cancel()
+        with suppress(asyncio.CancelledError):
+            await w2
+        assert w2.cancelled()
+        assert rw._pending_writers == 0
+        assert rw._readers == 4
+
+        await asyncio.wait_for(
+            asyncio.gather(*(ev.wait() for ev in r_acquired)),
+            timeout=0.5,
+        )
+        assert rw._readers == 4
+        assert not rw._writer
+        assert rw._raw.woken_tickets_len() == 0
+
+        # Subsequent writer must wait until holder and all promoted readers release.
+        w3 = asyncio.create_task(subsequent_writer())
+        await wait_all_tasks_blocked()
+        assert rw._pending_writers == 1
+        assert not w3_acquired.is_set()
+
+        holder_release.set()
+        await asyncio.wait_for(holder, timeout=0.5)
+        assert rw._readers == 3
+        await wait_all_tasks_blocked()
+        assert not w3_acquired.is_set()
+        assert not w3.done()
+
+        promoted_release.set()
+        await asyncio.wait_for(asyncio.gather(*readers, w3), timeout=0.5)
+        assert w3_acquired.is_set()
+        assert rw._readers == 0
+        assert not rw._writer
+        assert rw._pending_writers == 0
+    finally:
+        holder_release.set()
+        promoted_release.set()
+        all_tasks = [t for t in (holder, w1, w2, w3, *readers) if t is not None]
+        for task in all_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*all_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_rwmutex_writer_cancel_closed_loop_reader_rollback() -> None:
+    """Closed-loop blocked reader promoted by writer cancellation rolls back cleanly."""
+    rw = AsyncRWMutex()
+    loop = asyncio.get_running_loop()
+    dead_loop = asyncio.new_event_loop()
+    dead_fut = dead_loop.create_future()
+    live_acquired = asyncio.Event()
+    live_release = asyncio.Event()
+
+    async def live_reader() -> None:
+        async with rw.reader():
+            live_acquired.set()
+            await live_release.wait()
+
+    live_task: asyncio.Task[None] | None = None
+    try:
+        async with rw.reader():
+            w_fut: asyncio.Future[None] = loop.create_future()
+            w_ticket = rw._raw.acquire_write_ticket(777_001, loop, w_fut)
+            assert w_ticket is not None
+
+            dead_r_ticket = rw._raw.acquire_read_ticket(777_002, dead_loop, dead_fut)
+            assert dead_r_ticket is not None
+
+            live_task = asyncio.create_task(live_reader())
+            await wait_all_tasks_blocked()
+            assert not live_acquired.is_set()
+            assert rw._readers == 1
+
+            dead_loop.close()
+            rw._raw.cancel_write_ticket(777_001, w_ticket)
+
+            await asyncio.wait_for(live_acquired.wait(), timeout=0.5)
+            assert rw._readers == 2
+
+        assert rw._readers == 1
+        live_release.set()
+        await asyncio.wait_for(live_task, timeout=0.5)
+        assert rw._readers == 0
+
+        async with asyncio.timeout(0.5), rw.writer():
+            assert rw._writer
+    finally:
+        live_release.set()
+        if not dead_loop.is_closed():
+            dead_loop.close()
+        if live_task is not None and not live_task.done():
+            live_task.cancel()
+        if live_task is not None:
+            await asyncio.gather(live_task, return_exceptions=True)
 
 
 def test_rwmutex_foreign_task_release_raises() -> None:
@@ -666,17 +863,81 @@ async def test_rwmutex_stale_ticket_cancel_idempotency() -> None:
     """Stale ticket_id cancellation does not release AsyncRWMutex held by the same task."""
     task = asyncio.current_task()
     assert task is not None
-    task_id = id(task)
+    task_token = _task_token(task)
 
     rw = AsyncRWMutex()
     async with rw.writer():
         assert rw._writer
-        rw._raw.cancel_write_ticket(task_id, 999_999)
+        rw._raw.cancel_write_ticket(task_token, 999_999)
         assert rw._writer
     assert not rw._writer
 
     async with rw.reader():
         assert rw._readers == 1
-        rw._raw.cancel_read_ticket(task_id, 999_999)
+        rw._raw.cancel_read_ticket(task_token, 999_999)
         assert rw._readers == 1
     assert rw._readers == 0
+
+    loop = asyncio.get_running_loop()
+
+    # Real stale write ticket from a prior contended acquisition must not release current write lock.
+    r_held = asyncio.Event()
+    r_release = asyncio.Event()
+
+    async def holder_reader() -> None:
+        async with rw.reader():
+            r_held.set()
+            await r_release.wait()
+
+    r_task = asyncio.create_task(holder_reader())
+    try:
+        await r_held.wait()
+        w_fut: asyncio.Future[None] = loop.create_future()
+        stale_write_ticket = rw._raw.acquire_write_ticket(task_token, loop, w_fut)
+        assert stale_write_ticket is not None
+        r_release.set()
+        await w_fut
+        assert rw._writer
+        rw._raw.release_write_task(task_token)
+        assert not rw._writer
+
+        async with rw.writer():
+            assert rw._writer
+            rw._raw.cancel_write_ticket(task_token, stale_write_ticket)
+            assert rw._writer
+        assert not rw._writer
+    finally:
+        r_release.set()
+        if not r_task.done():
+            r_task.cancel()
+        await asyncio.gather(r_task, return_exceptions=True)
+
+    # Already-claimed read ticket cancellation must not drop current reader ownership.
+    w_held = asyncio.Event()
+    w_release = asyncio.Event()
+
+    async def holder_writer() -> None:
+        async with rw.writer():
+            w_held.set()
+            await w_release.wait()
+
+    w_task = asyncio.create_task(holder_writer())
+    try:
+        await w_held.wait()
+        r_fut: asyncio.Future[None] = loop.create_future()
+        read_ticket = rw._raw.acquire_read_ticket(task_token, loop, r_fut)
+        assert read_ticket is not None
+        w_release.set()
+        await r_fut
+        rw._raw.claim_read_ticket(read_ticket)
+        assert rw._readers == 1
+
+        rw._raw.cancel_read_ticket(task_token, read_ticket)
+        assert rw._readers == 1
+        rw._raw.release_read_task(task_token)
+        assert rw._readers == 0
+    finally:
+        w_release.set()
+        if not w_task.done():
+            w_task.cancel()
+        await asyncio.gather(w_task, return_exceptions=True)

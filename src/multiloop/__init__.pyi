@@ -38,6 +38,7 @@ __all__ = [
     "SendChannel",
     "TaskGroup",
     "TaskHandle",
+    "TaskState",
     "TaskStatus",
     "ThreadPoolClosedError",
     "TimeoutError",
@@ -372,9 +373,9 @@ class Barrier:
     def abort(self) -> None: ...
     def reset(self) -> None: ...
 
-# -- TaskGroup / TaskHandle / TaskStatus ----------------------------------
+# -- TaskGroup / TaskHandle / TaskState / TaskStatus -----------------------
 
-class _TaskStatus(enum.Enum):
+class TaskState(enum.Enum):
     PENDING = ...
     STARTED = ...
     FINISHED = ...
@@ -385,7 +386,7 @@ class TaskStatus:
 
 class TaskHandle:
     @property
-    def status(self) -> _TaskStatus: ...
+    def status(self) -> TaskState: ...
     @property
     def result(self) -> Any: ...
     @property

@@ -1,12 +1,14 @@
 use parking_lot::{Condvar, Mutex, RwLock};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
+use pyo3::pyclass::{PyTraverseError, PyVisit};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::errors::pool_closed_err;
 use crate::metrics::AtomicMetrics;
+use crate::timeout::deadline_from_secs;
 
 /// RAII guard that decrements an `AtomicUsize` counter on drop.
 /// Used to ensure `num_polling` is always decremented even if a panic
@@ -155,11 +157,23 @@ impl NativeWorkerPool {
     }
 
     pub fn complete_task(&self) {
-        let prev = self.outstanding_tasks.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(prev >= 1, "outstanding_tasks underflow");
-        if prev == 1 {
-            let _guard = self.drain_mutex.lock();
-            self.drain_condvar.notify_all();
+        let mut cur = self.outstanding_tasks.load(Ordering::Acquire);
+        while cur > 0 {
+            match self.outstanding_tasks.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if cur == 1 {
+                        let _guard = self.drain_mutex.lock();
+                        self.drain_condvar.notify_all();
+                    }
+                    return;
+                }
+                Err(actual) => cur = actual,
+            }
         }
     }
 
@@ -167,27 +181,34 @@ impl NativeWorkerPool {
         self.outstanding_tasks.load(Ordering::Acquire)
     }
 
-    pub fn wait_drained(&self, py: Python<'_>, timeout_secs: f64) -> bool {
+    pub fn wait_drained(&self, py: Python<'_>, timeout_secs: f64) -> PyResult<bool> {
+        let deadline = deadline_from_secs(timeout_secs)?;
         if self.outstanding_tasks.load(Ordering::Acquire) == 0 && self.is_drained() {
-            return true;
+            return Ok(true);
         }
         if timeout_secs <= 0.0 {
-            return false;
+            return Ok(false);
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs);
-        py.detach(|| {
+        Ok(py.detach(|| {
             let mut guard = self.drain_mutex.lock();
             loop {
                 if self.outstanding_tasks.load(Ordering::Acquire) == 0 && self.is_drained() {
                     return true;
                 }
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    return false;
+                match deadline {
+                    Some(dl) => {
+                        let now = std::time::Instant::now();
+                        if now >= dl {
+                            return false;
+                        }
+                        self.drain_condvar.wait_for(&mut guard, dl - now);
+                    }
+                    None => {
+                        self.drain_condvar.wait(&mut guard);
+                    }
                 }
-                self.drain_condvar.wait_for(&mut guard, deadline - now);
             }
-        })
+        }))
     }
 
     pub fn drain_all(&self, _py: Python<'_>) -> Vec<Py<PyAny>> {
@@ -484,5 +505,58 @@ impl NativeWorkerPool {
             }
             return Ok(None);
         }
+    }
+
+    pub fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        for buf in &self.buffers {
+            let Some(guard) = buf.try_lock() else {
+                return Ok(());
+            };
+            for item in &*guard {
+                visit.call(item)?;
+            }
+        }
+        let Some(metrics_guard) = self.metrics.try_read() else {
+            return Ok(());
+        };
+        if let Some(ref metrics) = *metrics_guard {
+            visit.call(metrics)?;
+        }
+        Ok(())
+    }
+
+    pub fn __clear__(&self) {
+        let mut global_guard = self.global_sender.lock();
+        let dropped_global_sender = global_guard.take();
+        drop(global_guard);
+
+        let mut local_guard = self.local_senders.lock();
+        let dropped_local_senders = std::mem::take(&mut *local_guard);
+        drop(local_guard);
+
+        self.is_closed.store(true, Ordering::Release);
+
+        let mut drained = Vec::new();
+        while let Ok(task) = self.global_receiver.try_recv() {
+            drained.push(task);
+        }
+        for buf in &self.buffers {
+            let mut guard = buf.lock();
+            drained.extend(guard.drain(..));
+            drop(guard);
+        }
+        for rx in &self.local_receivers {
+            while let Ok(task) = rx.try_recv() {
+                drained.push(task);
+            }
+        }
+        let mut metrics_guard = self.metrics.write();
+        let dropped_metrics = metrics_guard.take();
+        drop(metrics_guard);
+
+        drop(dropped_global_sender);
+        drop(dropped_local_senders);
+        drop(drained);
+        drop(dropped_metrics);
     }
 }

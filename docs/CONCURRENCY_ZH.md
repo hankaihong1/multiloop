@@ -22,7 +22,7 @@ multiloop 运行在 **Python 3.14t（自由线程 / 无 GIL）多核物理真并
 1. **Python 3.14t 自由线程（无 GIL）真并行假设**：字节码与对象读写在多核 CPU 上真并行执行，无全局解释器锁保护。任何涉及跨线程复合状态的操作（如计数器增减 + 等待者队列出入队）收敛在单一 Rust `parking_lot::Mutex` 临界区内，杜绝复合锁竞争撕裂与双轨制脑裂。
 2. **跨线程 EventLoop 物理隔离与不透明句柄公理**：`asyncio.Task`、`Future`、`Event` 与 `TimerHandle` 严格物理绑定于单一 OS 线程及其 EventLoop。Rust 核心绝不跨线程调用 `.done()`，也绝不在持有 `parking_lot::Mutex` 期间调用任何 Python 方法；跨线程唤醒一律在锁外通过 `loop.call_soon_threadsafe(...)` 派发。
 3. **ContextVar 线程/任务局部性公理**：`contextvars.ContextVar` 严格归属于当前 OS 线程与当前 Task。跨线程取消（`scope.cancel()`）严禁跨线程读取 ContextVar 栈，仅依赖线程互斥锁与 `call_soon_threadsafe`。
-4. **路线 3 纯 Rust 任务取消栈（`RawTaskCancelState`）公理**：`CancelScope`、`fail_after`/`fail_at`、`move_on_after`/`move_on_at`、`sleep`、`wait_cancellable` 与 `checkpoint` 在每任务的 Rust `RawTaskCancelState` 栈上运行（通过 `_TASK_CANCEL_STATES` `WeakKeyDictionary` 绑定任务弱引用），**全程绝不调用 `task.cancel()`、`task.uncancel()` 或读写修改 `task.cancelling()`**。等待点经 `_await_cancellable`（`park_waiter` / `unpark_waiter`）订阅取消，外部协程经 `wait_cancellable()` 桥接，`shield=True` 屏蔽外层 `CancelScope` 截止时间与取消，`__aexit__` 严格执行三模式退出规则（`PLAIN` 抛 `CancelledError`、`MOVE_ON` 静默吸收并置 `cancelled_caught=True`、`FAIL_AFTER` 转换为 `TimeoutError`）。
+4. **纯 Rust 任务取消栈（`RawTaskCancelState`）公理**：`CancelScope`、`fail_after`/`fail_at`、`move_on_after`/`move_on_at`、`sleep`、`wait_cancellable` 与 `checkpoint` 在每任务的 Rust `RawTaskCancelState` 栈上运行（直接存储在任务的 `_multiloop_cancel_state` 属性上，仅对只含 `__slots__` 的任务代理由 `_FALLBACK_STATES` `WeakKeyDictionary` 兜底），**全程绝不调用 `task.cancel()`、`task.uncancel()` 或读写修改 `task.cancelling()`**。等待点经 `_await_cancellable`（`park_waiter` / `unpark_waiter`）订阅取消，外部协程经 `wait_cancellable()` 桥接，`shield=True` 屏蔽外层 `CancelScope` 截止时间与取消，`__aexit__` 严格执行三模式退出规则（`PLAIN` 抛 `CancelledError`、`MOVE_ON` 静默吸收并置 `cancelled_caught=True`、`FAIL_AFTER` 转换为 `TimeoutError`）。
 5. **统一票据等待者协议与防插队 FIFO 公理**：所有 Rust 同步原语统一分配单调递增的 `WaiterId (u64)` 票据（`src/waiter.rs`），严禁使用裸指针地址（`fut.as_ptr()`）作身份标识，彻底根除内存地址复用引发的 ABA 误删；通道（`RawAsyncChannel`）通过 `in_flight_putters` 预留名额机制严格维护 FIFO 防插队不变量与令牌守恒。
 6. **结构化并发物理作用域公理**：`TaskGroup` 的宿主上下文及派生调用（`start_soon` / `start`）物理绑定于宿主 `asyncio.AbstractEventLoop`，并关联宿主 `CancelScope`，当子任务异常崩溃或调用 `cancel_all()` 时立即中断阻塞在 `async with TaskGroup()` 块内的宿主协程。传入 `TaskGroup(pool=pool)` 时，子任务通过独立子 `CancelScope` 分发至 `EventLoopThreadPool` 各工作线程 Loop 执行，并在退出时经屏蔽栅栏安全排空；跨 Loop 消息传递与级联取消同时由 `Channel` 与 `AsyncContext` 协同编排。
 
@@ -65,7 +65,7 @@ multiloop 运行在 **Python 3.14t（自由线程 / 无 GIL）多核物理真并
 
 | 组件 | 机制 | 关键点 |
 |---|---|---|
-| `CancelScope` | 路线 3 Rust `RawTaskCancelState` 栈（`_TASK_CANCEL_STATES` `WeakKeyDictionary`）+ `_await_cancellable`（`park_waiter` / `unpark_waiter`） | 零修改 CPython `task.cancel()` / `uncancel()` / `cancelling()`；`shield=True` 屏蔽外层 `CancelScope` 并保持外部 CPython `task.cancelling()` 原封不动；严格三模式退出（`PLAIN` / `MOVE_ON` / `FAIL_AFTER`）；`sleep()` 与 `wait_cancellable()` 提供路线 3 可取消挂起（`_cancel.py`, `src/cancel.rs`） |
+| `CancelScope` | 纯 Rust `RawTaskCancelState` 栈（任务直接属性 `_multiloop_cancel_state`，仅只含 `__slots__` 的任务代理走 `_FALLBACK_STATES` `WeakKeyDictionary`）+ `_await_cancellable`（`park_waiter` / `unpark_waiter`） | 零修改 CPython `task.cancel()` / `uncancel()` / `cancelling()`；`shield=True` 屏蔽外层 `CancelScope` 并保持外部 CPython `task.cancelling()` 原封不动；严格三模式退出（`PLAIN` / `MOVE_ON` / `FAIL_AFTER`）；`sleep()` 与 `wait_cancellable()` 提供可取消挂起（`_cancel.py`, `src/cancel.rs`） |
 | `TaskGroup` | `_TGState` 枚举（`IDLE`..`FAILED`）+ `_CancelReason` 枚举 + `_children_lock`（`threading.Lock`）+ 每子任务独立 `CancelScope`（本地与池统一）+ `_wake_fut`（`_await_cancellable`） | 宿主上下文与派生调用绑定于 `self._loop`；本地与 `pool=pool` 子任务统一通过子 `CancelScope` 级联取消；`_wait_children` 在 `CancelScope(shield=True)` 内排空并保留外部 CPython `host_task.cancelling()`（`_taskgroup.py`） |
 | `select_channel` | 两阶段仲裁器（Phase 1 轮询起始索引快速 `try_recv`，Phase 2 基于 `WaiterId` 票据与 `weakref.ref(ch)` 的 `register_select_watcher_ticket`） | 通过 `_await_cancellable(loop, arbiter_fut)` 零引用环报告就绪；赢家通过 `try_recv()` 消费并在 `finally` 中调用 `cancel_select_watcher` 切除所有 `WaiterId` watcher 票据（`primitives.py`, `src/channel.rs`） |
 
@@ -98,9 +98,8 @@ multiloop 运行在 **Python 3.14t（自由线程 / 无 GIL）多核物理真并
 
 **症状**：发送方成功入队后唤醒一个"已经不存在"的接收者，或接收方注册
 future 时数据已经被取走，future 永远没人 resolve → 挂死。
-**根因**：无锁快路径（`try_send`/`try_recv`）与加锁的 waiter 列表是两个
-不同的状态面，快路径赢过慢路径时唤醒信号丢失。
-**正确姿势**：快路径尝试后，**在锁内再检查一次**才注册 future；注册与
+**根因**：非阻塞快路径（`try_send`/`try_recv` 或 `is_set()`/`is_zero()`）与加锁的 waiter 注册是两步独立操作；当并发状态跃迁在快路径与注册之间胜出时，唤醒信号丢失。
+**正确姿势**：快路径尝试后，**在 `parking_lot::Mutex` 锁内原子二次校验**后再注册 future；注册与
 唤醒目标提取都在同一把 `parking_lot::Mutex` 下完成，并在释放锁后调用 `call_soon_threadsafe`。
 **例证**：`RawAsyncChannel::send_or_register` / `register_getter_ticket`（`src/channel.rs`）、
 `Channel.send` / `Channel.recv`（`primitives.py`）。
@@ -176,27 +175,23 @@ O(n²)（而 `Barrier::cancel_waiter` 在首个取消到达时 O(n) 置破本轮
 
 **症状**：由于违反各组件特定的 API 契约或并发边界，导致运行时报错、死锁、饿死或限流失效。
 
-**1. `AsyncWaitGroup.track` 协程对象误传给 Callable 接收方**：
-- **陷阱**：`wg.track(coro)` 在调用瞬间即执行 `self.add(1)`，并返回包裹了 `finally: self.done()` 的协程对象（Coroutine Object）。若误传给期望 Callable 的 `TaskGroup.start_soon`，会引发 `TypeError` 并导致计数器永久泄漏与死锁。
+**1. `AsyncWaitGroup.track` 未 await 协程泄漏与 `wrap` 延迟递增**：
+- **陷阱**：`wg.track(coro)` 在调用点**立即**执行 `wg.add(1)`，并返回在 `try/finally`（或 `.close()`）中调用 `wg.done()` 的追踪协程包装器。若创建了 `wg.track(worker())` 却既不 `await`、也不传给 `tg.start_soon(...)` / `pool.submit(...)` 或手动 `.close()`，会导致计数器永久泄漏（GC 时发出 `RuntimeWarning`）。相反，`wg.wrap(fn)` 在子任务实际启动执行时才延迟调用 `wg.add(1)`，若子任务尚未步进就立即 `await wg.wait()` 则可能发生竞态。
 - **错误示例**：
 ```python
 async def worker():
     pass
 
 
-async with TaskGroup() as tg:
-    wg = AsyncWaitGroup()
-    tg.start_soon(wg.track(worker()))  # TypeError! 计数器永久泄漏!
+wg = AsyncWaitGroup()
+tracked = wg.track(worker())  # add(1) 已立即执行；丢弃 `tracked` 会导致计数器永久泄漏！
 ```
-- **正确姿势**：
+- **正确姿势**：直接将 `wg.track(worker())` 传给 `tg.start_soon(...)` 或 `pool.submit(...)`（两者均接受协程对象，且在未启动即取消时会自动 `.close()`），或直接 `await wg.track(worker())`：
 ```python
 async with TaskGroup() as tg:
     wg = AsyncWaitGroup()
-
-    async def tracked_worker():
-        await wg.track(worker())
-
-    tg.start_soon(tracked_worker)
+    tg.start_soon(wg.track(worker()))  # add(1) happens-before wait()；done() 在 finally 中执行
+    await wg.wait()
 ```
 
 **2. `select_channel` 线程局部轮询索引假设陷阱（无位置优先级与步调共振混叠）**：
@@ -239,14 +234,14 @@ if limiter.available_tokens > 0:  # 例如 0.5 > 0
 ```
 - **正确姿势**：统一推荐 `async with limiter:` 上下文管理器；使用 `limiter.available_capacity >= 1`（或 `available_tokens >= 1.0`）确保可立即无阻借出。
 
-**5. 在路线 3 `CancelScope` / `TaskGroup` / `AsyncContext` 中裸用 `asyncio.*` 阻塞原语**：
-- **陷阱**：路线 3 `CancelScope` 不修改 CPython `task.cancel()`，因此裸用 `asyncio.sleep(...)`、`asyncio.Event().wait()`、`asyncio.Queue().get()`、`asyncio.wait_for(...)` / `asyncio.gather(...)`（会创建游离于外层取消栈之外的子 `Task`），以及未经桥接的 `await pool.submit(...)`，都会无视作用域取消与截止时间。
+**5. 在 `CancelScope` / `TaskGroup` / `AsyncContext` 中裸用 `asyncio.*` 阻塞原语**：
+- **陷阱**：`CancelScope` 不修改 CPython `task.cancel()`，因此裸用 `asyncio.sleep(...)`、`asyncio.Event().wait()`、`asyncio.Queue().get()`、`asyncio.wait_for(...)` / `asyncio.gather(...)`（会创建游离于外层取消栈之外的子 `Task`），以及未经桥接的 `await pool.submit(...)`，都会无视作用域取消与截止时间。
 - **错误示例**：
 ```python
 async with fail_after(0.1):
-    await asyncio.sleep(10)  # 会卡住 10s；路线 3 不会唤醒 asyncio.sleep
+    await asyncio.sleep(10)  # 会卡住 10s；CancelScope 不会唤醒 asyncio.sleep
 ```
-- **正确姿势**：优先使用支持路线 3 订阅的 `multiloop` 原语（`multiloop.sleep(...)`、`fail_after(...)`、`TaskGroup`、`multiloop.Event`、`Channel`、`run_in_pool(...)`），遇到第三方或标准库 awaitable / 原始 `Future` 时用 `wait_cancellable(...)` 包装桥接。
+- **正确姿势**：直接使用支持 `CancelScope` 订阅的 `multiloop` 原语（`multiloop.sleep(...)`、`fail_after(...)`、`TaskGroup`、`multiloop.Event`、`Channel`、`run_in_pool(...)`），遇到第三方或标准库 awaitable / 原始 `Future` 时用 `wait_cancellable(...)` 包装桥接。
 
 ---
 
@@ -256,7 +251,7 @@ async with fail_after(0.1):
 前，逐条核对；任何一条不满足，先想清楚再动手。**
 
 - [ ] 改动是否新增/修改 **waiter 注册或唤醒路径**？→ 过模式 2/4：注册与
-      唤醒是否在同一把锁下？是否有锁外快路径+锁内双检？
+      唤醒是否在同一把锁下？是否有非阻塞快路径+锁内原子二次校验？
 - [ ] 改动是否触及 **取消/超时路径**？→ 过模式 3/5：清理路径的 await
       是否在 shield 或吸收取消的重试循环内？waiter 删除是否带 generation/`WaiterId` 票据校验？
 - [ ] 改动是否让 **asyncio 对象跨线程**？→ 过模式 7：跨线程只允许
@@ -285,7 +280,7 @@ async with fail_after(0.1):
 | `RawAsyncWaitGroup` | 任意线程可 add/done/register | 单 `parking_lot::Mutex<WaitGroupInner>` 状态机与 `WaiterId` 票据；`done()` 锁内排空等待者并在锁外经 `wake_waiter_outside_lock` 唤醒（`src/waitgroup.rs`, `src/waiter.rs`, `primitives.py`） |
 | `RawAsyncRWMutex` | 任意线程可获取/释放 reader/writer | 写者优先 `parking_lot::Mutex<RWMutexInner>` 状态机、`WaiterId` 票据与锁外唤醒（`src/rwlock.rs`） |
 | `RawAsyncLock` / `Semaphore` / `Event` / `Condition` / `Barrier` / `CapacityLimiter` / `Once` | 任意线程可 acquire/release/notify/wait | 统一 Rust 状态机（`src/sync.rs`），基于 `parking_lot::Mutex`、`WaiterId (u64)` 票据与锁外唤醒（`src/waiter.rs`） |
-| `RawTaskCancelState` | 任意线程可 `cancel_scope` / 查询；宿主任务压栈/弹栈/挂起 | 路线 3 纯 Rust 任务取消栈，在 `parking_lot::Mutex<CancelStateInner>` 下维护并在锁外唤醒 `WaiterEntry`（`src/cancel.rs`, `_cancel.py`） |
+| `RawTaskCancelState` | 任意线程可 `cancel_scope` / 查询；宿主任务压栈/弹栈/挂起 | 纯 Rust 任务取消栈，在 `parking_lot::Mutex<TaskCancelInner>` 下维护并配 `AtomicBool` / `AtomicU64` 快读缓存，在锁外唤醒挂起的 `WaiterEntry`（`src/cancel.rs`, `_cancel.py`） |
 | `AtomicMetrics` | 任意线程可记录/读取 | 单 worker 独立 64 字节填充原子计数器，避免伪共享（`src/metrics.rs`） |
 
 ### 4.2 软 poller 门（`num_polling`）
@@ -312,9 +307,9 @@ async with fail_after(0.1):
   false sharing。**加新计数器时保持 64 字节对齐**，否则多核下吞吐会
   莫名下降（`src/metrics.rs:6-7`）。
 - 已确立的序约定，新代码沿用：
-  - `is_closed`：`Release` store / `Acquire` load（flag 模式，`src/pool.rs:138, 146`）
-  - `idle_mask`：`Release` 位更新（`fetch_or`/`fetch_and`）/ `Acquire` load（`src/pool.rs:78-104`）
-  - `num_polling`、`rr_index` 与 `AtomicMetrics` 各计数器：`Relaxed`（`src/pool.rs:29, 103, 277`, `src/metrics.rs`）
+  - `is_closed` 与 `RawTaskCancelState` 快读缓存（`effectively_cancelled`、`effective_deadline_bits`、`parked_id`）：`Release` store / `Acquire` load（`src/pool.rs`, `src/cancel.rs`）
+  - `idle_mask`：`Release` 位更新（`fetch_or`/`fetch_and`）/ `Acquire` load 与 `AcqRel` CAS（`src/pool.rs:78-114`）
+  - `num_polling` 与 `AtomicMetrics` 各计数器：`Relaxed`（`src/pool.rs`, `src/metrics.rs`）
 - flume 是 lock-free 但**不是零成本**：跨线程 send/recv 仍有原子操作与
   内存栅栏。性能敏感路径不要假设"无锁=免费"。
 
@@ -344,7 +339,7 @@ uv run pytest --lf
 
 | marker | 用途 | CI 行为 |
 |---|---|---|
-| `slow` | 性能测试 | 默认跳过（`addopts = -m "not slow"`） |
+| `slow` | 性能测试（`tests/test_perf_regression.py`） | 默认跳过（`addopts = -m "not slow"`）；通过 `pytest -m slow` 运行 |
 | `free_threading` | 3.14t 自由线程压测 | 仅在 free-threaded 构建的 job 跑 |
 | `repeat(n)` | 声明需要重复跑 | 与 `--count` 配合 |
 
@@ -353,8 +348,7 @@ uv run pytest --lf
 
 ### 5.3 测试辅助设施（`tests/conftest.py`）
 
-- `skip_if_no_rust`：Rust 扩展未编译时跳过（本地没跑 `make develop` 也能
-  跑纯 Python 部分）。
+- 运行时必须编译加载 `_multiloop_core`：所有原语均由 Rust 支撑（不存在纯 Python 回退；运行测试前需先执行 `make develop`；`multiloop.testing.rust_available()` 可检查 `_multiloop_core` 是否已编译）。
 - `yielder` fixture → `wait_all_tasks_blocked()`：等所有任务阻塞后再断言，
   消除"还没开始就断言"的时序假阳性。
 

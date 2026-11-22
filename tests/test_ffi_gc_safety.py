@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import math
 import threading
 import weakref
 from typing import Any
@@ -19,6 +20,7 @@ from multiloop import (
     CancelScope,
     CapacityLimiter,
     Channel,
+    ChannelClosedError,
     Condition,
     Event,
     EventLoopThreadPool,
@@ -37,9 +39,10 @@ from multiloop import (
     sleep,
 )
 from multiloop._metrics import MetricsCollector
-from multiloop._sync import BarrierWaitResult, _WaiterView
+from multiloop._multiloop_core import NativeWorkerPool
+from multiloop._sync import BarrierWaitResult
 from multiloop.pool import _PoolWorkItem
-from multiloop.primitives import _LenShim, _TrackedCoroutine
+from multiloop.primitives import _TrackedCoroutine
 
 
 class _ReentrantDelPayload:
@@ -336,7 +339,6 @@ async def test_all_core_classes_use_slots() -> None:
     read_guard = rw.reader()
     write_guard = rw.writer()
     wg_guard = wg.holding()
-    waiter_view = _WaiterView(lock._raw)
     bar_res = BarrierWaitResult(0, 1)
 
     instances: list[object] = [
@@ -346,7 +348,6 @@ async def test_all_core_classes_use_slots() -> None:
         ch,
         SendChannel(ch),
         ReceiveChannel(ch),
-        _LenShim(lambda: 0),
         wg,
         wg_guard,
         tracked,
@@ -361,7 +362,6 @@ async def test_all_core_classes_use_slots() -> None:
         cond,
         bar,
         bar_res,
-        waiter_view,
         scope,
         tg,
         handle,
@@ -534,7 +534,7 @@ def test_multithread_5000_rounds_zero_garbage_convergence() -> None:
                         asyncio.run(
                             _run_storm_rounds(pool, tid * rounds_per_thread, rounds_per_thread)
                         )
-                    except BaseException as exc:  # noqa: BLE001
+                    except BaseException as exc:
                         errors.append(exc)
 
                 for tid in range(num_threads):
@@ -545,7 +545,7 @@ def test_multithread_5000_rounds_zero_garbage_convergence() -> None:
                     await asyncio.to_thread(t.join)
 
         asyncio.run(_main_storm())
-    except BaseException as exc:  # noqa: BLE001
+    except BaseException as exc:
         errors.append(exc)
 
     assert not errors, f"Multi-thread storm raised errors: {errors}"
@@ -555,3 +555,294 @@ def test_multithread_5000_rounds_zero_garbage_convergence() -> None:
     assert after_objects - baseline_objects < 500, (
         f"Tracked GC objects drifted excessively: baseline={baseline_objects}, after={after_objects}"
     )
+
+
+@pytest.mark.asyncio
+async def test_async_once_failed_do_releases_self_and_args_no_leak() -> None:
+    """Failed AsyncOnce.do() does not leak self or argument objects via stored traceback frames."""
+
+    class _TrackedArg:
+        __slots__ = ("__weakref__", "tag")
+
+        def __init__(self, tag: str) -> None:
+            self.tag = tag
+
+    def _failing_sync(arg: _TrackedArg) -> None:
+        raise RuntimeError(f"boom:{arg.tag}")
+
+    once = AsyncOnce()
+    tracked_arg = _TrackedArg("sync")
+    w_once = weakref.ref(once)
+    w_arg = weakref.ref(tracked_arg)
+
+    with pytest.raises(RuntimeError, match="boom:sync"):
+        await once.do(_failing_sync, tracked_arg)
+
+    # Even while `once` stays alive, the argument is not pinned by stored traceback frames
+    del tracked_arg
+    gc.collect()
+    gc.collect()
+    assert w_arg() is None
+
+    del once
+    gc.collect()
+    gc.collect()
+    assert w_once() is None
+
+    # Also verify async coroutine failure and cancelled-leader failure do not pin args/once
+    async def _failing_coro(arg: _TrackedArg) -> None:
+        await asyncio.sleep(0)
+        raise ValueError(f"async:{arg.tag}")
+
+    once_async = AsyncOnce()
+    tracked_async = _TrackedArg("async")
+    w_once_async = weakref.ref(once_async)
+    w_arg_async = weakref.ref(tracked_async)
+
+    with pytest.raises(ValueError, match="async:async"):
+        await once_async.do(_failing_coro, tracked_async)
+
+    del once_async, tracked_async
+    gc.collect()
+    gc.collect()
+    assert w_once_async() is None
+    assert w_arg_async() is None
+
+    once_cancel = AsyncOnce()
+    tracked_cancel = _TrackedArg("cancel")
+    started = asyncio.Event()
+    w_once_cancel = weakref.ref(once_cancel)
+    w_arg_cancel = weakref.ref(tracked_cancel)
+
+    async def _cancellable_fn(_arg: _TrackedArg) -> None:
+        started.set()
+        await asyncio.sleep(10.0)
+
+    task = asyncio.create_task(once_cancel.do(_cancellable_fn, tracked_cancel))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    del task, once_cancel, tracked_cancel
+    await asyncio.sleep(0)
+    gc.collect()
+    gc.collect()
+    assert w_once_cancel() is None
+    assert w_arg_cancel() is None
+
+
+@pytest.mark.asyncio
+async def test_async_once_failed_custom_two_arg_exception_preserves_attrs() -> None:
+    """Custom exceptions whose __init__ differs from self.args clone cleanly across all callers."""
+
+    class CustomError(Exception):
+        def __init__(self, code: int, msg: str) -> None:
+            super().__init__(msg)
+            self.code = code
+
+    once = AsyncOnce()
+    started = asyncio.Event()
+
+    async def _fail_custom() -> None:
+        started.set()
+        await asyncio.sleep(0.02)
+        raise CustomError(42, "boom")
+
+    leader = asyncio.create_task(once.do(_fail_custom))
+    await started.wait()
+    follower = asyncio.create_task(once.do(_fail_custom))
+
+    with pytest.raises(CustomError) as exc1:
+        await leader
+    assert exc1.value.code == 42
+    assert str(exc1.value) == "boom"
+
+    with pytest.raises(CustomError) as exc2:
+        await follower
+    assert exc2.value.code == 42
+    assert str(exc2.value) == "boom"
+    assert exc2.value is not exc1.value
+
+    with pytest.raises(CustomError) as exc3:
+        await once.do(_fail_custom)
+    assert exc3.value.code == 42
+    assert str(exc3.value) == "boom"
+    assert exc3.value is not exc2.value
+
+
+def test_cyclic_ffi_primitives_collected() -> None:
+    """Self-referential Channel, Lock, and AsyncWaitGroup cycles are reclaimed by gc.collect()."""
+
+    class _CyclicOwner:
+        __slots__ = ("__weakref__", "ref")
+
+        def __init__(self, ref: Any) -> None:
+            self.ref = ref
+
+        def done(self) -> bool:
+            return False
+
+    def _build_self_ref_channel() -> weakref.ref[Channel]:
+        ch = Channel(maxsize=1)
+        ch.try_send(ch)
+        return weakref.ref(ch)
+
+    def _build_cyclic_lock() -> weakref.ref[Lock]:
+        lock = Lock()
+        owner = _CyclicOwner(lock)
+        assert lock._raw.try_acquire(1, 1, weakref.ref(owner))
+        loop = asyncio.new_event_loop()
+        try:
+            fut = loop.create_future()
+            fut.add_done_callback(lambda _f, _lock=lock, _owner=owner: None)
+            ticket = lock._raw.acquire_or_register(2, 1, weakref.ref(owner), loop, fut)
+            assert ticket is not None
+        finally:
+            loop.close()
+        return weakref.ref(lock)
+
+    def _build_cyclic_waitgroup() -> weakref.ref[_CyclicOwner]:
+        wg = AsyncWaitGroup()
+        wg.add(1)
+        dummy = _CyclicOwner(wg)
+        ticket = wg._inner.register_waiter_ticket(dummy, dummy)
+        assert ticket is not None
+        return weakref.ref(dummy)
+
+    w_ch = _build_self_ref_channel()
+    w_lock = _build_cyclic_lock()
+    w_wg = _build_cyclic_waitgroup()
+
+    gc.collect()
+    gc.collect()
+    assert w_ch() is None
+    assert w_lock() is None
+    assert w_wg() is None
+
+
+def test_uncancelled_child_async_context_gc_and_active_cancel() -> None:
+    """Uncancelled child AsyncContexts do not leak in parent._children, while live children still cancel."""
+    parent = AsyncContext()
+    child_refs: list[weakref.ref[AsyncContext]] = []
+    for _ in range(20):
+        child = AsyncContext(parent=parent)
+        child_refs.append(weakref.ref(child))
+        del child
+
+    gc.collect()
+    gc.collect()
+    assert all(ref() is None for ref in child_refs)
+    assert len(parent._children) == 0
+
+    live_child = AsyncContext(parent=parent)
+    live_ref = weakref.ref(live_child)
+    assert len(parent._children) == 1
+    assert not live_child.is_cancelled
+
+    parent.cancel()
+    assert live_child.is_cancelled
+    assert len(parent._children) == 0
+
+    del live_child
+    gc.collect()
+    assert live_ref() is None
+
+
+def test_sync_timeouts_nan_and_infinite() -> None:
+    """NaN timeouts raise ValueError and huge/infinite timeouts work cleanly on sync FFI boundaries."""
+    # 1. Channel.send_sync
+    ch_tx = Channel(maxsize=1)
+    ch_tx.try_send("occupy")
+    with pytest.raises(ValueError):
+        ch_tx.send_sync("nan_item", timeout=math.nan)
+
+    t1 = threading.Timer(0.02, ch_tx.try_recv)
+    t1.start()
+    try:
+        ch_tx.send_sync("inf_item", timeout=math.inf)
+    finally:
+        t1.join(timeout=2.0)
+        assert not t1.is_alive()
+
+    t2 = threading.Timer(0.02, ch_tx.try_recv)
+    t2.start()
+    try:
+        ch_tx.send_sync("huge_item", timeout=1e20)
+    finally:
+        t2.join(timeout=2.0)
+        assert not t2.is_alive()
+    assert ch_tx.try_recv() == "huge_item"
+
+    # 2. Channel.recv_sync
+    ch_rx = Channel(maxsize=1)
+    with pytest.raises(ValueError):
+        ch_rx.recv_sync(timeout=math.nan)
+
+    t3 = threading.Timer(0.02, lambda: ch_rx.try_send("from_inf"))
+    t3.start()
+    try:
+        assert ch_rx.recv_sync(timeout=math.inf) == "from_inf"
+    finally:
+        t3.join(timeout=2.0)
+        assert not t3.is_alive()
+
+    t4 = threading.Timer(0.02, lambda: ch_rx.try_send("from_huge"))
+    t4.start()
+    try:
+        assert ch_rx.recv_sync(timeout=1e20) == "from_huge"
+    finally:
+        t4.join(timeout=2.0)
+        assert not t4.is_alive()
+
+    t5 = threading.Timer(0.02, ch_rx.close)
+    t5.start()
+    try:
+        with pytest.raises(ChannelClosedError):
+            ch_rx.recv_sync(timeout=math.inf)
+    finally:
+        t5.join(timeout=2.0)
+        assert not t5.is_alive()
+
+    # 3. NativeWorkerPool.wait_drained
+    np = NativeWorkerPool(1)
+    assert np.wait_drained(math.inf) is True
+
+    np.push_global("pending_1")
+    with pytest.raises(ValueError):
+        np.wait_drained(math.nan)
+
+    def _drain_one() -> None:
+        np.pop_work(0)
+        np.complete_task()
+
+    t6 = threading.Timer(0.02, _drain_one)
+    t6.start()
+    try:
+        assert np.wait_drained(math.inf) is True
+    finally:
+        t6.join(timeout=2.0)
+        assert not t6.is_alive()
+
+    np.push_global("pending_2")
+    t7 = threading.Timer(0.02, _drain_one)
+    t7.start()
+    try:
+        assert np.wait_drained(1e20) is True
+    finally:
+        t7.join(timeout=2.0)
+        assert not t7.is_alive()
+
+
+def test_capacity_limiter_non_finite_raises_value_error() -> None:
+    """CapacityLimiter rejects non-finite total_tokens with ValueError (never OverflowError)."""
+    with pytest.raises(ValueError):
+        CapacityLimiter(math.inf)
+    with pytest.raises(ValueError):
+        CapacityLimiter(math.nan)
+
+    limiter = CapacityLimiter(2)
+    with pytest.raises(ValueError):
+        limiter.total_tokens = math.inf
+    with pytest.raises(ValueError):
+        limiter.total_tokens = math.nan
+    assert limiter.total_tokens == 2.0

@@ -1,6 +1,8 @@
 import asyncio
+import gc
 import threading
 import time
+from typing import Any
 
 import pytest
 
@@ -110,7 +112,7 @@ async def test_checkpoint_noop_no_scope() -> None:
 
 @pytest.mark.asyncio
 async def test_checkpoint_raises_when_cancelled() -> None:
-    """checkpoint() raises CancelledError under Route 3 without touching task.cancelling()."""
+    """checkpoint() raises CancelledError under the Rust task cancel stack (RawTaskCancelState) without touching task.cancelling()."""
     task = asyncio.current_task()
     assert task is not None
     with pytest.raises(asyncio.CancelledError):
@@ -379,7 +381,7 @@ async def test_async_context_cancel_survives_dead_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Route 3 contracts & regression checks
+# Rust task cancel stack (RawTaskCancelState) contracts & regression checks
 # ---------------------------------------------------------------------------
 
 
@@ -432,7 +434,7 @@ async def test_cancel_scope_cannot_share_across_tasks() -> None:
         try:
             async with scope:
                 await sleep(0.3)
-        except BaseException as e:  # noqa: BLE001
+        except BaseException as e:
             results["a"] = type(e).__name__
 
     async def enter_b() -> None:
@@ -440,7 +442,7 @@ async def test_cancel_scope_cannot_share_across_tasks() -> None:
         try:
             async with scope:
                 await sleep(0.3)
-        except BaseException as e:  # noqa: BLE001
+        except BaseException as e:
             results["b"] = type(e).__name__
 
     ta = asyncio.create_task(enter_a())
@@ -635,7 +637,7 @@ async def test_precancelled_move_on_body_raises_no_count_leak() -> None:
 
 @pytest.mark.asyncio
 async def test_checkpoint_consumes_pending_cancel() -> None:
-    """Route 3 level-triggered checkpoint(): raises CancelledError repeatedly while cancelled without touching task.cancelling()."""
+    """Level-triggered checkpoint() under the Rust task cancel stack (RawTaskCancelState): raises CancelledError repeatedly while cancelled without touching task.cancelling()."""
     task = asyncio.current_task()
     assert task is not None
     with pytest.raises(asyncio.CancelledError):
@@ -772,7 +774,7 @@ async def test_cancel_scope_cross_thread_post_scope_delivery_guard() -> None:
 
 @pytest.mark.asyncio
 async def test_shield_restores_outer_cancellation_on_exit() -> None:
-    """Route 3: shield blocks outer CancelScope while leaving task.cancelling() untouched; its own expired deadline still raises."""
+    """Rust task cancel stack (RawTaskCancelState): shield blocks outer CancelScope while leaving task.cancelling() untouched; its own expired deadline still raises."""
     task = asyncio.current_task()
     assert task is not None
 
@@ -803,7 +805,7 @@ async def test_shield_restores_outer_cancellation_on_exit() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Route 3: pure Rust stack contract tests (PLAIN / MOVE_ON / FAIL_AFTER)
+# Rust task cancel stack (RawTaskCancelState) contract tests (PLAIN / MOVE_ON / FAIL_AFTER)
 # ---------------------------------------------------------------------------
 
 
@@ -826,7 +828,7 @@ async def test_shield_restores_outer_cancellation_on_exit() -> None:
     ],
 )
 async def test_cancel_scope_route3_exit_contracts(trigger_mode: str, external_cancels: int) -> None:
-    """Verify Route 3 CancelScope/shield/checkpoint never mutate task.cancelling() and follow PLAIN/MOVE_ON/FAIL_AFTER exit rules."""
+    """Verify Rust task cancel stack (RawTaskCancelState) CancelScope/shield/checkpoint never mutate task.cancelling() and follow PLAIN/MOVE_ON/FAIL_AFTER exit rules."""
     task = asyncio.current_task()
     assert task is not None
 
@@ -907,7 +909,7 @@ async def test_cancel_scope_route3_exit_contracts(trigger_mode: str, external_ca
     ],
 )
 async def test_cancel_scope_route3_shield_contracts(boundary_mode: str, outer_cancels: int) -> None:
-    """Boundary parameterized tests for shielded scopes under Route 3."""
+    """Boundary parameterized tests for shielded scopes under the Rust task cancel stack (RawTaskCancelState)."""
     task = asyncio.current_task()
     assert task is not None
 
@@ -1045,7 +1047,7 @@ async def test_wait_cancellable_passthrough_value_and_exception() -> None:
 
 @pytest.mark.asyncio
 async def test_run_in_pool_honors_route3_cancel_scope_and_fail_after() -> None:
-    """run_in_pool must propagate active Route 3 CancelScope/fail_after cancellation and shield cleanup."""
+    """run_in_pool must propagate active Rust task cancel stack (RawTaskCancelState) CancelScope/fail_after cancellation and shield cleanup."""
     task = asyncio.current_task()
     assert task is not None
     shielded_cleanup_ran = False
@@ -1106,7 +1108,7 @@ async def test_task_handle_await_checks_pre_cancelled_scope() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Consolidated AsyncContext lifecycle & Route 3 edge-case tests
+# Consolidated AsyncContext lifecycle & Rust task cancel stack (RawTaskCancelState) edge-case tests
 # ---------------------------------------------------------------------------
 
 
@@ -1302,3 +1304,381 @@ async def test_checkpoint_yields_control() -> None:
     order.append("after")
     await t
     assert order == ["before", "worker", "after"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_scope_cross_thread_deadline_extension_race() -> None:
+    """Stale deadline timer callbacks queued before cross-thread deadline extension must not cancel or clobber."""
+    loop = asyncio.get_running_loop()
+
+    # Case 1: Stale timer callback already queued in loop._ready before cross-thread extension runs
+    async with fail_after(0.05) as scope:
+        stale_gen = scope._deadline_gen
+        new_deadline = loop.time() + 5.0
+        loop.call_soon(scope._on_deadline_timer, stale_gen)
+
+        def extend_deadline() -> None:
+            scope.deadline = new_deadline
+
+        th = threading.Thread(target=extend_deadline, daemon=True)
+        th.start()
+        th.join(timeout=1.0)
+
+        await sleep(0.08)
+        assert not scope.cancel_called
+        assert scope._deadline_handle is not None
+
+        # Case 2: Stale callback firing AFTER new handle is installed must not clobber _deadline_handle
+        new_handle = scope._deadline_handle
+        scope._on_deadline_timer(stale_gen)
+        assert scope._deadline_handle is new_handle
+        assert not scope.cancel_called
+
+
+@pytest.mark.asyncio
+async def test_move_on_after_concurrent_external_task_cancel() -> None:
+    """Concurrent external task.cancel() must propagate through move_on_after even if scope also cancelled."""
+    entered = asyncio.Event()
+    scope_box: list[CancelScope] = []
+
+    async def worker_both() -> None:
+        async with move_on_after(60.0) as scope:
+            scope_box.append(scope)
+            entered.set()
+            await sleep(10.0)
+
+    t = asyncio.create_task(worker_both())
+    await entered.wait()
+    await wait_all_tasks_blocked()
+    scope_box[0].cancel()
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(t, timeout=2.0)
+    assert t.cancelled() is True
+    assert scope_box[0].cancelled_caught is False
+
+    # Also verify pre-expired move_on_after does not swallow concurrent task.cancel()
+    expired_scope_box: list[CancelScope] = []
+
+    async def worker_pre_expired() -> None:
+        async with move_on_after(0.0) as scope:
+            expired_scope_box.append(scope)
+            cur = asyncio.current_task()
+            assert cur is not None
+            cur.cancel()
+            await asyncio.sleep(0)
+
+    t2 = asyncio.create_task(worker_pre_expired())
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(t2, timeout=2.0)
+    assert t2.cancelled() is True
+    assert expired_scope_box[0].cancelled_caught is False
+
+
+@pytest.mark.asyncio
+async def test_fail_after_concurrent_external_task_cancel() -> None:
+    """Concurrent external task.cancel() must not be converted into TimeoutError by fail_after."""
+    entered = asyncio.Event()
+    scope_box: list[CancelScope] = []
+
+    async def worker_both() -> None:
+        async with fail_after(60.0) as scope:
+            scope_box.append(scope)
+            entered.set()
+            await sleep(10.0)
+
+    t = asyncio.create_task(worker_both())
+    await entered.wait()
+    await wait_all_tasks_blocked()
+    scope_box[0].cancel()
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(t, timeout=2.0)
+    assert t.cancelled() is True
+
+    # Even if body catches CancelledError on checkpoint, pending external task.cancel() wins over TimeoutError
+    async def worker_caught_inner() -> None:
+        async with fail_after(0.0) as scope:
+            cur = asyncio.current_task()
+            assert cur is not None
+            cur.cancel()
+            try:
+                await checkpoint()
+            except asyncio.CancelledError:
+                pass
+            assert scope.cancel_called
+
+    t2 = asyncio.create_task(worker_caught_inner())
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(t2, timeout=2.0)
+    assert t2.cancelled() is True
+
+
+@pytest.mark.asyncio
+async def test_nested_move_on_and_fail_after_respect_unshielded_outer_cancel() -> None:
+    """Unshielded move_on_after / fail_after inside cancelled outer scope must propagate outer CancelledError."""
+    from multiloop._cancel import MOVE_ON
+
+    after_inner = False
+    inner_move = move_on_after(0.0)
+    with pytest.raises(asyncio.CancelledError):
+        async with CancelScope() as outer:
+            outer.cancel()
+            async with inner_move:
+                await sleep(1.0)
+            after_inner = True
+    assert after_inner is False
+    assert inner_move.cancelled_caught is False
+
+    with pytest.raises(asyncio.CancelledError):
+        async with CancelScope() as outer:
+            outer.cancel()
+            async with fail_after(0.0):
+                await sleep(1.0)
+
+    # Shielded move_on scope CAN catch its own cancellation while outer remains cancelled
+    loop = asyncio.get_running_loop()
+    shielded_after = False
+    with pytest.raises(asyncio.CancelledError):
+        async with CancelScope() as outer:
+            outer.cancel()
+            shielded_move = CancelScope(deadline=loop.time() - 1.0, shield=True)
+            shielded_move._mode = MOVE_ON
+            async with shielded_move:
+                await sleep(1.0)
+            assert shielded_move.cancelled_caught is True
+            shielded_after = True
+    assert shielded_after is True
+
+
+# ---------------------------------------------------------------------------
+# P3.1 / P3.2: Direct task-attribute storage, fallback dict & atomic cache
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_state_attached_directly_to_standard_task() -> None:
+    """Standard asyncio.Task attaches _multiloop_cancel_state directly without fallback dict entries."""
+    from multiloop._cancel import (
+        _FALLBACK_STATES,
+        _TASK_STATE_ATTR,
+        _get_cancel_state,
+        _get_cancel_state_if_any,
+    )
+
+    async def worker() -> None:
+        cur = asyncio.current_task()
+        assert cur is not None
+        assert getattr(cur, _TASK_STATE_ATTR, None) is None
+        assert _get_cancel_state_if_any(cur) is None
+
+        async with CancelScope():
+            state = getattr(cur, _TASK_STATE_ATTR, None)
+            assert state is not None
+            assert _get_cancel_state_if_any(cur) is state
+            assert _get_cancel_state(cur) is state
+            assert cur not in _FALLBACK_STATES
+            assert len(_FALLBACK_STATES) == 0
+
+        # Attached state remains bound for stable task_token across scopes, with empty fallback
+        assert getattr(cur, _TASK_STATE_ATTR, None) is not None
+        assert len(_FALLBACK_STATES) == 0
+
+    await asyncio.create_task(worker())
+    assert len(_FALLBACK_STATES) == 0
+
+
+def test_cancel_state_slots_proxy_task_fallback() -> None:
+    """Slots-only and custom-setattr proxy tasks rejecting setattr fall back cleanly to _FALLBACK_STATES."""
+    from multiloop._cancel import (
+        _FALLBACK_STATES,
+        _TASK_STATE_ATTR,
+        _get_cancel_state,
+        _get_cancel_state_if_any,
+    )
+
+    class _SlotsTaskProxy:
+        __slots__ = ("__weakref__", "name")
+
+        def __init__(self, name: str = "slots") -> None:
+            self.name = name
+
+    class _RejectingSetattrTaskProxy:
+        __slots__ = ("__weakref__",)
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            raise TypeError("immutable proxy task")
+
+    slots_proxy: Any = _SlotsTaskProxy()
+    type_proxy: Any = _RejectingSetattrTaskProxy()
+
+    try:
+        assert _get_cancel_state_if_any(None) is None
+        assert _get_cancel_state_if_any(slots_proxy) is None
+        assert _get_cancel_state_if_any(type_proxy) is None
+
+        s1 = _get_cancel_state(slots_proxy)
+        assert getattr(slots_proxy, _TASK_STATE_ATTR, None) is None
+        assert slots_proxy in _FALLBACK_STATES
+        assert _get_cancel_state_if_any(slots_proxy) is s1
+        assert _get_cancel_state(slots_proxy) is s1
+
+        s2 = _get_cancel_state(type_proxy)
+        assert getattr(type_proxy, _TASK_STATE_ATTR, None) is None
+        assert type_proxy in _FALLBACK_STATES
+        assert _get_cancel_state_if_any(type_proxy) is s2
+        assert _get_cancel_state(type_proxy) is s2
+        assert s1 is not s2
+    finally:
+        del slots_proxy, type_proxy
+        gc.collect()
+
+    assert len(_FALLBACK_STATES) == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_scope_concurrent_shield_toggle_and_cache_consistency() -> None:
+    """Concurrent multi-thread fast-path checks across CancelScope, shield toggling, and checkpoint()."""
+    from multiloop._cancel import (
+        _TASK_STATE_ATTR,
+        _is_current_task_cancelled,
+        _RawTaskCancelState,
+    )
+
+    task = asyncio.current_task()
+    assert task is not None
+
+    # 1. Async task CancelScope + shield toggling + checkpoint() observed from background threads
+    with pytest.raises(asyncio.CancelledError):
+        async with CancelScope() as outer:
+            async with CancelScope(shield=True) as inner:
+                state = getattr(task, _TASK_STATE_ATTR)
+                assert state is not None
+                outer_id = outer._entry_id
+                inner_id = inner._entry_id
+                assert outer_id is not None and inner_id is not None
+
+                stop_readers = threading.Event()
+                reader_errors: list[str] = []
+
+                def bg_observer() -> None:
+                    try:
+                        while not stop_readers.is_set():
+                            val = state.is_effectively_cancelled()
+                            dl = state.effective_deadline()
+                            if not isinstance(val, bool) or not isinstance(dl, float):
+                                reader_errors.append(f"unexpected types: {val!r}, {dl!r}")
+                    except BaseException as exc:
+                        reader_errors.append(f"observer raised: {exc!r}")
+
+                readers = [threading.Thread(target=bg_observer, daemon=True) for _ in range(2)]
+                for r in readers:
+                    r.start()
+
+                try:
+                    # Background thread cancels outer while inner is shielded
+                    canceller = threading.Thread(target=outer.cancel, daemon=True)
+                    canceller.start()
+                    canceller.join(timeout=2.0)
+
+                    # Shielded: cache and checkpoint stay uncancelled
+                    for _ in range(10):
+                        assert not state.is_effectively_cancelled()
+                        assert not inner._effectively_cancelled()
+                        assert not _is_current_task_cancelled()
+                        assert state.is_scope_effectively_cancelled(outer_id)
+                        await checkpoint()
+
+                        # Drop shield -> cache flips True -> checkpoint raises CancelledError
+                        inner.shield = False
+                        assert state.is_effectively_cancelled()
+                        assert inner._effectively_cancelled()
+                        assert _is_current_task_cancelled()
+                        with pytest.raises(asyncio.CancelledError):
+                            await checkpoint()
+
+                        # Re-arm shield -> cache flips False -> checkpoint passes again
+                        inner.shield = True
+                        assert not state.is_effectively_cancelled()
+                        assert not inner._effectively_cancelled()
+                        await checkpoint()
+                finally:
+                    stop_readers.set()
+                    for r in readers:
+                        r.join(timeout=2.0)
+
+                assert reader_errors == []
+
+            # Exited shield while outer is cancelled: cache must immediately be True
+            assert state.is_effectively_cancelled()
+            assert _is_current_task_cancelled()
+
+    # 2. Direct multi-thread RawTaskCancelState stress verifying cache matches protected stack
+    raw = _RawTaskCancelState()
+    stop = threading.Event()
+    errors: list[str] = []
+
+    def stress_reader() -> None:
+        try:
+            while not stop.is_set():
+                cached = raw.is_effectively_cancelled()
+                dl = raw.effective_deadline()
+                if not isinstance(cached, bool):
+                    errors.append(f"non-bool cached: {cached!r}")
+                if dl not in (25.0, 50.0, 100.0, float("inf")):
+                    errors.append(f"unexpected deadline: {dl!r}")
+        except BaseException as exc:
+            errors.append(f"reader error: {exc!r}")
+
+    stress_threads = [threading.Thread(target=stress_reader, daemon=True) for _ in range(3)]
+    for t in stress_threads:
+        t.start()
+
+    try:
+        for _ in range(150):
+            outer_eid = raw.push_scope(100.0, 0, False, False)
+            assert raw.is_effectively_cancelled() == raw.is_scope_effectively_cancelled(outer_eid)
+            assert raw.effective_deadline() == 100.0
+
+            inner_eid = raw.push_scope(50.0, 0, True, False)
+            assert raw.is_effectively_cancelled() == raw.is_scope_effectively_cancelled(inner_eid)
+            assert not raw.is_effectively_cancelled()
+            assert raw.effective_deadline() == 50.0
+
+            raw.set_deadline(inner_eid, 25.0)
+            assert raw.effective_deadline() == 25.0
+            assert raw.is_effectively_cancelled() == raw.is_scope_effectively_cancelled(inner_eid)
+
+            assert not raw.cancel_scope(outer_eid)
+            assert not raw.is_effectively_cancelled()
+            assert raw.is_scope_effectively_cancelled(outer_eid)
+            assert raw.is_effectively_cancelled() == raw.is_scope_effectively_cancelled(inner_eid)
+
+            raw.set_shield(inner_eid, False)
+            assert raw.is_effectively_cancelled()
+            assert raw.is_effectively_cancelled() == raw.is_scope_effectively_cancelled(inner_eid)
+
+            raw.set_shield(inner_eid, True)
+            assert not raw.is_effectively_cancelled()
+            assert raw.is_effectively_cancelled() == raw.is_scope_effectively_cancelled(inner_eid)
+
+            assert raw.cancel_scope(inner_eid)
+            assert raw.is_effectively_cancelled()
+            assert raw.is_effectively_cancelled() == raw.is_scope_effectively_cancelled(inner_eid)
+
+            self_c, outer_c = raw.pop_scope_status(inner_eid)
+            assert self_c is True and outer_c is False
+            assert raw.is_effectively_cancelled()
+            assert raw.is_effectively_cancelled() == raw.is_scope_effectively_cancelled(outer_eid)
+            assert raw.effective_deadline() == 100.0
+
+            self_o, outer_o = raw.pop_scope_status(outer_eid)
+            assert self_o is True and outer_o is False
+            assert not raw.is_effectively_cancelled()
+            assert raw.effective_deadline() == float("inf")
+    finally:
+        stop.set()
+        for t in stress_threads:
+            t.join(timeout=2.0)
+
+    assert errors == []

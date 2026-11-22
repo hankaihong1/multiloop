@@ -2,6 +2,9 @@ use super::*;
 use parking_lot::Mutex;
 use pyo3::{Py, PyAny, Python};
 
+// CPython 3.14t gc.collect() returns 0 without collecting if called concurrently by another thread.
+static GC_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn test_waitgroup_done_underflow() {
     Python::attach(|py| {
@@ -278,7 +281,7 @@ fn test_nativeworkerpool_over_64_bitmap_and_drain_all() {
         pool.push_local(120, t2, py).unwrap();
         assert_eq!(pool.push_global_batch(py, vec![t3]).unwrap(), 1);
         assert_eq!(pool.outstanding_count(), 3);
-        assert!(!pool.wait_drained(py, 0.0));
+        assert!(!pool.wait_drained(py, 0.0).unwrap());
 
         let leftover = pool.drain_all(py);
         assert_eq!(leftover.len(), 3);
@@ -287,7 +290,7 @@ fn test_nativeworkerpool_over_64_bitmap_and_drain_all() {
             pool.complete_task();
         }
         assert_eq!(pool.outstanding_count(), 0);
-        assert!(pool.wait_drained(py, 0.01));
+        assert!(pool.wait_drained(py, 0.01).unwrap());
     });
 }
 
@@ -772,12 +775,12 @@ fn test_lock_and_rwmutex_ticket_cancel_idempotency() {
             .unwrap()
             .unbind();
         assert!(lock.try_acquire(42, 1, task_weak).unwrap());
-        assert!(lock.locked());
+        assert!(lock.locked(py));
         // Stale ticket_id must not release active lock held by task_id 42
         lock.cancel_waiter(py, 42, 999);
-        assert!(lock.locked());
+        assert!(lock.locked(py));
         lock.release(py, 42).unwrap();
-        assert!(!lock.locked());
+        assert!(!lock.locked(py));
 
         let rw = RawAsyncRWMutex::new();
         assert!(rw.try_acquire_write_task(42).unwrap());
@@ -921,5 +924,462 @@ fn test_cancel_state_out_of_lock_drop_reentrancy() {
         // Dropping ReentrantDrop inside unpark_waiter must occur strictly outside the mutex
         state.borrow(py).unpark_waiter(park_id);
         assert!(!state.borrow(py).is_effectively_cancelled());
+    });
+}
+
+#[test]
+fn test_timeout_helpers_edge_values() {
+    use std::time::{Duration, Instant};
+
+    Python::attach(|py| {
+        // NaN and -inf must return PyValueError without panicking
+        for bad in [f64::NAN, -f64::NAN, f64::NEG_INFINITY] {
+            let dur_err = crate::timeout::timeout_to_duration(bad).unwrap_err();
+            assert!(dur_err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            let dl_err = crate::timeout::deadline_from_secs(bad).unwrap_err();
+            assert!(dl_err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            let opt_err = crate::timeout::deadline_from_opt_secs(Some(bad)).unwrap_err();
+            assert!(opt_err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+        }
+
+        // +inf and None map to unbounded wait (Ok(None)) without panicking
+        assert_eq!(
+            crate::timeout::timeout_to_duration(f64::INFINITY).unwrap(),
+            None
+        );
+        assert!(crate::timeout::deadline_from_secs(f64::INFINITY)
+            .unwrap()
+            .is_none());
+        assert!(crate::timeout::deadline_from_opt_secs(Some(f64::INFINITY))
+            .unwrap()
+            .is_none());
+        assert!(crate::timeout::deadline_from_opt_secs(None)
+            .unwrap()
+            .is_none());
+
+        // Huge finite floats (1e20, f64::MAX) must be capped safely without panicking
+        for huge in [1e20, f64::MAX] {
+            let dur = crate::timeout::timeout_to_duration(huge)
+                .unwrap()
+                .expect("capped finite timeout should produce a bounded Duration");
+            assert_eq!(
+                dur,
+                Duration::from_secs_f64(crate::timeout::MAX_FINITE_TIMEOUT_SECS)
+            );
+            let before = Instant::now();
+            let dl = crate::timeout::deadline_from_secs(huge).unwrap();
+            if let Some(deadline) = dl {
+                assert!(deadline > before);
+            }
+        }
+
+        // Finite <= 0.0 (-1.0, -0.0, 0.0) map to immediate zero duration / expired deadline
+        for non_pos in [-1.0, -0.0, 0.0] {
+            assert_eq!(
+                crate::timeout::timeout_to_duration(non_pos).unwrap(),
+                Some(Duration::ZERO)
+            );
+            let dl = crate::timeout::deadline_from_secs(non_pos)
+                .unwrap()
+                .expect("finite <= 0.0 should produce an immediate Instant deadline");
+            assert!(dl <= Instant::now());
+        }
+
+        // Positive finite float (0.5) produces exact Duration and future deadline
+        assert_eq!(
+            crate::timeout::timeout_to_duration(0.5).unwrap(),
+            Some(Duration::from_millis(500))
+        );
+        let before = Instant::now();
+        let dl = crate::timeout::deadline_from_secs(0.5)
+            .unwrap()
+            .expect("positive finite timeout should produce a deadline");
+        assert!(dl > before);
+    });
+}
+
+#[test]
+fn test_channel_sync_timeout_edge_cases() {
+    use std::thread;
+    use std::time::Duration;
+
+    Python::attach(|py| {
+        let ch = Bound::new(py, RawAsyncChannel::new(1)).unwrap();
+
+        // NaN and -inf must return PyValueError (even if channel has space/data)
+        for bad in [f64::NAN, f64::NEG_INFINITY] {
+            let item: Py<PyAny> = pyo3::types::PyInt::new(py, 1).into_any().unbind();
+            let send_err = RawAsyncChannel::send_sync(&ch, py, item, Some(bad)).unwrap_err();
+            assert!(send_err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            let recv_err = RawAsyncChannel::recv_sync(&ch, py, Some(bad)).unwrap_err();
+            assert!(recv_err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+        }
+
+        // Non-positive finite timeouts (-1.0, 0.0) allow fast-path send/recv and time out immediately when blocked
+        for non_pos in [-1.0, 0.0] {
+            let item: Py<PyAny> = pyo3::types::PyInt::new(py, 7).into_any().unbind();
+            RawAsyncChannel::send_sync(&ch, py, item, Some(non_pos)).unwrap();
+            // Channel is now full: send_sync with <= 0.0 times out (TimeoutError, not ValueError)
+            let extra: Py<PyAny> = pyo3::types::PyInt::new(py, 8).into_any().unbind();
+            let full_err = RawAsyncChannel::send_sync(&ch, py, extra, Some(non_pos)).unwrap_err();
+            assert!(!full_err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+
+            // Drain via recv_sync with <= 0.0 succeeds
+            let val = RawAsyncChannel::recv_sync(&ch, py, Some(non_pos)).unwrap();
+            assert_eq!(val.extract::<i32>(py).unwrap(), 7);
+            // Channel is now empty: recv_sync with <= 0.0 times out
+            let empty_err = RawAsyncChannel::recv_sync(&ch, py, Some(non_pos)).unwrap_err();
+            assert!(!empty_err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+        }
+
+        // +inf and 1e20 fast-path and blocking wakeup without panic
+        let item_inf: Py<PyAny> = pyo3::types::PyInt::new(py, 11).into_any().unbind();
+        RawAsyncChannel::send_sync(&ch, py, item_inf, Some(f64::INFINITY)).unwrap();
+        let ch_bg = ch.clone().unbind();
+        let bg_recv = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(15));
+            Python::attach(|py| {
+                let v = RawAsyncChannel::try_recv(ch_bg.bind(py), py).unwrap();
+                assert_eq!(v.extract::<i32>(py).unwrap(), 11);
+            });
+        });
+        let item_wait: Py<PyAny> = pyo3::types::PyInt::new(py, 22).into_any().unbind();
+        RawAsyncChannel::send_sync(&ch, py, item_wait, Some(f64::INFINITY)).unwrap();
+        py.detach(|| bg_recv.join()).unwrap();
+
+        let val_1e20 = RawAsyncChannel::recv_sync(&ch, py, Some(1e20)).unwrap();
+        assert_eq!(val_1e20.extract::<i32>(py).unwrap(), 22);
+
+        let ch_bg2 = ch.clone().unbind();
+        let bg_send = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(15));
+            Python::attach(|py| {
+                let v: Py<PyAny> = pyo3::types::PyInt::new(py, 33).into_any().unbind();
+                assert!(RawAsyncChannel::try_send(ch_bg2.bind(py), py, v).unwrap());
+            });
+        });
+        let got = RawAsyncChannel::recv_sync(&ch, py, Some(1e20)).unwrap();
+        assert_eq!(got.extract::<i32>(py).unwrap(), 33);
+        py.detach(|| bg_send.join()).unwrap();
+
+        // Finite positive timeout (0.5) succeeds when ready
+        let item_ok: Py<PyAny> = pyo3::types::PyInt::new(py, 44).into_any().unbind();
+        RawAsyncChannel::send_sync(&ch, py, item_ok, Some(0.5)).unwrap();
+        let got_ok = RawAsyncChannel::recv_sync(&ch, py, Some(0.5)).unwrap();
+        assert_eq!(got_ok.extract::<i32>(py).unwrap(), 44);
+    });
+}
+
+#[test]
+fn test_nativeworkerpool_wait_drained_timeout_edges() {
+    use std::thread;
+    use std::time::Duration;
+
+    Python::attach(|py| {
+        let pool = Py::new(py, NativeWorkerPool::new(2)).unwrap();
+        let p = pool.bind(py).get();
+
+        // Already drained: NaN and -inf still raise ValueError
+        for bad in [f64::NAN, f64::NEG_INFINITY] {
+            let err = p.wait_drained(py, bad).unwrap_err();
+            assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+        }
+
+        // Already drained: <= 0.0, +inf, 1e20, 0.5 all return Ok(true)
+        for ok_val in [-1.0, 0.0, 0.5, f64::INFINITY, 1e20] {
+            assert!(p.wait_drained(py, ok_val).unwrap());
+        }
+
+        // Push a task so pool is not drained
+        let t1: Py<PyAny> = pyo3::types::PyInt::new(py, 1).into_any().unbind();
+        p.push_global(py, t1).unwrap();
+
+        // Non-drained: NaN/-inf -> Err(ValueError); -1.0/0.0 -> Ok(false)
+        for bad in [f64::NAN, f64::NEG_INFINITY] {
+            let err = p.wait_drained(py, bad).unwrap_err();
+            assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+        }
+        assert!(!p.wait_drained(py, -1.0).unwrap());
+        assert!(!p.wait_drained(py, 0.0).unwrap());
+
+        // +inf and 1e20 wait safely until background thread drains and completes the task
+        let pool_bg = pool.clone_ref(py);
+        let bg = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(15));
+            Python::attach(|py| {
+                let pb = pool_bg.bind(py).get();
+                let items = pb.drain_all(py);
+                assert_eq!(items.len(), 1);
+                pb.complete_task();
+            });
+        });
+        assert!(p.wait_drained(py, f64::INFINITY).unwrap());
+        py.detach(|| bg.join()).unwrap();
+
+        let t2: Py<PyAny> = pyo3::types::PyInt::new(py, 2).into_any().unbind();
+        p.push_global(py, t2).unwrap();
+        let pool_bg2 = pool.clone_ref(py);
+        let bg2 = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(15));
+            Python::attach(|py| {
+                let pb = pool_bg2.bind(py).get();
+                let items = pb.drain_all(py);
+                assert_eq!(items.len(), 1);
+                pb.complete_task();
+            });
+        });
+        assert!(p.wait_drained(py, 1e20).unwrap());
+        py.detach(|| bg2.join()).unwrap();
+    });
+}
+
+#[test]
+fn test_nativeworkerpool_complete_task_underflow_protection() {
+    use std::thread;
+    use std::time::Duration;
+
+    Python::attach(|py| {
+        let pool = Py::new(py, NativeWorkerPool::new(2)).unwrap();
+        let p = pool.bind(py).get();
+
+        // Extra complete_task() calls when already 0 must NOT panic or wrap to usize::MAX
+        assert_eq!(p.outstanding_count(), 0);
+        p.complete_task();
+        p.complete_task();
+        p.complete_task();
+        assert_eq!(p.outstanding_count(), 0);
+        assert!(p.wait_drained(py, 0.0).unwrap());
+
+        // Transition 1 -> 0 wakes wait_drained condvar, and subsequent extra calls stay at 0
+        let t: Py<PyAny> = pyo3::types::PyInt::new(py, 99).into_any().unbind();
+        p.push_global(py, t).unwrap();
+        assert_eq!(p.outstanding_count(), 1);
+
+        let pool_waiter = pool.clone_ref(py);
+        let waiter = thread::spawn(move || {
+            Python::attach(|py| pool_waiter.bind(py).get().wait_drained(py, 2.0).unwrap())
+        });
+        thread::sleep(Duration::from_millis(15));
+        let drained = p.drain_all(py);
+        assert_eq!(drained.len(), 1);
+        p.complete_task();
+        assert!(py.detach(|| waiter.join()).unwrap());
+        assert_eq!(p.outstanding_count(), 0);
+
+        p.complete_task();
+        assert_eq!(p.outstanding_count(), 0);
+    });
+}
+
+#[test]
+fn test_channel_gc_traverse_clear_and_reentrancy() {
+    let _gc_guard = GC_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    Python::attach(|py| {
+        // 1. Real cyclic GC collection across buffer, getters, putters, select_watchers, and in_flight_getters
+        let globals = pyo3::types::PyDict::new(py);
+        {
+            let ch_buf = Py::new(py, RawAsyncChannel::new(4)).unwrap();
+            let ch_wait = Py::new(py, RawAsyncChannel::new(1)).unwrap();
+            let ch_sel = Py::new(py, RawAsyncChannel::new(1)).unwrap();
+            let ch_inf = Py::new(py, RawAsyncChannel::new(1)).unwrap();
+            globals.set_item("ch_buf", ch_buf.bind(py)).unwrap();
+            globals.set_item("ch_wait", ch_wait.bind(py)).unwrap();
+            globals.set_item("ch_sel", ch_sel.bind(py)).unwrap();
+            globals.set_item("ch_inf", ch_inf.bind(py)).unwrap();
+        }
+        py.run(
+            c"import gc, weakref
+
+class CycleNode:
+    def call_soon_threadsafe(self, *args):
+        pass
+
+assert gc.is_tracked(ch_buf)
+assert gc.is_tracked(ch_wait)
+assert gc.is_tracked(ch_sel)
+assert gc.is_tracked(ch_inf)
+
+n_buf = CycleNode()
+n_buf.ch = ch_buf
+ref_buf = weakref.ref(n_buf)
+ch_buf.try_send([n_buf])
+
+n_wait = CycleNode()
+n_wait.ch = ch_wait
+ref_wait = weakref.ref(n_wait)
+ch_wait.try_send(1)
+ch_wait.send_or_register(2, n_wait, n_wait)
+
+n_get = CycleNode()
+n_get.ch = ch_sel
+ref_get = weakref.ref(n_get)
+n_sel = CycleNode()
+n_sel.ch = ch_sel
+ref_sel = weakref.ref(n_sel)
+ch_sel.register_getter_ticket(n_get, n_get)
+ch_sel.register_select_watcher_ticket(n_sel, n_sel, weakref.ref(n_sel))
+
+n_inf_waiter = CycleNode()
+n_inf_waiter.ch = ch_inf
+n_inf_payload = CycleNode()
+n_inf_payload.ch = ch_inf
+ref_inf = weakref.ref(n_inf_payload)
+ch_inf.register_getter_ticket(n_inf_waiter, n_inf_waiter)
+ch_inf.try_send(n_inf_payload)
+
+del n_buf, n_wait, n_get, n_sel, n_inf_waiter, n_inf_payload
+del ch_buf, ch_wait, ch_sel, ch_inf
+gc.collect()
+gc.collect()
+survived = [
+    name
+    for name, r in (
+        ('buf', ref_buf()),
+        ('wait', ref_wait()),
+        ('get', ref_get()),
+        ('sel', ref_sel()),
+        ('inf', ref_inf()),
+    )
+    if r is not None
+]
+",
+            Some(&globals),
+            None,
+        )
+        .unwrap();
+        let survived: Vec<String> = globals
+            .get_item("survived")
+            .unwrap()
+            .unwrap()
+            .extract()
+            .unwrap();
+        assert!(
+            survived.is_empty(),
+            "cyclic RawAsyncChannel instances must be collected by gc.collect(), survived={survived:?}"
+        );
+
+        // 2. Direct __clear__() drops payloads strictly outside the mutex (re-entrant __del__ safe)
+        let ch = Py::new(py, RawAsyncChannel::new(2)).unwrap();
+        let globals2 = pyo3::types::PyDict::new(py);
+        globals2.set_item("ch", ch.bind(py)).unwrap();
+        py.run(
+            c"reentered = []
+class ReentrantPayload:
+    def __init__(self, c):
+        self.c = c
+    def __del__(self):
+        reentered.append((self.c.qsize(), self.c.is_closed(), self.c.empty()))
+ch.try_send(ReentrantPayload(ch))
+",
+            Some(&globals2),
+            None,
+        )
+        .unwrap();
+        ch.bind(py).get().__clear__();
+        let reentered_len: usize = globals2
+            .get_item("reentered")
+            .unwrap()
+            .unwrap()
+            .len()
+            .unwrap();
+        assert_eq!(reentered_len, 1);
+        assert!(ch.bind(py).get().is_closed());
+        assert_eq!(ch.bind(py).get().qsize(), 0);
+    });
+}
+
+#[test]
+fn test_nativeworkerpool_gc_traverse_clear_and_reentrancy() {
+    let _gc_guard = GC_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    Python::attach(|py| {
+        // 1. Real cyclic GC collection across worker buffers and metrics
+        let globals = pyo3::types::PyDict::new(py);
+        {
+            let pool = Py::new(py, NativeWorkerPool::new(2)).unwrap();
+            let metrics = Py::new(py, AtomicMetrics::new(2)).unwrap();
+            globals.set_item("pool", pool.bind(py)).unwrap();
+            globals.set_item("metrics", metrics.bind(py)).unwrap();
+        }
+        py.run(
+            c"import gc, weakref
+
+class CycleNode:
+    pass
+
+assert gc.is_tracked(pool)
+
+pool.set_metrics(metrics)
+refs = gc.get_referents(pool)
+metrics_visited = metrics in refs
+del refs, metrics
+
+n_first = CycleNode()
+n_first.pool = pool
+ref_first = weakref.ref(n_first)
+
+n_buf = CycleNode()
+n_buf.pool = pool
+ref_buf = weakref.ref(n_buf)
+
+pool.push_global_batch([[n_first], [n_buf]])
+# pop_work(0) batch-pulls both items into worker 0's buffer and pops one,
+# leaving [n_buf] inside buffers[0] forming pool -> buffers[0] -> [n_buf] -> pool
+first = pool.pop_work(0)
+del first, n_first, n_buf, pool
+gc.collect()
+gc.collect()
+pool_collected = metrics_visited and ref_first() is None and ref_buf() is None
+",
+            Some(&globals),
+            None,
+        )
+        .unwrap();
+        let pool_collected: bool = globals
+            .get_item("pool_collected")
+            .unwrap()
+            .unwrap()
+            .extract()
+            .unwrap();
+        assert!(
+            pool_collected,
+            "cyclic NativeWorkerPool with item in worker buffer must be collected by gc.collect()"
+        );
+
+        // 2. Direct __clear__() drains buffers + global/local flume receivers + metrics outside locks
+        let pool = Py::new(py, NativeWorkerPool::new(2)).unwrap();
+        let metrics = Py::new(py, AtomicMetrics::new(2)).unwrap();
+        pool.bind(py).get().set_metrics(metrics);
+        let globals2 = pyo3::types::PyDict::new(py);
+        globals2.set_item("pool", pool.bind(py)).unwrap();
+        py.run(
+            c"reentered = []
+class ReentrantWork:
+    def __init__(self, p, tag):
+        self.p = p
+        self.tag = tag
+    def __del__(self):
+        reentered.append((self.tag, self.p.is_closed(), self.p.is_drained(), self.p.outstanding_count()))
+pool.push_global_batch([ReentrantWork(pool, 'buf0'), ReentrantWork(pool, 'buf1')])
+popped = pool.pop_work(0)
+assert popped.tag == 'buf0'
+del popped
+pool.push_global(ReentrantWork(pool, 'global'))
+pool.push_local(1, ReentrantWork(pool, 'local'))
+assert len(reentered) == 1
+",
+            Some(&globals2),
+            None,
+        )
+        .unwrap();
+        pool.bind(py).get().__clear__();
+        let reentered_len: usize = globals2
+            .get_item("reentered")
+            .unwrap()
+            .unwrap()
+            .len()
+            .unwrap();
+        assert_eq!(reentered_len, 4);
+        assert!(pool.bind(py).get().is_closed());
+        assert!(pool.bind(py).get().is_drained());
     });
 }

@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-11-22
+
+### Fixed, Hardened & Changed
+- **FFI, GC & Timeout Memory Safety (`src/timeout.rs`, `src/channel.rs`, `src/pool.rs`, `src/sync.rs`, `src/cancel.rs`, `src/rwlock.rs`, `src/waitgroup.rs`, `src/multiloop/primitives.py`, `src/multiloop/context.py`)**:
+  - Implemented PyO3 0.29 GC protocol (`__traverse__` using `try_lock()` and `__clear__` dropping extracted `Py<PyAny>` outside locks) across all 12 Python-object-holding `#[pyclass]` types.
+  - Added `src/timeout.rs` for panic-free timeout validation and deadline computation (`NaN`/`-inf` -> `ValueError`, `+inf` -> unbounded wait, finite clamped to 10 years with `checked_add`), and protected `NativeWorkerPool::complete_task` against counter underflow.
+  - Fixed `AsyncOnce.do` traceback reference cycle retention (`_clone_exception`, `__weakref__` slot, frame local cleanup) and custom multi-argument exception cloning; converted `AsyncContext._children` to `weakref.WeakSet`.
+  - Tightened `CapacityLimiter` (`RawAsyncCapacityLimiter::new` and `set_total_tokens`) to reject non-finite `total_tokens` (`ValueError`).
+- **Concurrency State-Machine & Lifecycle Fixes (`src/rwlock.rs`, `src/channel.rs`, `src/multiloop/pool.py`, `src/multiloop/_cancel.py`, `src/multiloop/_taskgroup.py`)**:
+  - Unified `RawAsyncRWMutex` wakeup transitions (`prepare_wake_action` / `dispatch_wake_action`) so cancelling a queued writer while `ReadLocked` immediately admits and wakes queued `read_waiters`.
+  - Enforced `occupied() < maxsize` capacity accounting across `RawAsyncChannel` send/claim paths.
+  - Hardened `EventLoopThreadPool` lifecycle (`_PoolState` state machine, pre-transition `close(timeout=...)` validation, serialized concurrent `close()`/`abort()` callers, shared monotonic deadline in `_join_threads_sync`, two-stage stubborn task cancellation, unstarted `close()` blocking subsequent `start()`, and `move_on_after` completion handling).
+  - Added monotonic `_deadline_gen` to `CancelScope._on_deadline_timer`, `RawTaskCancelState::pop_scope_status`, and `_enter_cancelling` baseline checks so `move_on_after` and `fail_after` never swallow or convert concurrent external `task.cancel()`.
+  - Fixed `TaskGroup(pool=...)` external child `asyncio.Future` cancellation handling and cross-loop `TaskHandle.__await__` wakeup.
+- **Hot-Path Optimization & API Alignment (`src/cancel.rs`, `src/sync.rs`, `src/multiloop/_cancel.py`, `src/multiloop/_sync.py`, `src/multiloop/_taskgroup.py`)**:
+  - Replaced global `_STATE_LOCK` + `WeakKeyDictionary` contention on standard `asyncio.Task` instances with direct `_multiloop_cancel_state` task attributes and `AtomicBool`/`AtomicU64` fast-read caches on `RawTaskCancelState`.
+  - Removed `LockState::AbandonedByDeadOwner` (transitioning dead owners directly to `Unlocked` when no waiters remain) and eliminated cross-thread `.done()` calls in `RawAsyncLock::owner`.
+  - Aligned `BarrierWaitResult.index` / `is_leader` with `threading.Barrier` (`index = 0` for first arriver / `is_leader = True`, `parties - 1` for tripping last arriver) and added `RawAsyncBarrier::try_arrive` zero-Future fast path.
+  - Updated `TaskHandle.exception` to raise `asyncio.CancelledError` on cancelled tasks, renamed and exported `TaskState` (`PENDING`, `STARTED`, `FINISHED`), removed internal shims (`_WaiterView`, `_LenShim`, `_waiters`, `_cancel_waiter`, `_getters`/`_putters`/`_notifiers`, `select_channel._deadline`, `_complete_waiter_future`, `skip_if_no_rust`), enabled `F821`/`RUF100` lint checks, and synchronized benchmarks and EN/ZH documentation.
+
 ## [0.1.4] - 2026-11-21
 
 ### Added & Changed

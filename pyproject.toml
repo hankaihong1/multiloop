@@ -1,6 +1,6 @@
 [project]
 name = "multiloop"
-version = "0.1.4"
+version = "0.1.5"
 description = "High-performance multi-event-loop concurrency engine for Python 3.14t with Rust core"
 readme = "README.md"
 license = "MIT"
@@ -19,7 +19,7 @@ keywords = [
     "eventloop",
     "multieventloop",
     "sync",
-    "AsyncRwLock",
+    "AsyncRWMutex",
     "rwlock",
 ]
 classifiers = [
@@ -34,7 +34,6 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Programming Language :: Rust",
     "Operating System :: OS Independent",
-    "Topic :: System :: Networking",
     "Framework :: AsyncIO",
 ]
 dependencies = []
@@ -97,11 +96,9 @@ lint.select = ["E", "F", "I", "N", "UP", "W", "B", "C4", "SIM", "TCH", "RUF"]
 lint.ignore = [
     "E501",    # line-too-long
     "E741",    # ambiguous-variable-name
-    "F821",    # undefined-name (self-referencing forward-ref types)
     "RUF002",  # ambiguous-unicode-character-docstring (Chinese punctuation)
     "RUF003",  # ambiguous-unicode-character-comment (Chinese punctuation)
     "RUF006",  # store-task-reference
-    "RUF100",  # unused-noqa
     "SIM105",  # suppressible-exception
     "TC001",   # typing-only-first-party-import
     "TC003",   # typing-only-standard-library-import
