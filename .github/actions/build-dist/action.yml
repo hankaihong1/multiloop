@@ -5,10 +5,6 @@ inputs:
   mode:
     description: "Build mode: container-wheels | host-wheels | sdist."
     required: true
-  target:
-    description: "Target architecture for host wheel builds (e.g. x86_64, aarch64)."
-    required: false
-    default: ""
   rust-target:
     description: "Rust target triple for host wheel builds (e.g. x86_64-apple-darwin)."
     required: false
@@ -68,7 +64,7 @@ runs:
     - name: Build host wheels across target Python versions
       if: ${{ inputs.mode == 'host-wheels' }}
       shell: bash
-      run: uv run --no-project python .github/scripts/build_host_wheels.py --target "${{ inputs.target }}" --out dist ${{ inputs.python-versions }}
+      run: uv run --no-project python .github/scripts/build_host_wheels.py --target "${{ inputs.rust-target }}" --out dist ${{ inputs.python-versions }}
 
     - name: Check distribution metadata
       shell: bash
