@@ -114,7 +114,7 @@ dependencies = [
  "flume",
  "parking_lot",
  "pyo3",
- "pyo3-build-config",
+ "pyo3-build-config 0.30.1",
 ]
 
 [[package]]
@@ -185,7 +185,7 @@ dependencies = [
  "libc",
  "once_cell",
  "portable-atomic",
- "pyo3-build-config",
+ "pyo3-build-config 0.29.1",
  "pyo3-ffi",
  "pyo3-macros",
 ]
@@ -200,13 +200,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyo3-build-config"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70130e2b6dd1ee589a8788026a429561ca5c40fa7a2fa7914c2282eddae24700"
+dependencies = [
+ "target-lexicon",
+]
+
+[[package]]
 name = "pyo3-ffi"
 version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3160087aa5733bce7d9a729f8c55f85a2a53b74742a09613178eeebff0722253"
 dependencies = [
  "libc",
- "pyo3-build-config",
+ "pyo3-build-config 0.29.1",
 ]
 
 [[package]]
