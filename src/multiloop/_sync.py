@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import weakref
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from typing import Any, Self
 
 from multiloop._cancel import (
@@ -40,26 +40,6 @@ _RawAsyncCondition = _try_import_rust_class("multiloop._multiloop_core", "RawAsy
 _RawAsyncBarrier = _try_import_rust_class("multiloop._multiloop_core", "RawAsyncBarrier")
 
 
-class _WaiterView:
-    """Read-only view over a Rust waiter queue supporting ``len()`` and ``iter()``."""
-
-    __slots__ = ("_raw",)
-
-    def __init__(self, raw: Any) -> None:
-        self._raw = raw
-
-    def __len__(self) -> int:
-        return int(self._raw.waiter_count())
-
-    def __iter__(self) -> Iterator[int]:
-        if hasattr(self._raw, "waiter_tickets"):
-            return iter(self._raw.waiter_tickets())
-        return iter(range(int(self._raw.waiter_count())))
-
-    def __bool__(self) -> bool:
-        return int(self._raw.waiter_count()) > 0
-
-
 # ============================================================================
 # Lock — fair FIFO mutex
 # ============================================================================
@@ -89,10 +69,6 @@ class Lock:
 
         self._owner_done_cb: Callable[[asyncio.Task[Any]], None] = _on_owner_done
 
-    @property
-    def _waiters(self) -> _WaiterView:
-        return _WaiterView(self._raw)
-
     def _reap_same_loop_dead_owner(self, loop_id: int) -> None:
         owner = self._raw.check_owner_same_loop(loop_id)
         if owner is not None and owner.done():
@@ -106,7 +82,11 @@ class Lock:
     @property
     def owner(self) -> asyncio.Task[Any] | None:
         """Return the owning asyncio task, or None if free."""
-        return self._raw.owner()  # type: ignore[no-any-return]
+        try:
+            loop_id: int | None = id(asyncio.get_running_loop())
+        except RuntimeError:
+            loop_id = None
+        return self._raw.owner(loop_id)  # type: ignore[no-any-return]
 
     async def acquire(self) -> None:
         """Acquire the lock, blocking in strict FIFO order until it becomes available.
@@ -218,15 +198,11 @@ class Semaphore:
             raise RuntimeError("_multiloop_core Rust extension is not compiled.")
         self._raw = _RawAsyncSemaphore(max_value)
 
-    @property
-    def _waiters(self) -> _WaiterView:
-        return _WaiterView(self._raw)
-
     def __repr__(self) -> str:
         return (
             f"<Semaphore value={self.value}, "
             f"max_value={self.max_value}, "
-            f"waiters={len(self._waiters)}>"
+            f"waiters={self._raw.waiter_count()}>"
         )
 
     @property
@@ -258,11 +234,6 @@ class Semaphore:
             self._raw.cancel_waiter(ticket_id)
             raise
         self._raw.claim_acquire(ticket_id)
-
-    def _cancel_waiter(self, ticket_id: int | Any) -> None:
-        """Handle cancellation of a waiting task, preserving permit conservation."""
-        if isinstance(ticket_id, int):
-            self._raw.cancel_waiter(ticket_id)
 
     def try_acquire(self) -> bool:
         """Attempt to acquire a permit immediately without blocking.
@@ -313,10 +284,6 @@ class CapacityLimiter:
         if _RawAsyncCapacityLimiter is None:
             raise RuntimeError("_multiloop_core Rust extension is not compiled.")
         self._raw = _RawAsyncCapacityLimiter(float(total_tokens))
-
-    @property
-    def _waiters(self) -> _WaiterView:
-        return _WaiterView(self._raw)
 
     def __repr__(self) -> str:
         total, avail, borrowed = self.snapshot()
@@ -377,11 +344,6 @@ class CapacityLimiter:
             raise
         self._raw.claim_acquire(ticket_id)
 
-    def _cancel_waiter(self, ticket_id: int | Any) -> None:
-        """Handle cancellation while waiting for a token."""
-        if isinstance(ticket_id, int):
-            self._raw.cancel_waiter(ticket_id)
-
     def try_acquire(self) -> bool:
         """Attempt to borrow one token immediately without blocking.
 
@@ -428,10 +390,6 @@ class Event:
         if _RawAsyncEvent is None:
             raise RuntimeError("_multiloop_core Rust extension is not compiled.")
         self._raw = _RawAsyncEvent()
-
-    @property
-    def _waiters(self) -> _WaiterView:
-        return _WaiterView(self._raw)
 
     def is_set(self) -> bool:
         """Return True if the event has been set."""
@@ -480,10 +438,6 @@ class Condition:
             raise RuntimeError("_multiloop_core Rust extension is not compiled.")
         self._lock = lock if lock is not None else Lock()
         self._raw = _RawAsyncCondition()
-
-    @property
-    def _waiters(self) -> _WaiterView:
-        return _WaiterView(self._raw)
 
     # -- context-manager support (delegates to the underlying Lock) ---------
 
@@ -664,12 +618,16 @@ class Barrier:
         :raises RuntimeError: If the barrier is broken, aborted, or reset.
         """
         _check_not_cancelled()
+        fast_index = self._raw.try_arrive()
+        if fast_index is not None:
+            return BarrierWaitResult(parties=self.parties, index=int(fast_index))
+
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[int] = loop.create_future()
 
         generation, ticket_id = self._raw.arrive_or_register(loop, fut)
         if ticket_id is None:
-            return BarrierWaitResult(parties=self.parties, index=0)
+            return BarrierWaitResult(parties=self.parties, index=self.parties - 1)
 
         try:
             outcome = int(await _await_cancellable(loop, fut))

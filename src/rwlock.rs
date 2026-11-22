@@ -1,7 +1,8 @@
 use parking_lot::Mutex;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use std::collections::{HashMap, HashSet, VecDeque};
+use pyo3::pyclass::{PyTraverseError, PyVisit};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::waiter::{wake_pair_outside_lock, WaiterId};
@@ -22,8 +23,41 @@ enum RWMutexMode {
     ReadLocked {
         total_readers: usize,
         reader_depths: HashMap<u64, usize>,
-        woken_tickets: HashSet<WaiterId>,
+        woken_tickets: HashMap<WaiterId, u64>,
     },
+}
+
+enum RWAction {
+    None,
+    WakeWriter(RWMutexWaiter),
+    WakeReaders(Vec<RWMutexWaiter>),
+}
+
+#[inline]
+fn admit_readers(
+    readers: &[RWMutexWaiter],
+    reader_depths: &mut HashMap<u64, usize>,
+    woken_tickets: &mut HashMap<WaiterId, u64>,
+) -> usize {
+    for r in readers {
+        woken_tickets.insert(r.id, r.task_token);
+        *reader_depths.entry(r.task_token).or_insert(0) += 1;
+    }
+    reader_depths.len()
+}
+
+#[inline]
+fn decrement_reader_depth(
+    reader_depths: &mut HashMap<u64, usize>,
+    task_token: u64,
+) -> Option<usize> {
+    let depth = reader_depths.get_mut(&task_token)?;
+    if *depth > 1 {
+        *depth -= 1;
+    } else {
+        reader_depths.remove(&task_token);
+    }
+    Some(reader_depths.len())
 }
 
 pub(crate) struct RWMutexInner {
@@ -38,6 +72,51 @@ impl RWMutexInner {
         let id = self.next_waiter_id;
         self.next_waiter_id = self.next_waiter_id.wrapping_add(1).max(1);
         id
+    }
+
+    /// Promote queued writers or readers under the mutex and return any wakeups to run outside.
+    fn prepare_wake_action(&mut self) -> RWAction {
+        match &mut self.mode {
+            RWMutexMode::Unlocked => {
+                if let Some(w) = self.write_waiters.pop_front() {
+                    self.mode = RWMutexMode::WriteLocked {
+                        task_token: w.task_token,
+                        ticket_id: Some(w.id),
+                    };
+                    RWAction::WakeWriter(w)
+                } else if !self.read_waiters.is_empty() {
+                    let readers: Vec<RWMutexWaiter> = self.read_waiters.drain(..).collect();
+                    let mut reader_depths: HashMap<u64, usize> =
+                        HashMap::with_capacity(readers.len());
+                    let mut woken_tickets: HashMap<WaiterId, u64> =
+                        HashMap::with_capacity(readers.len());
+                    let total_readers =
+                        admit_readers(&readers, &mut reader_depths, &mut woken_tickets);
+                    self.mode = RWMutexMode::ReadLocked {
+                        total_readers,
+                        reader_depths,
+                        woken_tickets,
+                    };
+                    RWAction::WakeReaders(readers)
+                } else {
+                    RWAction::None
+                }
+            }
+            RWMutexMode::ReadLocked {
+                total_readers,
+                reader_depths,
+                woken_tickets,
+            } => {
+                if self.write_waiters.is_empty() && !self.read_waiters.is_empty() {
+                    let readers: Vec<RWMutexWaiter> = self.read_waiters.drain(..).collect();
+                    *total_readers = admit_readers(&readers, reader_depths, woken_tickets);
+                    RWAction::WakeReaders(readers)
+                } else {
+                    RWAction::None
+                }
+            }
+            RWMutexMode::WriteLocked { .. } => RWAction::None,
+        }
     }
 }
 
@@ -54,51 +133,16 @@ impl Default for RawAsyncRWMutex {
 }
 
 impl RawAsyncRWMutex {
-    /// Wake the next writer or all pending readers outside the lock, rolling back if a target loop is closed.
-    fn wake_next_after_release(&self, py: Python<'_>) {
+    /// Wake promoted waiters outside the lock, rolling back and advancing on closed loops.
+    fn dispatch_wake_action(&self, py: Python<'_>, mut action: RWAction) {
         loop {
-            enum Action {
-                None,
-                WakeWriter(RWMutexWaiter),
-                WakeReaders(Vec<RWMutexWaiter>),
-            }
-
-            let action = {
-                let mut guard = self.state.lock();
-                if !matches!(guard.mode, RWMutexMode::Unlocked) {
-                    Action::None
-                } else if let Some(w) = guard.write_waiters.pop_front() {
-                    guard.mode = RWMutexMode::WriteLocked {
-                        task_token: w.task_token,
-                        ticket_id: Some(w.id),
-                    };
-                    Action::WakeWriter(w)
-                } else if !guard.read_waiters.is_empty() {
-                    let readers: Vec<RWMutexWaiter> = guard.read_waiters.drain(..).collect();
-                    let mut reader_depths: HashMap<u64, usize> =
-                        HashMap::with_capacity(readers.len());
-                    let mut woken_tickets: HashSet<WaiterId> =
-                        HashSet::with_capacity(readers.len());
-                    for r in &readers {
-                        woken_tickets.insert(r.id);
-                        *reader_depths.entry(r.task_token).or_insert(0) += 1;
-                    }
-                    let total_readers = reader_depths.len();
-                    guard.mode = RWMutexMode::ReadLocked {
-                        total_readers,
-                        reader_depths,
-                        woken_tickets,
-                    };
-                    Action::WakeReaders(readers)
-                } else {
-                    Action::None
-                }
-            };
-
             match action {
-                Action::None => break,
-                Action::WakeWriter(w) => {
-                    if wake_pair_outside_lock(py, &w.loop_obj, &w.fut_obj) {
+                RWAction::None => break,
+                RWAction::WakeWriter(w) => {
+                    let ok = wake_pair_outside_lock(py, &w.loop_obj, &w.fut_obj);
+                    let wid = w.id;
+                    drop(w);
+                    if ok {
                         break;
                     }
                     let mut guard = self.state.lock();
@@ -107,24 +151,25 @@ impl RawAsyncRWMutex {
                         RWMutexMode::WriteLocked {
                             ticket_id: Some(tid),
                             ..
-                        } if tid == w.id
+                        } if tid == wid
                     ) {
                         guard.mode = RWMutexMode::Unlocked;
+                        action = guard.prepare_wake_action();
                     } else {
                         break;
                     }
                 }
-                Action::WakeReaders(readers) => {
+                RWAction::WakeReaders(readers) => {
                     let mut failed_readers = Vec::new();
                     for r in readers {
                         if !wake_pair_outside_lock(py, &r.loop_obj, &r.fut_obj) {
-                            failed_readers.push((r.id, r.task_token));
+                            failed_readers.push(r.id);
                         }
                     }
                     if failed_readers.is_empty() {
                         break;
                     }
-                    let should_retry = {
+                    action = {
                         let mut guard = self.state.lock();
                         let transitioned_to_unlocked = match &mut guard.mode {
                             RWMutexMode::ReadLocked {
@@ -132,14 +177,12 @@ impl RawAsyncRWMutex {
                                 reader_depths,
                                 woken_tickets,
                             } => {
-                                for (rid, tok) in failed_readers {
-                                    if woken_tickets.remove(&rid) {
-                                        if let Some(d) = reader_depths.get_mut(&tok) {
-                                            if *d > 1 {
-                                                *d -= 1;
-                                            } else {
-                                                reader_depths.remove(&tok);
-                                            }
+                                for rid in failed_readers {
+                                    if let Some(tok) = woken_tickets.remove(&rid) {
+                                        if let Some(new_total) =
+                                            decrement_reader_depth(reader_depths, tok)
+                                        {
+                                            *total_readers = new_total;
                                         }
                                     }
                                 }
@@ -151,12 +194,8 @@ impl RawAsyncRWMutex {
                         if transitioned_to_unlocked {
                             guard.mode = RWMutexMode::Unlocked;
                         }
-                        matches!(guard.mode, RWMutexMode::Unlocked)
-                            && (!guard.write_waiters.is_empty() || !guard.read_waiters.is_empty())
+                        guard.prepare_wake_action()
                     };
-                    if !should_retry {
-                        break;
-                    }
                 }
             }
         }
@@ -215,7 +254,7 @@ impl RawAsyncRWMutex {
                     guard.mode = RWMutexMode::ReadLocked {
                         total_readers: 1,
                         reader_depths,
-                        woken_tickets: HashSet::new(),
+                        woken_tickets: HashMap::new(),
                     };
                     Ok(true)
                 } else {
@@ -270,7 +309,7 @@ impl RawAsyncRWMutex {
                         guard.mode = RWMutexMode::ReadLocked {
                             total_readers: 1,
                             reader_depths,
-                            woken_tickets: HashSet::new(),
+                            woken_tickets: HashMap::new(),
                         };
                         Some(Ok(None))
                     } else {
@@ -306,10 +345,13 @@ impl RawAsyncRWMutex {
 
     /// Cancel a pending or newly-woken read ticket and forward ownership if needed.
     pub fn cancel_read_ticket(&self, py: Python<'_>, task_token: u64, ticket_id: WaiterId) {
-        let (need_wake, dropped_waiter) = {
+        let _ = task_token;
+        let (action, dropped_waiter) = {
             let mut guard = self.state.lock();
             if let Some(pos) = guard.read_waiters.iter().position(|w| w.id == ticket_id) {
-                (false, guard.read_waiters.remove(pos))
+                let removed = guard.read_waiters.remove(pos);
+                let action = guard.prepare_wake_action();
+                (action, removed)
             } else {
                 let transitioned = match &mut guard.mode {
                     RWMutexMode::ReadLocked {
@@ -317,16 +359,16 @@ impl RawAsyncRWMutex {
                         reader_depths,
                         woken_tickets,
                     } => {
-                        if woken_tickets.remove(&ticket_id) {
-                            if let Some(d) = reader_depths.get_mut(&task_token) {
-                                if *d > 1 {
-                                    *d -= 1;
-                                } else {
-                                    reader_depths.remove(&task_token);
-                                }
+                        if let Some(owner_tok) = woken_tickets.remove(&ticket_id) {
+                            if let Some(new_total) =
+                                decrement_reader_depth(reader_depths, owner_tok)
+                            {
+                                *total_readers = new_total;
+                                new_total == 0
+                            } else {
+                                *total_readers = reader_depths.len();
+                                *total_readers == 0
                             }
-                            *total_readers = reader_depths.len();
-                            *total_readers == 0
                         } else {
                             false
                         }
@@ -335,24 +377,17 @@ impl RawAsyncRWMutex {
                 };
                 if transitioned {
                     guard.mode = RWMutexMode::Unlocked;
-                    (
-                        !guard.write_waiters.is_empty() || !guard.read_waiters.is_empty(),
-                        None,
-                    )
-                } else {
-                    (false, None)
                 }
+                (guard.prepare_wake_action(), None)
             }
         };
         drop(dropped_waiter);
-        if need_wake {
-            self.wake_next_after_release(py);
-        }
+        self.dispatch_wake_action(py, action);
     }
 
     /// Release a task-tracked read lock (decrements reentrancy depth, wakes next writer when last reader exits).
     pub fn release_read_task(&self, py: Python<'_>, task_token: u64) -> PyResult<()> {
-        let need_wake = {
+        let action = {
             let mut guard = self.state.lock();
             let transitioned = match &mut guard.mode {
                 RWMutexMode::ReadLocked {
@@ -360,15 +395,9 @@ impl RawAsyncRWMutex {
                     reader_depths,
                     ..
                 } => {
-                    if let Some(depth) = reader_depths.get_mut(&task_token) {
-                        if *depth > 1 {
-                            *depth -= 1;
-                            false
-                        } else {
-                            reader_depths.remove(&task_token);
-                            *total_readers = reader_depths.len();
-                            *total_readers == 0
-                        }
+                    if let Some(new_total) = decrement_reader_depth(reader_depths, task_token) {
+                        *total_readers = new_total;
+                        new_total == 0
                     } else {
                         return Err(PyRuntimeError::new_err(
                             "AsyncRWMutex: release_read called by a task that does not hold a read lock",
@@ -383,14 +412,10 @@ impl RawAsyncRWMutex {
             };
             if transitioned {
                 guard.mode = RWMutexMode::Unlocked;
-                !guard.write_waiters.is_empty() || !guard.read_waiters.is_empty()
-            } else {
-                false
             }
+            guard.prepare_wake_action()
         };
-        if need_wake {
-            self.wake_next_after_release(py);
-        }
+        self.dispatch_wake_action(py, action);
         Ok(())
     }
 
@@ -493,14 +518,12 @@ impl RawAsyncRWMutex {
 
     /// Cancel a pending or newly-woken write ticket and forward ownership if needed.
     pub fn cancel_write_ticket(&self, py: Python<'_>, _task_token: u64, ticket_id: WaiterId) {
-        let (need_wake, dropped_waiter) = {
+        let (action, dropped_waiter) = {
             let mut guard = self.state.lock();
             if let Some(pos) = guard.write_waiters.iter().position(|w| w.id == ticket_id) {
                 let removed = guard.write_waiters.remove(pos);
-                let wake = matches!(guard.mode, RWMutexMode::Unlocked)
-                    && guard.write_waiters.is_empty()
-                    && !guard.read_waiters.is_empty();
-                (wake, removed)
+                let action = guard.prepare_wake_action();
+                (action, removed)
             } else if matches!(
                 guard.mode,
                 RWMutexMode::WriteLocked {
@@ -509,23 +532,19 @@ impl RawAsyncRWMutex {
                 } if tid == ticket_id
             ) {
                 guard.mode = RWMutexMode::Unlocked;
-                (
-                    !guard.write_waiters.is_empty() || !guard.read_waiters.is_empty(),
-                    None,
-                )
+                let action = guard.prepare_wake_action();
+                (action, None)
             } else {
-                (false, None)
+                (RWAction::None, None)
             }
         };
         drop(dropped_waiter);
-        if need_wake {
-            self.wake_next_after_release(py);
-        }
+        self.dispatch_wake_action(py, action);
     }
 
     /// Release a task-tracked exclusive write lock and wake next writer or all pending readers.
     pub fn release_write_task(&self, py: Python<'_>, task_token: u64) -> PyResult<()> {
-        {
+        let action = {
             let mut guard = self.state.lock();
             if !matches!(
                 guard.mode,
@@ -536,8 +555,9 @@ impl RawAsyncRWMutex {
                 ));
             }
             guard.mode = RWMutexMode::Unlocked;
-        }
-        self.wake_next_after_release(py);
+            guard.prepare_wake_action()
+        };
+        self.dispatch_wake_action(py, action);
         Ok(())
     }
 
@@ -561,5 +581,29 @@ impl RawAsyncRWMutex {
                 (*total_readers, false, pending_writers)
             }
         }
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let Some(guard) = self.state.try_lock() else {
+            return Ok(());
+        };
+        for w in &guard.read_waiters {
+            visit.call(&w.loop_obj)?;
+            visit.call(&w.fut_obj)?;
+        }
+        for w in &guard.write_waiters {
+            visit.call(&w.loop_obj)?;
+            visit.call(&w.fut_obj)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&self) {
+        let mut guard = self.state.lock();
+        let read_waiters = std::mem::take(&mut guard.read_waiters);
+        let write_waiters = std::mem::take(&mut guard.write_waiters);
+        drop(guard);
+        drop(read_waiters);
+        drop(write_waiters);
     }
 }

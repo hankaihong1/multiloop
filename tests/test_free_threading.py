@@ -11,6 +11,7 @@ which gate-keeps on ``sys._is_gil_enabled() is False``.
 import asyncio
 import sys
 import threading
+from typing import Any
 
 import pytest
 
@@ -35,6 +36,7 @@ from multiloop import (  # noqa: E402
     CancelScope,
     CapacityLimiter,
     EventLoopThreadPool,
+    ThreadPoolClosedError,
     sleep,
 )
 from multiloop.testing import wait_all_tasks_blocked  # noqa: E402
@@ -202,27 +204,84 @@ async def test_pool_concurrent_submit_close():
     pool = EventLoopThreadPool(num_threads=2)
     await pool.start()
 
-    errors: list[Exception] = []
+    num_submitters = 4
+    submissions_per_thread = 20
+    barrier = threading.Barrier(num_submitters + 1, timeout=5.0)
+    submit_errors: list[Exception] = []
+    future_errors: list[Exception] = []
+    unexpected_errors: list[BaseException] = []
+    accepted_counts: list[int] = []
+    lock = threading.Lock()
 
-    def hammer_submit():
-        for _ in range(20):
-            try:
-                pool.submit(asyncio.sleep, 0.001)
-            except Exception as exc:
-                errors.append(exc)
+    def hammer_submit() -> None:
+        async def _submitter() -> None:
+            assert asyncio.get_running_loop().is_running()
+            accepted: list[asyncio.Future[Any]] = []
+            local_submit_errors: list[Exception] = []
+            local_future_errors: list[Exception] = []
 
-    threads = [threading.Thread(target=hammer_submit) for _ in range(4)]
+            barrier.wait()
+            for i in range(submissions_per_thread):
+                try:
+                    fut = pool.submit(asyncio.sleep, 0.001)
+                except Exception as exc:
+                    local_submit_errors.append(exc)
+                else:
+                    assert asyncio.isfuture(fut)
+                    accepted.append(fut)
+                if i % 4 == 3:
+                    await asyncio.sleep(0.001)
+                else:
+                    await asyncio.sleep(0)
+
+            if accepted:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*accepted, return_exceptions=True),
+                    timeout=5.0,
+                )
+                for res in results:
+                    if isinstance(res, BaseException):
+                        if isinstance(res, Exception):
+                            local_future_errors.append(res)
+                        else:
+                            with lock:
+                                unexpected_errors.append(res)
+
+            with lock:
+                submit_errors.extend(local_submit_errors)
+                future_errors.extend(local_future_errors)
+                accepted_counts.append(len(accepted))
+
+        try:
+            asyncio.run(_submitter())
+        except BaseException as exc:
+            with lock:
+                unexpected_errors.append(exc)
+
+    threads = [threading.Thread(target=hammer_submit) for _ in range(num_submitters)]
     for t in threads:
         t.start()
 
-    # Close while threads are still submitting — exercises lock safety.
-    await pool.close()
+    try:
+        await asyncio.to_thread(barrier.wait)
+        # Close while submitter threads are actively racing submit() from their own running loops.
+        await pool.close()
+    finally:
+        for t in threads:
+            t.join(timeout=10.0)
+        await pool.close()
 
-    for t in threads:
-        t.join()
+    assert not any(t.is_alive() for t in threads), "Submitter thread failed to exit"
+    assert not unexpected_errors, f"Unexpected thread/future exceptions: {unexpected_errors}"
+    assert sum(accepted_counts) + len(submit_errors) == num_submitters * submissions_per_thread
 
-    # Some errors (ThreadPoolClosedError) are expected from submit
-    # after close. None of them should be segmentation faults or
-    # internal Python exceptions (AttributeError, TypeError, etc.).
-    for exc in errors:
-        assert isinstance(exc, RuntimeError), f"Unexpected error type: {type(exc).__name__}: {exc}"
+    # Errors from submit() or unexecuted accepted futures during close() must be
+    # specifically ThreadPoolClosedError — never the missing-loop RuntimeError
+    # or internal Python errors.
+    for exc in [*submit_errors, *future_errors]:
+        assert "running asyncio event loop" not in str(exc), (
+            f"submit() unexpectedly saw missing running loop: {exc}"
+        )
+        assert isinstance(exc, ThreadPoolClosedError), (
+            f"Unexpected error type: {type(exc).__name__}: {exc}"
+        )

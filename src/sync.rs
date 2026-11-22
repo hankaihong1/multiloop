@@ -1,11 +1,20 @@
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::pyclass::{PyTraverseError, PyVisit};
 use pyo3::types::{PyInt, PyWeakrefMethods, PyWeakrefReference};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::waiter::{wake_pair_outside_lock, wake_waiter_outside_lock, WaiterEntry, WaiterId};
+
+#[inline]
+fn visit_waiter_entry(w: &WaiterEntry, visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
+    visit.call(&w.event_loop)?;
+    visit.call(&w.future)?;
+    visit.call(w.channel_token.as_ref())?;
+    Ok(())
+}
 
 // ============================================================================
 // RawAsyncLock — fair FIFO task-owned mutex
@@ -28,7 +37,6 @@ enum LockState {
         loop_id: usize,
         ticket_id: Option<WaiterId>,
     },
-    AbandonedByDeadOwner,
 }
 
 struct LockInner {
@@ -111,40 +119,59 @@ impl RawAsyncLock {
         }
     }
 
-    pub fn locked(&self) -> bool {
-        matches!(
-            self.state.lock().lock_state,
-            LockState::Locked { .. } | LockState::AbandonedByDeadOwner
-        )
+    pub fn locked(&self, py: Python<'_>) -> bool {
+        loop {
+            let locked_ref = {
+                let guard = self.state.lock();
+                match &guard.lock_state {
+                    LockState::Unlocked => return false,
+                    LockState::Locked {
+                        task_weak,
+                        task_token,
+                        ..
+                    } => (task_weak.clone_ref(py), *task_token),
+                }
+            };
+            let (task_weak, task_token) = locked_ref;
+            let is_alive = task_weak.bind(py).upgrade().is_some();
+            drop(task_weak);
+            if is_alive {
+                return true;
+            }
+            self.on_owner_task_done(py, task_token);
+        }
     }
 
-    pub fn owner(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+    #[pyo3(signature = (caller_loop_id = None))]
+    pub fn owner(&self, py: Python<'_>, caller_loop_id: Option<usize>) -> Option<Py<PyAny>> {
         let locked_ref = {
             let guard = self.state.lock();
             match &guard.lock_state {
                 LockState::Locked {
                     task_weak,
                     task_token,
+                    loop_id,
                     ..
-                } => Some((task_weak.clone_ref(py), *task_token)),
-                LockState::Unlocked | LockState::AbandonedByDeadOwner => None,
+                } => Some((task_weak.clone_ref(py), *task_token, *loop_id)),
+                LockState::Unlocked => None,
             }
         };
-        let (task_weak, task_token) = locked_ref?;
+        let (task_weak, task_token, owner_loop_id) = locked_ref?;
         match task_weak.bind(py).upgrade() {
             Some(task_obj) => {
-                let is_done = task_obj
-                    .call_method0("done")
-                    .and_then(|d| d.extract::<bool>())
-                    .unwrap_or(false);
-                if is_done {
-                    drop(task_obj);
-                    drop(task_weak);
-                    self.on_owner_task_done(py, task_token);
-                    None
-                } else {
-                    Some(task_obj.unbind())
+                if caller_loop_id == Some(owner_loop_id) {
+                    let is_done = task_obj
+                        .call_method0("done")
+                        .and_then(|d| d.extract::<bool>())
+                        .unwrap_or(false);
+                    if is_done {
+                        drop(task_obj);
+                        drop(task_weak);
+                        self.on_owner_task_done(py, task_token);
+                        return None;
+                    }
                 }
+                Some(task_obj.unbind())
             }
             None => {
                 drop(task_weak);
@@ -202,12 +229,7 @@ impl RawAsyncLock {
             if !is_owner {
                 return;
             }
-            if guard.waiters.is_empty() {
-                let old = std::mem::replace(&mut guard.lock_state, LockState::AbandonedByDeadOwner);
-                (old, None)
-            } else {
-                guard.handoff_locked(py)
-            }
+            guard.handoff_locked(py)
         };
         drop(old_state);
         self.wake_and_advance_on_closed_loop(py, next_waiter);
@@ -238,7 +260,7 @@ impl RawAsyncLock {
                         (Ok(false), None, Some(task_weak))
                     }
                 }
-                LockState::Unlocked | LockState::AbandonedByDeadOwner => {
+                LockState::Unlocked => {
                     if guard.waiters.is_empty() {
                         let old = std::mem::replace(
                             &mut guard.lock_state,
@@ -280,9 +302,7 @@ impl RawAsyncLock {
                     None,
                     Some((Some(task_weak), loop_obj, fut_obj)),
                 ),
-                LockState::Unlocked | LockState::AbandonedByDeadOwner
-                    if guard.waiters.is_empty() =>
-                {
+                LockState::Unlocked if guard.waiters.is_empty() => {
                     let old = std::mem::replace(
                         &mut guard.lock_state,
                         LockState::Locked {
@@ -354,6 +374,30 @@ impl RawAsyncLock {
         drop(old_state);
         self.wake_and_advance_on_closed_loop(py, next_waiter);
         Ok(())
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let Some(guard) = self.state.try_lock() else {
+            return Ok(());
+        };
+        if let LockState::Locked { task_weak, .. } = &guard.lock_state {
+            visit.call(task_weak)?;
+        }
+        for w in &guard.waiters {
+            visit.call(&w.task_weak)?;
+            visit.call(&w.loop_obj)?;
+            visit.call(&w.fut_obj)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&self) {
+        let mut guard = self.state.lock();
+        let old_state = std::mem::replace(&mut guard.lock_state, LockState::Unlocked);
+        let waiters = std::mem::take(&mut guard.waiters);
+        drop(guard);
+        drop(old_state);
+        drop(waiters);
     }
 }
 
@@ -509,6 +553,23 @@ impl RawAsyncSemaphore {
         }
         Ok(())
     }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let Some(guard) = self.state.try_lock() else {
+            return Ok(());
+        };
+        for w in &guard.waiters {
+            visit_waiter_entry(w, &visit)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&self) {
+        let mut guard = self.state.lock();
+        let waiters = std::mem::take(&mut guard.waiters);
+        drop(guard);
+        drop(waiters);
+    }
 }
 
 // ============================================================================
@@ -571,13 +632,21 @@ impl RawAsyncCapacityLimiter {
     }
 }
 
+#[inline]
+fn validate_total_tokens(value: f64) -> PyResult<()> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(PyValueError::new_err(
+            "total_tokens must be a finite positive number",
+        ));
+    }
+    Ok(())
+}
+
 #[pymethods]
 impl RawAsyncCapacityLimiter {
     #[new]
     pub fn new(total_tokens: f64) -> PyResult<Self> {
-        if total_tokens <= 0.0 || total_tokens.is_nan() {
-            return Err(PyValueError::new_err("total_tokens must be positive"));
-        }
+        validate_total_tokens(total_tokens)?;
         Ok(RawAsyncCapacityLimiter {
             state: Arc::new(Mutex::new(CapacityLimiterInner {
                 next_waiter_id: 1,
@@ -594,9 +663,7 @@ impl RawAsyncCapacityLimiter {
     }
 
     pub fn set_total_tokens(&self, py: Python<'_>, value: f64) -> PyResult<()> {
-        if value <= 0.0 || value.is_nan() {
-            return Err(PyValueError::new_err("total_tokens must be positive"));
-        }
+        validate_total_tokens(value)?;
         {
             let mut guard = self.state.lock();
             guard.total_tokens = value;
@@ -685,6 +752,23 @@ impl RawAsyncCapacityLimiter {
         self.wake_available_waiters(py);
         Ok(())
     }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let Some(guard) = self.state.try_lock() else {
+            return Ok(());
+        };
+        for w in &guard.waiters {
+            visit_waiter_entry(w, &visit)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&self) {
+        let mut guard = self.state.lock();
+        let waiters = std::mem::take(&mut guard.waiters);
+        drop(guard);
+        drop(waiters);
+    }
 }
 
 // ============================================================================
@@ -768,6 +852,23 @@ impl RawAsyncEvent {
             .map(|pos| guard.waiters.swap_remove(pos));
         drop(guard);
         drop(removed);
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let Some(guard) = self.state.try_lock() else {
+            return Ok(());
+        };
+        for w in &guard.waiters {
+            visit_waiter_entry(w, &visit)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&self) {
+        let mut guard = self.state.lock();
+        let waiters = std::mem::take(&mut guard.waiters);
+        drop(guard);
+        drop(waiters);
     }
 }
 
@@ -906,6 +1007,23 @@ impl RawAsyncCondition {
             }
         }
     }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let Some(guard) = self.state.try_lock() else {
+            return Ok(());
+        };
+        for w in &guard.waiters {
+            visit_waiter_entry(w, &visit)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&self) {
+        let mut guard = self.state.lock();
+        let waiters = std::mem::take(&mut guard.waiters);
+        drop(guard);
+        drop(waiters);
+    }
 }
 
 // ============================================================================
@@ -933,11 +1051,37 @@ impl BarrierInner {
         self.next_waiter_id = self.next_waiter_id.wrapping_add(1).max(1);
         id
     }
+
+    fn check_and_try_trip(&mut self) -> PyResult<Option<(usize, Vec<WaiterEntry>)>> {
+        match self.barrier_state {
+            BarrierState::Aborted => Err(PyRuntimeError::new_err("barrier has been aborted")),
+            BarrierState::Broken => Err(PyRuntimeError::new_err("barrier is broken")),
+            BarrierState::Healthy => {
+                let n = self.waiters.len() + 1;
+                if n == self.parties {
+                    let drained: Vec<WaiterEntry> = self.waiters.drain(..).collect();
+                    self.generation = self.generation.wrapping_add(1);
+                    Ok(Some((self.parties - 1, drained)))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
 }
 
 #[pyclass(frozen, module = "multiloop._multiloop_core")]
 pub struct RawAsyncBarrier {
     state: Arc<Mutex<BarrierInner>>,
+}
+
+impl RawAsyncBarrier {
+    fn wake_tripped_waiters(py: Python<'_>, drained: Vec<WaiterEntry>) {
+        for (idx, w) in drained.into_iter().enumerate() {
+            let code = PyInt::new(py, idx as isize).into_any().unbind();
+            wake_waiter_outside_lock(py, &w, Some(code), false);
+        }
+    }
 }
 
 #[pymethods]
@@ -973,6 +1117,19 @@ impl RawAsyncBarrier {
         self.state.lock().waiters.len()
     }
 
+    pub fn try_arrive(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        let tripped = {
+            let mut guard = self.state.lock();
+            guard.check_and_try_trip()?
+        };
+        if let Some((trip_idx, drained)) = tripped {
+            Self::wake_tripped_waiters(py, drained);
+            Ok(Some(trip_idx))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn arrive_or_register(
         &self,
         py: Python<'_>,
@@ -981,42 +1138,26 @@ impl RawAsyncBarrier {
     ) -> PyResult<(u64, Option<WaiterId>)> {
         let (outcome, _dropped_args) = {
             let mut guard = self.state.lock();
-            match guard.barrier_state {
-                BarrierState::Aborted => (
-                    Err(PyRuntimeError::new_err("barrier has been aborted")),
+            match guard.check_and_try_trip() {
+                Err(err) => (Err(err), Some((loop_obj, fut_obj))),
+                Ok(Some((_trip_idx, drained))) => (
+                    Ok((guard.generation, None, drained)),
                     Some((loop_obj, fut_obj)),
                 ),
-                BarrierState::Broken => (
-                    Err(PyRuntimeError::new_err("barrier is broken")),
-                    Some((loop_obj, fut_obj)),
-                ),
-                BarrierState::Healthy => {
-                    let n = guard.waiters.len() + 1;
-                    if n == guard.parties {
-                        let drained: Vec<WaiterEntry> = guard.waiters.drain(..).collect();
-                        guard.generation = guard.generation.wrapping_add(1);
-                        (
-                            Ok((guard.generation, None, drained)),
-                            Some((loop_obj, fut_obj)),
-                        )
-                    } else {
-                        let id = guard.alloc_id();
-                        let gen = guard.generation;
-                        guard
-                            .waiters
-                            .push_back(WaiterEntry::new(id, loop_obj, fut_obj));
-                        (Ok((gen, Some(id), Vec::new())), None)
-                    }
+                Ok(None) => {
+                    let id = guard.alloc_id();
+                    let gen = guard.generation;
+                    guard
+                        .waiters
+                        .push_back(WaiterEntry::new(id, loop_obj, fut_obj));
+                    (Ok((gen, Some(id), Vec::new())), None)
                 }
             }
         };
 
         let (gen, ticket_opt, drained) = outcome?;
         if ticket_opt.is_none() {
-            for (idx, w) in drained.into_iter().enumerate() {
-                let code = PyInt::new(py, (idx + 1) as isize).into_any().unbind();
-                wake_waiter_outside_lock(py, &w, Some(code), false);
-            }
+            Self::wake_tripped_waiters(py, drained);
         }
         Ok((gen, ticket_opt))
     }
@@ -1069,6 +1210,23 @@ impl RawAsyncBarrier {
             let code = PyInt::new(py, -3isize).into_any().unbind();
             wake_waiter_outside_lock(py, &w, Some(code), false);
         }
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let Some(guard) = self.state.try_lock() else {
+            return Ok(());
+        };
+        for w in &guard.waiters {
+            visit_waiter_entry(w, &visit)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&self) {
+        let mut guard = self.state.lock();
+        let waiters = std::mem::take(&mut guard.waiters);
+        drop(guard);
+        drop(waiters);
     }
 }
 
@@ -1212,5 +1370,29 @@ impl RawAsyncOnce {
                 wake_pair_outside_lock(py, &w.event_loop, &w.future);
             }
         }
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let Some(guard) = self.state.try_lock() else {
+            return Ok(());
+        };
+        match &guard.state {
+            OnceState::Idle => {}
+            OnceState::Executing(waiters) => {
+                for w in waiters {
+                    visit_waiter_entry(w, &visit)?;
+                }
+            }
+            OnceState::DoneValue(val) => visit.call(val)?,
+            OnceState::DoneError(exc) => visit.call(exc)?,
+        }
+        Ok(())
+    }
+
+    fn __clear__(&self) {
+        let mut guard = self.state.lock();
+        let old_state = std::mem::replace(&mut guard.state, OnceState::Idle);
+        drop(guard);
+        drop(old_state);
     }
 }

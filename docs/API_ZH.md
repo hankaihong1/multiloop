@@ -32,6 +32,7 @@
 - [任务管理](#任务管理-task-management)
   - [`TaskGroup`](#taskgroup)
   - [`TaskHandle`](#taskhandle)
+  - [`TaskState`](#taskstate)
   - [`TaskStatus`](#taskstatus)
   - [`CancelScope`](#cancelscope)
 - [同步与控制原语](#同步与控制原语-synchronization--control-primitives)
@@ -353,15 +354,15 @@ EventLoopThreadPool(
 池是否正在运行 worker 循环。
 
 ##### `async start()` -> `None`
-启动所有 worker 线程及其工作窃取队列分发器。
+启动所有 worker 线程及其工作窃取队列分发器。若池已关闭或已中止则抛出 `ThreadPoolClosedError`。
 
 ##### `async close(timeout: float | None = None)` -> `None`
 优雅停止所有 worker 循环：排空待处理任务、join 所有 worker 线程。
 
-排空超时可配置：`close()` 最多等待 `timeout` 秒（传入 `None` 时默认为 5.0 秒）让进行中的任务完成，超时后强制停止所有 worker 循环——届时仍在运行的任务会被取消，不保证完成。
+排空超时可配置：`close()` 最多等待 `timeout` 秒（传入 `None` 时默认为 5.0 秒；支持 `None`、`+inf` 及有界浮点数，`NaN` 或 `-inf` 抛 `ValueError`）让进行中与已排队的任务完成，超时后强制停止所有 worker 循环——届时仍在运行的任务会被取消，不保证完成。并发调用的 `close()` 与 `abort()` 会串行化并等待至清理彻底完成；一旦关闭或中止，池不可重新启动（再次调用 `start()` 或 `submit()` 会抛出 `ThreadPoolClosedError`）。
 
 ##### `async abort()` -> `None`
-强制停止所有 worker 循环，**不**排空待处理任务。已排队未执行的工作被丢弃。
+强制停止所有 worker 循环，**不**排空待处理任务。已排队但尚未执行的工作以 `ThreadPoolClosedError` 失败。并发调用的 `close()` 与 `abort()` 会等待至清理彻底完成，且此后池不可重新启动。
 
 ##### `async wait_closed()` -> `None`
 等待池完全停止。池未运行时立即返回。
@@ -373,10 +374,10 @@ EventLoopThreadPool(
 - **`pin_to`**：可选地把任务钉到指定 worker 循环（`int` worker 下标或池管理
   的 `AbstractEventLoop`）。为 `None` 时任务进全局共享队列。
 - **`cancel_scope`**：可选地把任务绑定到 `CancelScope`；已取消的 scope
-  会取消返回的 `Future`（`asyncio.CancelledError`），并立即中断路线 3
+  会取消返回的 `Future`（`asyncio.CancelledError`），并立即中断 `multiloop`
   等待点（`multiloop.sleep`、`Channel`、`Lock`、`wait_cancellable` 等）。
 - **抛出**：池已关闭时抛 `ThreadPoolClosedError`，非法 `pin_to` 下标抛
-  `ValueError`，传入原生 `asyncio.Future` 或向协程对象传递参数时抛 `TypeError`。
+  `ValueError`，传入原生 `asyncio.Future`（裸 Future 绑定于单 Loop）或向协程对象传递参数时抛 `TypeError`。
 
 ##### `submit_many(targets: Iterable[Callable[..., Any] | Any], cancel_scope: CancelScope | None = None)` -> `list[asyncio.Future]`
 在单次调度周期内将批量任务并发推入共享全局队列，最大化跨 Worker 线程的吞吐分发。返回与每个任务一一对应的 `asyncio.Future` 列表。
@@ -452,11 +453,11 @@ async def run_in_pool(coro: Any, *args: Any, num_threads: int = 0, **kwargs: Any
 async def checkpoint() -> None
 ```
 
-检查当前任务的路线 3 纯 Rust 取消栈（`RawTaskCancelState`）：如果当前 scope
+检查当前任务的纯 Rust 取消栈（`RawTaskCancelState`）：如果当前 scope
 （或任一未屏蔽的祖先 scope）已被取消，抛出 `asyncio.CancelledError`。在无法
 频繁 `await` 的长运行代码中周期性调用。
 
-在路线 3 下，取消检查为**水平触发**，全程绝不读写或修改 CPython 的
+取消检查为**水平触发**，全程绝不读写或修改 CPython 的
 `task.cancelling()` 计数。
 
 ### `sleep`
@@ -465,7 +466,7 @@ async def checkpoint() -> None
 async def sleep(delay: float) -> None
 ```
 
-订阅当前任务的路线 3 `CancelScope` 栈休眠 `delay` 秒。在 `CancelScope`、
+订阅当前任务的 `CancelScope` 栈休眠 `delay` 秒。在 `CancelScope`、
 `fail_after`、`move_on_after` 与 `TaskGroup` 内部请优先使用
 `multiloop.sleep(...)` 替代 `asyncio.sleep(...)`，以便取消时立即中断休眠。
 
@@ -483,7 +484,7 @@ async def wait_cancellable(awaitable: Awaitable[_T]) -> _T
 ```
 
 将外部 asyncio 可等待对象（如 `asyncio.sleep(...)` 或第三方异步 I/O 协程）
-桥接到路线 3 `CancelScope`，使活跃的取消与超时能立即生效。若等待期间
+桥接到 `CancelScope`，使活跃的取消与超时能立即生效。若等待期间
 `CancelScope` 被取消，将自动取消底层任务并等待其结束后再传播
 `asyncio.CancelledError`。
 
@@ -500,7 +501,7 @@ async with fail_after(0.05):
 def fail_after(seconds: float) -> CancelScope
 ```
 
-返回一个到期抛 `TimeoutError` 的 `CancelScope`。
+返回一个到期抛 `TimeoutError` 的 `CancelScope`（外部 `task.cancel()` 按 `asyncio.CancelledError` 原样向上传播，不会被转换为 `TimeoutError`）。
 
 ```python
 async with fail_after(5):
@@ -513,8 +514,8 @@ async with fail_after(5):
 def move_on_after(seconds: float) -> CancelScope
 ```
 
-返回一个到期静默退出的 `CancelScope`。到期后 `scope.cancelled_caught`
-为 `True`。
+返回一个到期静默退出的 `CancelScope`（到期后 `scope.cancelled_caught`
+为 `True`；外部 `task.cancel()` 原样向上传播，不会被静默吞掉）。
 
 ```python
 async with move_on_after(5) as scope:
@@ -760,12 +761,12 @@ async with TaskGroup(max_concurrency=10) as tg:
 
 #### 属性
 
-- **`status`** -> `_TaskStatus`：当前生命周期状态——`_TaskStatus.PENDING`、
-  `_TaskStatus.STARTED` 或 `_TaskStatus.FINISHED`。
+- **`status`** -> `TaskState`：当前生命周期状态——`TaskState.PENDING`、
+  `TaskState.STARTED` 或 `TaskState.FINISHED`。
 - **`result`** -> `Any`：任务完成后的结果。
-  - **抛出**：任务未完成时抛 `RuntimeError`。
+  - **抛出**：任务未完成时抛 `RuntimeError`，任务已取消时抛 `asyncio.CancelledError`。
 - **`exception`** -> `BaseException | None`：任务的异常；成功则为 `None`。
-  - **抛出**：任务未完成时抛 `RuntimeError`。
+  - **抛出**：任务未完成时抛 `RuntimeError`，任务已取消时抛 `asyncio.CancelledError`（与 `asyncio.Future.exception()` 一致）。
 
 #### 可等待
 
@@ -775,6 +776,14 @@ async with TaskGroup(max_concurrency=10) as tg:
 h = tg.start_soon(worker, "a")
 result = await h
 ```
+
+### `TaskState`
+
+表示 `TaskHandle`（`handle.status`）所跟踪子任务生命周期状态的 `enum.Enum` 枚举。
+
+- **`TaskState.PENDING`**：任务已调度，或通过 `TaskGroup.start()` 启动但尚未调用 `task_status.started()`。
+- **`TaskState.STARTED`**：任务通过 `TaskGroup.start()` 派生，已调用 `task_status.started()` 且仍在运行。
+- **`TaskState.FINISHED`**：任务已结束（成功完成、异常失败或已被取消）。
 
 ### `TaskStatus`
 
@@ -797,7 +806,7 @@ async with TaskGroup() as tg:
 
 ### `CancelScope`
 
-由路线 3 纯 Rust `RawTaskCancelState` 取消栈驱动的、单次使用的任务本地取消作用域
+由纯 Rust `RawTaskCancelState` 取消栈驱动的、单次使用的任务本地取消作用域
 （全程绝不修改 CPython `task.cancel()`、`task.uncancel()` 或 `task.cancelling()`）。
 
 ```text
@@ -805,7 +814,7 @@ CancelScope(deadline: float = float("inf"), shield: bool = False)
 ```
 
 - **`deadline`** (*float*)：绝对单调截止时间。`float("inf")` 表示无截止。支持动态修改 `.deadline` 重新调度定时器。
-- **`shield`** (*bool*)：路线 3 作用域屏蔽屏障：当 `shield` 为 `True` 时在 Rust 取消栈上遮蔽外层 `CancelScope` 的取消与截止时间（支持在清理块中正常 `await` `multiloop.sleep`、`Channel`、`Lock`、`wait_cancellable` 等），全程不触碰 CPython `task.cancelling()`。注意：外部原生 CPython `task.cancel()` 不受影响。
+- **`shield`** (*bool*)：作用域屏蔽屏障：当 `shield` 为 `True` 时在 Rust 取消栈上遮蔽外层 `CancelScope` 的取消与截止时间（支持在清理块中正常 `await` `multiloop.sleep`、`Channel`、`Lock`、`wait_cancellable` 等），全程不触碰 CPython `task.cancelling()`。注意：外部原生 CPython `task.cancel()` 不受影响。
 
 #### 属性与方法
 
@@ -813,14 +822,14 @@ CancelScope(deadline: float = float("inf"), shield: bool = False)
 - **`cancelled_caught`** -> `bool`：move-on 作用域（`move_on_after` / `move_on_at`）静默吸收了自身取消时为 `True`。
 - **`deadline`** -> `float`：绝对单调截止时间（可读写）。
 - **`shield`** -> `bool`：是否阻止外层 `CancelScope` 取消（可读写）。
-- **`cancel()`**：在 Rust 中将 scope 标记为已取消并经 `call_soon_threadsafe` 唤醒挂起的路线 3 等待者。幂等且线程安全。
+- **`cancel()`**：在 Rust 中将 scope 标记为已取消并经 `call_soon_threadsafe` 唤醒挂起的等待者。幂等且线程安全。
 
 #### 三模式退出契约
 
 `async with scope:` 在 `__aexit__` 退出时严格执行三种退出模式：
 1. **普通 `CancelScope`（`PLAIN`）**：若已触发取消且代码块正常结束（`exc_type is None`），退出时抛出 `asyncio.CancelledError()`；代码块抛出的非取消业务异常原样传播。
-2. **`move_on_after` / `move_on_at`（`MOVE_ON`）**：静默吸收自身取消，设置 `scope.cancelled_caught = True` 并返回 `True`，不会误吞外部 CPython `task.cancel()` 或业务异常。
-3. **`fail_after` / `fail_at`（`FAIL_AFTER`）**：将自身触发的取消或超时（即使内部捕获了 `CancelledError` 并正常走出块）统一转换为 `multiloop.TimeoutError` 抛出。
+2. **`move_on_after` / `move_on_at`（`MOVE_ON`）**：静默吸收自身取消，设置 `scope.cancelled_caught = True` 并返回 `True`。外部 CPython `task.cancel()`、外层 `CancelScope` 取消以及非取消业务异常不会被吞掉，均正常向上传播。
+3. **`fail_after` / `fail_at`（`FAIL_AFTER`）**：将自身触发的取消或超时（即使内部捕获了 `CancelledError` 并正常走出块）统一转换为 `multiloop.TimeoutError` 抛出。外部 CPython `task.cancel()` 不会被转换，按 `asyncio.CancelledError` 原样向上传播。
 
 #### 上下文管理器
 `async with CancelScope(...) as scope:` 把 scope 压入当前任务的 Rust 取消栈（跨任务共享或重复进入抛 `RuntimeError`）。
@@ -840,13 +849,13 @@ async with lock:
     critical_section()
 ```
 
-- **`locked`** -> `bool`：锁是否被持有。
+- **`locked`** -> `bool`：锁是否正被存活任务持有。
 - **`owner`** -> `asyncio.Task | None`：当前持有锁的任务（如有）。
 
 > **诊断属性**（`locked`/`owner`/`Semaphore.value`/`qsize`/`Event.is_set`/`TaskHandle.status`）是各自内部锁下的一致快照——彼此之间**不是**原子的，也不能替代并发下的真实 acquire/wait 操作。
 - **`acquire()`**：获取锁，挂起直到空闲。
 - **`try_acquire()` -> `bool`**：非阻塞原子尝试获取锁。获取成功返回 `True`，已被其他任务占用返回 `False`。
-- **`release()`**：释放锁。必须由持有者调用。
+- **`release()`**：释放锁。必须由持有者调用。若持有锁的任务在同一事件循环上已结束或已被垃圾回收且未调用 `release()`，`Lock` 会自动回收该死亡持有者——唤醒队列中下一个 FIFO 等待者，或直接回到未锁定状态（`locked == False`、`owner is None`、`try_acquire() == True`）。
 
 ### `Semaphore`
 
@@ -870,7 +879,7 @@ Semaphore(max_value: int)
 CapacityLimiter(total_tokens: float)
 ```
 
-- **`total_tokens`** -> `float`：总容量（可读写）。
+- **`total_tokens`** -> `float`：总容量（可读写）。必须为有限正数（`> 0` 且有限）；向 `CapacityLimiter(total_tokens)` 或 `total_tokens` setter 传入 `NaN`、`inf`、`-inf` 或 `<= 0` 会抛出 `ValueError`。
 - **`total_capacity`** -> `int`：整型底容量（`int(total_tokens)`）。
 - **`available_tokens`** -> `float`：当前可用令牌（`total_tokens - borrowed_tokens`）。
 - **`available_capacity`** -> `int`：当前可立即获取的离散整型槽位数（`max(0, int(total_tokens) - borrowed)`）。
@@ -918,16 +927,18 @@ Barrier(parties: int)
 ```
 
 - **`parties`** -> `int`：触发屏障所需的 party 数。
+- **`broken`** -> `bool`：屏障处于破损或已中止状态时为 `True`。
 - **`n_waiting`** -> `int`：当前等待的 party 数。
 - **`wait()`** -> `BarrierWaitResult`：阻塞直到所有 party 到齐。
-- **`abort()`**：中止屏障，唤醒所有等待者。
+- **`abort()`**：中止屏障，以 `RuntimeError` 唤醒所有等待者。
+- **`reset()`**：将屏障重置为全新代际的健康初始状态，若有当前正在等待的 party 则以 `RuntimeError` 唤醒。
 
 ### `BarrierWaitResult`
 
 `Barrier.wait()` 返回的结果对象。
 
 - **`parties`** -> `int`：本回合屏障的 party 总数。
-- **`index`** -> `int`：调用任务的到达次序下标（`0` 到 `parties - 1`）。
+- **`index`** -> `int`：调用任务从 0 开始的到达次序下标（`0` 到 `parties - 1`），与 `threading.Barrier` 一致（本回合首个到达的任务获得 `index == 0`，最后一个到达并触发屏障放行的任务获得 `index == parties - 1`）。
 - **`is_leader`** -> `bool`：若当前任务为本回合率先到达者（`index == 0`）则为 `True`。
 
 ### `AsyncContext`
@@ -962,7 +973,7 @@ await wg.wait()
 
 所有正数 `add()` 调用必须先于同一计数器的第一次 `wait()`（与 Go `sync.WaitGroup` 一致）：并发的 `add()` 与 `wait()` 竞争会丢失唤醒并永久挂起。允许负数增量（Go 语义），但不得把计数器减到 0 以下——否则抛出 `RuntimeError`。
  
-支持通过 `async with wg.holding():` 与 `tg.start_soon(wg.wrap(fn))` 进行结构化 RAII 跟踪，确保在异常与取消路径下计数器严格平衡。
+支持通过 `async with wg.holding():`、`tg.start_soon(wg.track(coro))`（调度前立即 `add(1)`）与 `tg.start_soon(wg.wrap(fn))` 进行结构化 RAII 跟踪，确保在异常与取消路径下计数器严格平衡。
 
 ---
 

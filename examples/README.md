@@ -2,15 +2,15 @@
 
 **[中文版 (Chinese)](README_ZH.md)**
 
-After cloning (run `make develop` first to compile the Rust core), execute
+After cloning (run `make develop` first to compile the required `_multiloop_core` Rust extension), execute
 directly:
 
 ```bash
-uv run python examples/00_pool_basics.py      # Thread pool: submit / loop pinning / metrics
-uv run python examples/01_channels_select.py  # Channels: send/recv / async for / select_channel / non-blocking
-uv run python examples/02_waitgroup_once.py   # Group sync: AsyncWaitGroup / AsyncOnce (incl. exception caching)
-uv run python examples/03_taskgroup_timeout.py# Structured concurrency: TaskGroup / fail_after / move_on_after / CancelScope
-uv run python examples/04_sync_primitives.py  # Sync primitives: Lock / Semaphore / Event / Condition / Barrier
+uv run python examples/00_pool_basics.py       # Thread pool: submit / loop pinning / metrics
+uv run python examples/01_channels_select.py   # Channels: send/recv / async for / select_channel / non-blocking
+uv run python examples/02_waitgroup_once.py    # Group sync: AsyncWaitGroup / AsyncOnce (incl. exception caching)
+uv run python examples/03_taskgroup_timeout.py # Structured concurrency: TaskGroup / fail_after / move_on_after / CancelScope
+uv run python examples/04_sync_primitives.py   # Sync primitives: Lock / Semaphore / Event / Condition / Barrier
 uv run python examples/05_multicore_pipeline.py # Multi-core pipeline: multi-producer multi-consumer with Channel & AsyncWaitGroup
 ```
 

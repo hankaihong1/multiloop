@@ -2,7 +2,7 @@
 
 **[English](README.md)**
 
-克隆仓库后（需先 `make develop` 编译 Rust 核心），直接运行：
+克隆仓库后（需先通过 `make develop` 编译必需的 `_multiloop_core` Rust 扩展），直接运行：
 
 ```bash
 uv run python examples/00_pool_basics.py      # 线程池：submit / loop 钉选 / metrics

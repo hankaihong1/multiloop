@@ -31,12 +31,12 @@
 | 等一组任务全部完成 | `AsyncWaitGroup` | Go `sync.WaitGroup` 语义，跨线程 |
 | 只执行一次的初始化（单例） | `AsyncOnce` | 并发安全，只跑一次，结果共享 |
 | 读多写少的共享状态 | `AsyncRWMutex` | `async with rw.reader():` 多读者并行，`async with rw.writer():` 独占 |
-| 结构化并发：子任务必回收 | `TaskGroup`（`tg.start_soon()` + `TaskHandle`） | 离开作用域时所有子任务必定已结束 |
+| 结构化并发：子任务必回收 | `TaskGroup`（`tg.start_soon()` + `TaskHandle` / `TaskState`） | 离开作用域时所有子任务必定已结束 |
 | 整体限时，超时抛异常 | `fail_after(sec)` / `fail_at(deadline)` | 到期抛 `TimeoutError` |
 | 整体限时，超时静默跳过 | `move_on_after(sec)` / `move_on_at(deadline)` | 到期静默退出，查 `scope.cancelled_caught` |
 | 精细控制取消（手动/屏蔽） | `CancelScope(deadline=..., shield=...)` | 纯 Rust 任务取消栈（三模式退出）；`shield` 阻止父作用域取消穿透 |
-| 响应 `CancelScope` 取消的异步休眠 | `sleep(delay)` | 路线 3 零泄漏可取消休眠（`multiloop.sleep`） |
-| 桥接外部 asyncio 协程响应 `CancelScope` | `wait_cancellable(coro)` | 包装 `asyncio.sleep` / 第三方协程以立即响应路线 3 取消 |
+| 响应 `CancelScope` 取消的异步休眠 | `sleep(delay)` | 零开销可取消休眠（`multiloop.sleep`） |
+| 桥接外部 asyncio 协程响应 `CancelScope` | `wait_cancellable(coro)` | 包装 `asyncio.sleep` / 第三方协程以立即响应 `CancelScope` 取消 |
 | 长循环里定期检查取消 | `checkpoint()` | 水平触发取消检查点，不修改 `task.cancelling()` |
 | 查当前最紧的截止时间 | `current_effective_deadline()` | shield 会截断外部 deadline |
 | 跨线程级联取消/超时广播 | `AsyncContext` | 树状传播取消到所有相关任务 |
@@ -60,7 +60,7 @@
   异常也会缓存并重抛给所有 follower。
 - **`TaskGroup`** — 子任务全部结束后才退出 `async with`；任一子任务失败会
   取消其余并聚合为 `BaseExceptionGroup`。
-- **`CancelScope`** — 路线 3 纯 Rust 任务取消栈（`RawTaskCancelState`），
+- **`CancelScope`** — 纯 Rust 任务取消栈（`RawTaskCancelState`），
   全程不修改 CPython `task.cancelling()`；支持 `shield=True`、严格三模式退出
   （`PLAIN` / `MOVE_ON` / `FAIL_AFTER`）、`sleep()` 与 `wait_cancellable()`
   （`fail_after`/`move_on_after` 为便捷封装）。

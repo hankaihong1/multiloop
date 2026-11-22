@@ -76,7 +76,7 @@ maturin develop --release
 # 测量多线程事件循环池扩展比
 uv run python benchmarks/bench_multithread_loops.py
 
-# 测量无锁工作窃取通道吞吐
+# 测量工作窃取池与通道拉取吞吐
 uv run python benchmarks/benchmark_pull_model.py
 ```
 
@@ -204,7 +204,7 @@ if __name__ == "__main__":
 
 ### 核心架构图
 
-`multiloop` 为每个工作 OS 线程分配独立的 `asyncio` 事件循环，底层由 Rust 无锁任务队列与 64 字节对齐的原子计数器提供支撑：
+`multiloop` 为每个工作 OS 线程分配独立的 `asyncio` 事件循环，底层由编译后的 `_multiloop_core` Rust 扩展（运行时必需）中的无锁 `flume` 任务队列、64 字节对齐填充的原子指标计数器以及 `parking_lot::Mutex` 同步状态机提供支撑：
 
 ```mermaid
 graph TD
@@ -250,12 +250,12 @@ make test
 
 | 不变量 / 并发原语 | 物理并发保证 | 底层形式化状态机 |
 |---|---|---|
-| Python 3.14t 自由线程 | 跨隔离事件循环的物理多核并行 | Rust 无锁队列 + OS 互斥锁保护的等待者结构 |
+| Python 3.14t 自由线程 | 跨隔离事件循环的物理多核并行 | 无锁 `flume` 工作队列 + `parking_lot::Mutex` 等待者状态机 |
 | `Barrier` 取消自愈 | 取消参与方自动触发 Broken 状态并唤醒全员 | 单调递增代际计数器 + Rust `RawAsyncBarrier` 状态机 |
-| `select_channel` 仲裁 | 100% 确定性仲裁，零消息丢失与零饥饿 | 双阶段仲裁器：均匀随机探测 + 单一仲裁注册 |
+| `select_channel` 仲裁 | 100% 确定性仲裁，零消息丢失与零饥饿 | 双阶段仲裁器：线程本地轮询探测 + 单一仲裁注册 |
 | 等待者取消注销 | 免疫 ABA 内存复用的安全票据注销 | Rust 单调递增 `WaiterId (u64)` 票据 + 锁外 `call_soon_threadsafe` |
 | `AsyncContext.cancel()` | 直接中断跨 OS 线程运行中的活动协程 | 任务级注入专属 `CancelScope` 跨 Loop 取消 |
-| `CancelScope` 屏蔽层 | 零泄漏作用域隔离，全程不触碰 `task.cancelling()` | 路线 3 纯 Rust `RawTaskCancelState` 任务取消栈 |
+| `CancelScope` 屏蔽层 | 零泄漏作用域隔离，全程不触碰 `task.cancelling()` | 纯 Rust `RawTaskCancelState` 任务取消栈 |
 
 形式化不变量与并发设计规范请参考 [docs/CONCURRENCY_ZH.md](docs/CONCURRENCY_ZH.md)。
 

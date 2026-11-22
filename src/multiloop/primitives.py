@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import math
 import threading
 import time
 import warnings
@@ -88,18 +89,6 @@ _RustRawAsyncChannel: type[_RawAsyncChannelProtocol] | None = _try_import_rust_c
 _RawAsyncWaitGroup: type[_WaitGroupProtocol] | None = _try_import_rust_class(
     "multiloop._multiloop_core", "RawAsyncWaitGroup"
 )
-
-
-class _LenShim:
-    """Helper enabling len() inspection on Rust-backed waiter queues."""
-
-    __slots__ = ("_len_fn",)
-
-    def __init__(self, len_fn: Callable[[], int]) -> None:
-        self._len_fn = len_fn
-
-    def __len__(self) -> int:
-        return int(self._len_fn())
 
 
 class Channel:
@@ -190,6 +179,8 @@ class Channel:
 
     async def _send_impl(self, item: Any) -> None:
         _check_not_cancelled()
+        if self._inner.try_send(item):
+            return
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Any] = loop.create_future()
         waiter_id = self._inner.send_or_register(item, loop, fut)
@@ -251,13 +242,15 @@ class Channel:
 
     async def _recv_impl(self) -> Any:
         _check_not_cancelled()
-        loop = asyncio.get_running_loop()
+        loop: asyncio.AbstractEventLoop | None = None
         while True:
             try:
                 return self._inner.try_recv()
             except WouldBlock:
                 pass
 
+            if loop is None:
+                loop = asyncio.get_running_loop()
             fut: asyncio.Future[Any] = loop.create_future()
             waiter_id, item = self._inner.register_getter_ticket(loop, fut)
             if waiter_id == 0:
@@ -287,18 +280,6 @@ class Channel:
 
     def _forward_select_wakeup(self) -> None:
         self._inner.forward_select_wakeup()
-
-    @property
-    def _getters(self) -> Any:
-        return _LenShim(self._inner.getters_len)
-
-    @property
-    def _putters(self) -> Any:
-        return _LenShim(self._inner.putters_len)
-
-    @property
-    def _notifiers(self) -> Any:
-        return _LenShim(self._inner.notifiers_len)
 
     def __aiter__(self) -> AsyncIterator[Any]:
         return self
@@ -459,14 +440,12 @@ async def select_channel(
     *channels: Any,
     timeout: float | None = None,
     default: Any = _UNSET,
-    _deadline: float | None = None,
 ) -> Any:
     """Select and receive from the first ready channel among multiple channels (Go select style).
 
     :param channels: One or more :class:`Channel` instances to monitor.
     :param timeout: Maximum seconds to wait.
     :param default: Optional non-blocking default fallback value.
-    :param _deadline: Internal monotonic deadline timestamp for recursive iterations.
     :returns: A tuple ``(channel, received_value)``, or ``default`` if non-blocking and empty.
     :raises ValueError: If no channels are passed.
     :raises TimeoutError: If the operation times out.
@@ -474,11 +453,14 @@ async def select_channel(
     """
     if not channels:
         raise ValueError("select_channel requires at least one channel")
+    if timeout is not None and (math.isnan(timeout) or timeout == float("-inf")):
+        raise ValueError("timeout must not be NaN or negative infinity")
 
     _check_not_cancelled()
     loop = asyncio.get_running_loop()
-    if timeout is not None and _deadline is None:
-        _deadline = loop.time() + timeout
+    deadline: float | None = (
+        loop.time() + timeout if (timeout is not None and math.isfinite(timeout)) else None
+    )
 
     num_channels = len(channels)
     while True:
@@ -499,8 +481,8 @@ async def select_channel(
             raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
 
         remaining_timeout: float | None = None
-        if _deadline is not None:
-            remaining_timeout = max(0.0, _deadline - loop.time())
+        if deadline is not None:
+            remaining_timeout = max(0.0, deadline - loop.time())
             if remaining_timeout <= 0:
                 raise TimeoutError("select_channel timed out")
         elif timeout is not None and timeout <= 0:
@@ -745,6 +727,142 @@ class AsyncWaitGroup:
 _RawAsyncOnce = _try_import_rust_class("multiloop._multiloop_core", "RawAsyncOnce")
 
 
+def _try_clone_exception_group(
+    exc: BaseException,
+    memo: dict[int, BaseException],
+) -> BaseException | None:
+    if not issubclass(type(exc), BaseExceptionGroup):
+        return None
+    try:
+        exc_any: Any = exc
+        raw_exceptions: tuple[BaseException, ...] = exc_any.exceptions
+        sub_exceptions: list[BaseException] = [
+            _clone_exception(sub, memo) for sub in raw_exceptions
+        ]
+        derived: BaseException = exc_any.derive(sub_exceptions)
+        return derived
+    except Exception:
+        return None
+
+
+def _clone_exception(
+    exc: BaseException,
+    _memo: dict[int, BaseException] | None = None,
+) -> BaseException:
+    """Clone *exc* without live traceback frames while preserving type, args, attributes, and chain.
+
+    Tries :func:`copy.copy` first, then falls back to ``__new__`` + attribute copying so custom
+    exception subclasses whose ``__init__`` does not accept ``self.args`` still clone cleanly.
+    All cloned nodes have ``__traceback__ = None`` so stored errors never pin stack frames.
+    """
+    if _memo is None:
+        _memo = {}
+    exc_id = id(exc)
+    if exc_id in _memo:
+        return _memo[exc_id]
+
+    cls = type(exc)
+    cloned: BaseException | None = _try_clone_exception_group(exc, _memo)
+    from_derive = cloned is not None
+
+    if cloned is None:
+        try:
+            cloned = copy.copy(exc)
+        except Exception:
+            cloned = None
+
+    if cloned is None:
+        try:
+            cloned = cls.__new__(cls)
+        except Exception:
+            try:
+                cloned = BaseException.__new__(cls)
+            except Exception:
+                cloned = None
+
+    if cloned is None:
+        tb = exc.__traceback__
+        if tb is not None:
+            import traceback
+
+            try:
+                traceback.clear_frames(tb)
+            except Exception:
+                pass
+        try:
+            exc.__traceback__ = None
+        except Exception:
+            pass
+        _memo[exc_id] = exc
+        return exc
+
+    _memo[exc_id] = cloned
+
+    if not from_derive:
+        try:
+            if cloned.args != exc.args:
+                cloned.args = exc.args
+        except Exception:
+            pass
+
+        for base in cls.__mro__:
+            slots = base.__dict__.get("__slots__")
+            if not slots:
+                continue
+            slot_names = (slots,) if isinstance(slots, str) else slots
+            for slot in slot_names:
+                if slot in ("__dict__", "__weakref__") or (
+                    slot.startswith("__") and slot.endswith("__")
+                ):
+                    continue
+                attr_name = f"_{base.__name__.lstrip('_')}{slot}" if slot.startswith("__") else slot
+                try:
+                    val = getattr(exc, attr_name)
+                except AttributeError:
+                    continue
+                try:
+                    setattr(cloned, attr_name, val)
+                except Exception:
+                    pass
+
+    src_dict: dict[str, Any] | None = getattr(exc, "__dict__", None)
+    dst_dict: dict[str, Any] | None = getattr(cloned, "__dict__", None)
+    if isinstance(src_dict, dict) and isinstance(dst_dict, dict):
+        dst_dict.update(src_dict)
+
+    notes: list[str] | None = getattr(exc, "__notes__", None)
+    if isinstance(notes, list):
+        try:
+            cloned.__notes__ = list(notes)
+        except Exception:
+            pass
+
+    try:
+        cloned.__traceback__ = None
+    except Exception:
+        pass
+
+    cause = exc.__cause__
+    context = exc.__context__
+    suppress_context = exc.__suppress_context__
+    if cause is not None:
+        try:
+            cloned.__cause__ = _clone_exception(cause, _memo)
+        except Exception:
+            pass
+    if context is not None:
+        try:
+            cloned.__context__ = _clone_exception(context, _memo)
+        except Exception:
+            pass
+    try:
+        cloned.__suppress_context__ = suppress_context
+    except Exception:
+        pass
+
+    return cloned
+
+
 class AsyncOnce:
     """Thread-safe single execution primitive across multiple event loops (Go sync.Once style).
 
@@ -752,7 +870,7 @@ class AsyncOnce:
     by many coroutines across different OS threads.
     """
 
-    __slots__ = ("_raw",)
+    __slots__ = ("__weakref__", "_raw")
 
     def __init__(self) -> None:
         if _RawAsyncOnce is None:
@@ -779,7 +897,7 @@ class AsyncOnce:
         if completed is not None:
             is_exc, val_or_exc = completed
             if is_exc:
-                raise copy.copy(val_or_exc)
+                raise _clone_exception(val_or_exc)
             return val_or_exc
 
         loop = asyncio.get_running_loop()
@@ -789,7 +907,7 @@ class AsyncOnce:
         if status == 2:
             return val_or_exc
         if status == 3:
-            raise copy.copy(val_or_exc)
+            raise _clone_exception(val_or_exc)
 
         if status == 1:
             assert ticket_id is not None
@@ -800,7 +918,7 @@ class AsyncOnce:
                 raise
             has_exc, out_val = self._raw.outcome()
             if has_exc:
-                raise copy.copy(out_val)
+                raise _clone_exception(out_val)
             return out_val
 
         res: Any = None
@@ -810,14 +928,16 @@ class AsyncOnce:
             if asyncio.iscoroutine(res) or asyncio.isfuture(res):
                 res = await res
         except BaseException as e:
+            res = None
             if isinstance(e, asyncio.CancelledError):
                 wrapped = RuntimeError("AsyncOnce execution was cancelled")
-                wrapped.__cause__ = e
+                wrapped.__cause__ = _clone_exception(e)
                 exc_to_store = wrapped
             else:
-                exc_to_store = e
+                exc_to_store = _clone_exception(e)
             raise
         finally:
             self._raw.complete(res, exc_to_store)
+            del self, fn, args, kwargs
 
         return res

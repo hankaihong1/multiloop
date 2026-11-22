@@ -12,7 +12,7 @@ from multiloop._sync import CapacityLimiter, Event
 if TYPE_CHECKING:
     from multiloop.pool import EventLoopThreadPool
 
-__all__ = ["TaskGroup", "TaskHandle", "TaskStatus"]
+__all__ = ["TaskGroup", "TaskHandle", "TaskState", "TaskStatus"]
 
 
 def _retrieve_task_exception(task: asyncio.Future[Any]) -> None:
@@ -24,8 +24,8 @@ def _retrieve_task_exception(task: asyncio.Future[Any]) -> None:
         task.exception()
 
 
-class _TaskStatus(enum.Enum):
-    """Internal task lifecycle states."""
+class TaskState(enum.Enum):
+    """Lifecycle states of a task managed by a :class:`TaskGroup`."""
 
     PENDING = 0
     STARTED = 1
@@ -131,13 +131,13 @@ class TaskHandle:
         self._start_event: Event | None = None
 
     @property
-    def status(self) -> _TaskStatus:
+    def status(self) -> TaskState:
         """Current lifecycle status of the wrapped task."""
         if self._task.done():
-            return _TaskStatus.FINISHED
+            return TaskState.FINISHED
         if self._start_event is not None and self._start_event.is_set():
-            return _TaskStatus.STARTED
-        return _TaskStatus.PENDING
+            return TaskState.STARTED
+        return TaskState.PENDING
 
     @property
     def result(self) -> Any:
@@ -162,7 +162,7 @@ class TaskHandle:
         if not self._task.done():
             raise RuntimeError("Task is not finished")
         if self._task.cancelled():
-            return asyncio.CancelledError()
+            raise asyncio.CancelledError()
         return self._task.exception()
 
     async def _await_impl(self) -> Any:
@@ -172,9 +172,18 @@ class TaskHandle:
         loop = asyncio.get_running_loop()
         wait_fut: asyncio.Future[None] = loop.create_future()
 
-        def _on_done(_f: asyncio.Future[Any]) -> None:
+        def _set_wait_done() -> None:
             if not wait_fut.done():
                 wait_fut.set_result(None)
+
+        def _on_done(_f: asyncio.Future[Any]) -> None:
+            if self._task.get_loop() is loop:
+                _set_wait_done()
+            else:
+                try:
+                    loop.call_soon_threadsafe(_set_wait_done)
+                except RuntimeError:
+                    pass
 
         self._task.add_done_callback(_on_done)
         try:
@@ -533,9 +542,11 @@ class TaskGroup:
                     return
                 exc = task_exc
 
-            cancelling_count: int = getattr(task, "cancelling", lambda: 0)()
+            is_externally_cancelled = (
+                task.cancelling() > 0 if isinstance(task, asyncio.Task) else task.cancelled()
+            )
             if isinstance(exc, asyncio.CancelledError) and (
-                task in cancelled_by_scope or cancelling_count > 0
+                task in cancelled_by_scope or is_externally_cancelled
             ):
                 return
             exceptions.append(exc)
@@ -729,7 +740,12 @@ class TaskGroup:
                     coro_fn.close()
                 raise
 
-            fut.add_done_callback(lambda _f: self._discard_child_scope(child_scope))
+            def _on_pool_child_done(done_fut: asyncio.Future[Any]) -> None:
+                if done_fut.cancelled():
+                    child_scope.cancel()
+                self._discard_child_scope(child_scope)
+
+            fut.add_done_callback(_on_pool_child_done)
             handle = TaskHandle(fut)
             with self._children_lock:
                 if self._state not in (_TGState.IDLE, _TGState.ACTIVE, _TGState.DRAINING):
@@ -823,7 +839,12 @@ class TaskGroup:
                 _run_local_child(child_scope, limiter, coro_fn, child_args)
             )
 
-        fut.add_done_callback(lambda _f: self._discard_child_scope(child_scope))
+        def _on_start_child_done(done_fut: asyncio.Future[Any]) -> None:
+            if self._pool is not None and done_fut.cancelled():
+                child_scope.cancel()
+            self._discard_child_scope(child_scope)
+
+        fut.add_done_callback(_on_start_child_done)
         handle = TaskHandle(fut)
         handle._start_event = task_status._started
         with self._children_lock:

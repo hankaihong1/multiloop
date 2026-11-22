@@ -38,7 +38,7 @@ from multiloop._sync import (
     Lock,
     Semaphore,
 )
-from multiloop._taskgroup import TaskGroup, TaskHandle, TaskStatus
+from multiloop._taskgroup import TaskGroup, TaskHandle, TaskState, TaskStatus
 from multiloop.context import AsyncContext
 from multiloop.exceptions import (
     ChannelClosedError,
@@ -62,7 +62,7 @@ from multiloop.primitives import (
 )
 from multiloop.rwlock import AsyncRWMutex
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 
 async def run_in_pool(coro: Any, *args: Any, num_threads: int = 0, **kwargs: Any) -> Any:
@@ -121,6 +121,7 @@ __all__ = [
     "SendChannel",
     "TaskGroup",
     "TaskHandle",
+    "TaskState",
     "TaskStatus",
     "ThreadPoolClosedError",
     "TimeoutError",

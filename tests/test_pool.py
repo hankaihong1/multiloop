@@ -1,5 +1,7 @@
 import asyncio
 import threading
+import time
+from typing import Any
 
 import pytest
 
@@ -15,7 +17,7 @@ from multiloop import (
     run_in_pool,
 )
 from multiloop.exceptions import ThreadPoolClosedError
-from multiloop.pool import EventLoopThreadPool, PoolOptions, _safe_complete
+from multiloop.pool import EventLoopThreadPool, PoolOptions, _join_threads_sync, _safe_complete
 from multiloop.testing import wait_all_tasks_blocked
 
 
@@ -139,7 +141,7 @@ async def test_pool_race_close_vs_submit():
                 pool.submit(dummy)
             except ThreadPoolClosedError:
                 pass
-            except RuntimeError as exc:  # noqa: PERF203
+            except RuntimeError as exc:
                 leaked.append(exc)
                 return
             await asyncio.sleep(0)
@@ -273,9 +275,9 @@ async def test_pool_close_cancels_submitted_slow_tasks():
     # Give the tasks time to be pulled by the workers.
     await wait_all_tasks_blocked()
 
-    # Close drains for up to ~5s, then stops the worker loops — the still
+    # Close drains briefly, then stops the worker loops — the still
     # running 10s tasks are cancelled and their futures resolve.
-    await pool.close()
+    await pool.close(timeout=0.05)
 
     # Let the call_soon_threadsafe result deliveries land on this loop.
     await wait_all_tasks_blocked()
@@ -663,16 +665,16 @@ async def test_pool_submit_push_failure_discards_future():
     class _FailingPool:
         """Duck-typed native pool whose push always fails; idle/drain paths stay benign."""
 
-        def push_global(self, task: object) -> None:  # noqa: ARG002
+        def push_global(self, task: object) -> None:
             raise RuntimeError("boom")
 
-        def push_global_batch(self, tasks: list[object]) -> int:  # noqa: ARG002
+        def push_global_batch(self, tasks: list[object]) -> int:
             raise RuntimeError("boom")
 
-        def push_local(self, index: int, task: object) -> None:  # noqa: ARG002
+        def push_local(self, index: int, task: object) -> None:
             raise RuntimeError("boom")
 
-        def pop_work(self, index: int) -> None:  # noqa: ARG002
+        def pop_work(self, index: int) -> None:
             return None
 
         def is_closed(self) -> bool:
@@ -684,13 +686,13 @@ async def test_pool_submit_push_failure_discards_future():
         def close(self) -> None:
             pass
 
-        def set_metrics(self, metrics: object) -> None:  # noqa: ARG002
+        def set_metrics(self, metrics: object) -> None:
             pass
 
-        def mark_worker_idle(self, index: int) -> None:  # noqa: ARG002
+        def mark_worker_idle(self, index: int) -> None:
             pass
 
-        def clear_worker_idle(self, index: int) -> None:  # noqa: ARG002
+        def clear_worker_idle(self, index: int) -> None:
             pass
 
         def claim_one_idle_worker(self) -> int | None:
@@ -702,7 +704,7 @@ async def test_pool_submit_push_failure_discards_future():
         def outstanding_count(self) -> int:
             return 0
 
-        def wait_drained(self, timeout_secs: float) -> bool:  # noqa: ARG002
+        def wait_drained(self, timeout_secs: float) -> bool:
             return True
 
         def drain_all(self) -> list[object]:
@@ -1006,9 +1008,10 @@ async def test_submit_many_valid(num_threads: int, batch_kind: str, count: int) 
             assert pool._native_pool is not None
             pushed = pool._native_pool.push_global_batch([lambda: None for _ in range(count)])
             assert pushed == count
-            # Drain them so pool closes cleanly
+            # Drain them and account for completed tasks so pool closes cleanly
             for _ in range(count):
                 _ = pool._native_pool.pop_work(0)
+                pool._native_pool.complete_task()
 
 
 @pytest.mark.asyncio
@@ -1275,3 +1278,309 @@ async def test_pool_over_64_workers_idle_wakeup() -> None:
         assert await asyncio.wait_for(fut_global, timeout=1.0) == 42
     finally:
         await pool.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 TDD Suite: Lifecycle state machine, close/abort races, CancelScope modes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pool_close_invalid_timeout_raises_without_closing() -> None:
+    """P2.3: NaN and -inf close timeouts raise ValueError before stopping or closing the pool."""
+    unstarted = EventLoopThreadPool(num_threads=1)
+    with pytest.raises(ValueError, match="NaN"):
+        await unstarted.close(timeout=float("nan"))
+    with pytest.raises(ValueError, match="negative infinity"):
+        await unstarted.close(timeout=float("-inf"))
+    # Unstarted pool remained in CREATED state and can still be started cleanly.
+    await unstarted.start()
+    try:
+        assert unstarted.is_running
+        assert await unstarted.submit(lambda: 123) == 123
+    finally:
+        await unstarted.close()
+
+    pool = EventLoopThreadPool(num_threads=2)
+    await pool.start()
+    try:
+        with pytest.raises(ValueError, match="NaN"):
+            await pool.close(timeout=float("nan"))
+        with pytest.raises(ValueError, match="negative infinity"):
+            await pool.close(timeout=float("-inf"))
+        assert pool.is_running
+        assert await pool.submit(lambda: 99) == 99
+    finally:
+        await pool.close()
+    assert not pool.is_running
+
+
+@pytest.mark.asyncio
+async def test_pool_close_infinite_and_huge_timeout_drains_cleanly() -> None:
+    """P2.3: close(timeout=float('inf')) and huge finite timeouts wait for tasks safely."""
+    for drain_timeout in (float("inf"), 1e20):
+        pool = EventLoopThreadPool(num_threads=2)
+        await pool.start()
+        threads = list(pool._threads)
+
+        async def short_work() -> str:
+            await asyncio.sleep(0.05)
+            return "finished"
+
+        fut = pool.submit(short_work)
+        await asyncio.wait_for(pool.close(timeout=drain_timeout), timeout=5.0)
+        assert fut.done() and await fut == "finished"
+        assert not pool.is_running
+        assert pool._closed_event.is_set()
+        assert all(not t.is_alive() for t in threads)
+
+
+@pytest.mark.asyncio
+async def test_pool_close_zero_timeout_force_stops_and_joins_threads() -> None:
+    """P2.3: close(timeout=0) stops loops immediately without leaking threads or futures."""
+    from multiloop._cancel import sleep
+
+    pool = EventLoopThreadPool(num_threads=2)
+    await pool.start()
+    threads = list(pool._threads)
+    started_ev = threading.Event()
+
+    async def slow() -> str:
+        started_ev.set()
+        await sleep(10.0)
+        return "never"
+
+    futs = [pool.submit(slow) for _ in range(4)]
+    await asyncio.to_thread(started_ev.wait, 2.0)
+
+    await asyncio.wait_for(pool.close(timeout=0), timeout=3.0)
+    assert not pool.is_running
+    assert pool._closed_event.is_set()
+    assert all(not t.is_alive() for t in threads)
+    for fut in futs:
+        assert fut.done()
+        with pytest.raises((asyncio.CancelledError, ThreadPoolClosedError)):
+            await fut
+
+
+@pytest.mark.asyncio
+async def test_pool_concurrent_close_abort_and_wait_closed() -> None:
+    """P2.3: Concurrent close/abort during CLOSING must wait for active teardown, never premature."""
+    pool = EventLoopThreadPool(num_threads=2)
+    await pool.start()
+    threads = list(pool._threads)
+    started_ev = threading.Event()
+    release_ev = threading.Event()
+
+    def blocked_work() -> str:
+        started_ev.set()
+        release_ev.wait(timeout=2.0)
+        return "ok"
+
+    fut = pool.submit(blocked_work)
+    await asyncio.to_thread(started_ev.wait, 2.0)
+
+    c1 = asyncio.create_task(pool.close(timeout=2.0))
+    await asyncio.sleep(0.02)
+    assert not c1.done()
+    assert not pool._closed_event.is_set()
+
+    c2 = asyncio.create_task(pool.close())
+    a1 = asyncio.create_task(pool.abort())
+    w1 = asyncio.create_task(pool.wait_closed())
+
+    await asyncio.sleep(0.03)
+    assert not c1.done()
+    assert not c2.done()
+    assert not a1.done()
+    assert not w1.done()
+    assert not pool._closed_event.is_set()
+
+    release_ev.set()
+    await asyncio.wait_for(asyncio.gather(c1, c2, a1, w1), timeout=3.0)
+
+    assert await fut == "ok"
+    assert not pool.is_running
+    assert pool._closed_event.is_set()
+    assert all(not t.is_alive() for t in threads)
+    await asyncio.wait_for(pool.wait_closed(), timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_pool_close_cancellation_stops_threads_and_unblocks_wait_closed() -> None:
+    """P2.3: Cancelling close() mid-drain still tears down loops, joins threads, and sets closed_event."""
+    pool = EventLoopThreadPool(num_threads=2)
+    await pool.start()
+    threads = list(pool._threads)
+    started_ev = threading.Event()
+
+    async def slow() -> None:
+        started_ev.set()
+        await asyncio.sleep(10.0)
+
+    fut = pool.submit(slow)
+    await asyncio.to_thread(started_ev.wait, 2.0)
+
+    close_task = asyncio.create_task(pool.close(timeout=10.0))
+    await asyncio.sleep(0.03)
+    close_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    assert not pool.is_running
+    assert pool._closed_event.is_set()
+    await asyncio.wait_for(pool.wait_closed(), timeout=0.5)
+    assert all(not t.is_alive() for t in threads)
+    assert fut.done()
+    if not fut.cancelled():
+        exc = fut.exception()
+        assert isinstance(exc, (asyncio.CancelledError, ThreadPoolClosedError))
+
+
+@pytest.mark.asyncio
+async def test_pool_close_stubborn_single_cancel_task_rescued_by_stage2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2.3: If a task swallows the first CancelledError on loop.stop(), Stage 2 cancels and joins."""
+    monkeypatch.setattr("multiloop.pool._DEFAULT_JOIN_TIMEOUT", 0.15)
+    pool = EventLoopThreadPool(num_threads=1)
+    await pool.start()
+    threads = list(pool._threads)
+    entered = threading.Event()
+
+    async def absorb_once() -> None:
+        entered.set()
+        try:
+            await asyncio.sleep(10.0)
+        except asyncio.CancelledError:
+            await asyncio.sleep(10.0)
+
+    fut = pool.submit(absorb_once)
+    await asyncio.to_thread(entered.wait, 2.0)
+    await asyncio.sleep(0.02)
+
+    await asyncio.wait_for(pool.close(timeout=0), timeout=6.0)
+    assert not pool.is_running
+    assert pool._closed_event.is_set()
+    assert all(not t.is_alive() for t in threads)
+    assert fut.done()
+    if not fut.cancelled():
+        exc = fut.exception()
+        assert isinstance(exc, (asyncio.CancelledError, ThreadPoolClosedError))
+
+
+@pytest.mark.asyncio
+async def test_pool_unstarted_close_and_abort_prevent_start_and_submit() -> None:
+    """P2.4: close()/abort() on CREATED pool transitions to CLOSED and blocks subsequent start()."""
+    for use_abort in (False, True):
+        pool = EventLoopThreadPool(num_threads=2)
+        await asyncio.wait_for(pool.wait_closed(), timeout=0.5)
+
+        if use_abort:
+            await pool.abort()
+        else:
+            await pool.close()
+
+        assert not pool.is_running
+        assert pool._closed_event.is_set()
+        assert pool._native_pool is not None
+        assert pool._native_pool.is_closed()
+        await asyncio.wait_for(pool.wait_closed(), timeout=0.5)
+
+        with pytest.raises(ThreadPoolClosedError):
+            await pool.start()
+
+        with pytest.raises(ThreadPoolClosedError):
+            async with pool:
+                pass
+
+        async def dummy() -> int:
+            return 1
+
+        c = dummy()
+        with pytest.raises(ThreadPoolClosedError):
+            pool.submit(c)
+        assert c.cr_frame is None
+
+        # Repeated close/abort remain idempotent.
+        await pool.close()
+        await pool.abort()
+
+
+@pytest.mark.asyncio
+async def test_pool_submit_cancel_scope_move_on_after_and_fail_after() -> None:
+    """P2.5: move_on_after resolves future to None (not CancelledError); fail_after raises TimeoutError."""
+    from multiloop._cancel import CancelScope, fail_after, move_on_after, sleep
+    from multiloop.exceptions import TimeoutError as MultiloopTimeoutError
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+
+        async def slow() -> str:
+            await sleep(5.0)
+            return "completed"
+
+        async def fast() -> str:
+            await sleep(0.01)
+            return "fast_ok"
+
+        # 1. move_on_after expires -> future completes normally with None and cancelled_caught=True
+        move_scope = move_on_after(0.03)
+        fut_move = pool.submit(slow, cancel_scope=move_scope)
+        res = await asyncio.wait_for(fut_move, timeout=2.0)
+        assert res is None
+        assert not fut_move.cancelled()
+        assert move_scope.cancelled_caught is True
+
+        # 2. move_on_after that completes before deadline returns target value
+        fast_scope = move_on_after(2.0)
+        fut_fast = pool.submit(fast, cancel_scope=fast_scope)
+        assert await asyncio.wait_for(fut_fast, timeout=2.0) == "fast_ok"
+        assert fast_scope.cancelled_caught is False
+
+        # 3. submit_many with single target and move_on_after
+        batch_scope = move_on_after(0.03)
+        futs_batch = pool.submit_many([slow()], cancel_scope=batch_scope)
+        assert await asyncio.wait_for(futs_batch[0], timeout=2.0) is None
+        assert not futs_batch[0].cancelled()
+        assert batch_scope.cancelled_caught is True
+
+        # 4. fail_after expires -> future raises MultiloopTimeoutError
+        fail_scope = fail_after(0.03)
+        fut_fail = pool.submit(slow, cancel_scope=fail_scope)
+        with pytest.raises(MultiloopTimeoutError):
+            await asyncio.wait_for(fut_fail, timeout=2.0)
+
+        # 5. PLAIN CancelScope cancelled -> future is cancelled (CancelledError)
+        plain_scope = CancelScope()
+        fut_plain = pool.submit(slow, cancel_scope=plain_scope)
+        await asyncio.sleep(0.02)
+        plain_scope.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(fut_plain, timeout=2.0)
+        assert fut_plain.cancelled()
+
+
+def test_join_threads_sync_shared_deadline() -> None:
+    """_join_threads_sync bounds total join time across all threads to one shared deadline."""
+    release = threading.Event()
+    started = threading.Barrier(5, timeout=2.0)
+
+    def _blocker() -> None:
+        started.wait()
+        release.wait(timeout=2.0)
+
+    threads = [threading.Thread(target=_blocker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    try:
+        started.wait()
+        t0 = time.monotonic()
+        _join_threads_sync(threads, timeout=0.12)
+        elapsed = time.monotonic() - t0
+        # 4 threads serially without shared budget would take ~0.48s; shared budget stops near 0.12s.
+        assert 0.10 <= elapsed < 0.30
+    finally:
+        release.set()
+        for t in threads:
+            t.join(timeout=2.0)

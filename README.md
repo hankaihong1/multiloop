@@ -76,7 +76,7 @@ Run the built-in multi-thread benchmark suite to measure physical multi-core thr
 # Measure multi-thread loop pool scaling
 uv run python benchmarks/bench_multithread_loops.py
 
-# Measure lock-free work stealing channel pull throughput
+# Measure work-stealing pool and channel pull throughput
 uv run python benchmarks/benchmark_pull_model.py
 ```
 
@@ -204,7 +204,7 @@ Explore more standalone scripts in [`examples/`](examples/README.md).
 
 ### Core Architecture
 
-`multiloop` assigns an isolated `asyncio` event loop to each worker OS thread, backed by lock-free task queues and padded atomic metrics in Rust:
+`multiloop` assigns an isolated `asyncio` event loop to each worker OS thread, backed by lock-free `flume` task queues, 64-byte padded atomic metrics, and `parking_lot::Mutex` synchronization state machines in the compiled `_multiloop_core` Rust extension (required at runtime):
 
 ```mermaid
 graph TD
@@ -250,12 +250,12 @@ make test
 
 | Invariant / Primitive | Physical Concurrency Guarantee | Underlying State Machine |
 |---|---|---|
-| Python 3.14t Free-Threading | Physical multi-core parallelism across isolated event loops | Lock-free Rust queues + OS mutex protected waiter lists |
+| Python 3.14t Free-Threading | Physical multi-core parallelism across isolated event loops | Lock-free `flume` work queues + `parking_lot::Mutex` waiter state machines |
 | `Barrier` Cancellation | Auto-healing: cancelled party immediately breaks round & wakes all waiters | Monotonic generation counter + Rust `RawAsyncBarrier` state machine |
-| `select_channel` Arbitration | 100% deterministic arbitration without message loss or starvation | Two-phase arbiter: uniform random probe + single-arbiter registration |
+| `select_channel` Arbitration | 100% deterministic arbitration without message loss or starvation | Two-phase arbiter: thread-local round-robin probe + single-arbiter registration |
 | Waiter Cancellation | Safe ticketed cancellation immune to ABA pointer reuse | Monotonic Rust `WaiterId (u64)` tickets + out-of-lock `call_soon_threadsafe` |
 | `AsyncContext.cancel()` | Directly cancels active coroutines on worker OS threads | Injected `CancelScope` cross-thread cancellation |
-| `CancelScope` Shielding | Zero-leak scope isolation without touching `task.cancelling()` | Route 3 pure Rust `RawTaskCancelState` task cancel stack |
+| `CancelScope` Shielding | Zero-leak scope isolation without touching `task.cancelling()` | Pure Rust `RawTaskCancelState` task cancel stack |
 
 For formal invariants and concurrency design principles, see [docs/CONCURRENCY.md](docs/CONCURRENCY.md).
 

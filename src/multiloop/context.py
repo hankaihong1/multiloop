@@ -43,7 +43,7 @@ class AsyncContext:
         self._parent = parent
         self._cancelled = False
         self._lock = threading.Lock()
-        self._children: set[AsyncContext] = set()
+        self._children: weakref.WeakSet[AsyncContext] = weakref.WeakSet()
         self._scopes: dict[asyncio.Future[Any], CancelScope] = {}
         self._task_groups: weakref.WeakSet[TaskGroup] = weakref.WeakSet()
 

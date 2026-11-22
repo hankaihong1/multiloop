@@ -163,7 +163,7 @@ async def test_condition_cancel_during_reacquire_forwards_notification():
     t1 = asyncio.create_task(waiter(1))
     t2 = asyncio.create_task(waiter(2))
     await wait_all_tasks_blocked()
-    assert len(cond._waiters) == 2
+    assert cond._raw.waiter_count() == 2
 
     # Acquire lock in main task after waiters have released it inside wait()
     async with cond:
@@ -391,7 +391,7 @@ async def test_condition_wait_reacquires_lock_through_cancellation():
     await holder_gate.wait()  # holder holds the lock
     w.cancel()  # cancel #1: the waiter enters the re-acquire path
     await wait_all_tasks_blocked()  # re-acquire blocked on the Lock queue (holder holds it)
-    assert len(lock._waiters) == 1  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownArgumentType]
+    assert lock._raw.waiter_count() == 1
     w.cancel()  # cancel #2: arrives inside the blocked re-acquire window
     holder_done.set()
     await h
@@ -440,23 +440,30 @@ async def test_condition_wait_for_sync_and_async_predicate() -> None:
 
 @pytest.mark.asyncio
 async def test_barrier_index_leader_election_and_unique_indices() -> None:
-    """Barrier.wait() returns BarrierWaitResult with unique indices and leader."""
-    barrier = Barrier(parties=4)
-    results: list[tuple[int, bool]] = []
+    """Barrier.wait() returns D1 arrival-order indices (0=leader .. parties-1=tripper)."""
+    parties = 4
+    barrier = Barrier(parties=parties)
+    results: dict[int, tuple[int, bool]] = {}
 
-    async def party(idx: int) -> None:
-        await asyncio.sleep(idx * 0.01)
+    async def party(arrival_pos: int) -> None:
         res = await barrier.wait()
-        results.append((res.index, res.is_leader))
+        results[arrival_pos] = (res.index, res.is_leader)
 
-    tasks = [asyncio.create_task(party(i)) for i in range(4)]
+    tasks: list[asyncio.Task[None]] = []
+    for pos in range(parties):
+        t = asyncio.create_task(party(pos))
+        tasks.append(t)
+        await wait_all_tasks_blocked()
+        if pos < parties - 1:
+            assert barrier.n_waiting == pos + 1
+
     await asyncio.gather(*tasks)
 
-    assert len(results) == 4
-    indices = [r[0] for r in results]
-    assert sorted(indices) == [0, 1, 2, 3]
-    leaders = [r[1] for r in results if r[1] is True]
-    assert len(leaders) == 1
+    assert len(results) == parties
+    for pos in range(parties):
+        idx, is_leader = results[pos]
+        assert idx == pos
+        assert is_leader is (pos == 0)
 
 
 @pytest.mark.asyncio
@@ -614,7 +621,7 @@ async def test_barrier_subsequent_round_broken_does_not_affect_graduated_party()
         try:
             res = await barrier.wait()
             t1_results.append(res)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             t1_errors.append(e)
 
     # Round 0: party 1 enters and blocks
@@ -632,7 +639,10 @@ async def test_barrier_subsequent_round_broken_does_not_affect_graduated_party()
     # Party 1 graduated from Round 0 before Round 1 broke
     assert len(t1_errors) == 0, f"Party 1 erroneously failed with: {t1_errors}"
     assert len(t1_results) == 1
-    assert {t1_results[0].index, res2_r0.index} == {0, 1}
+    assert t1_results[0].index == 0
+    assert t1_results[0].is_leader is True
+    assert res2_r0.index == 1
+    assert res2_r0.is_leader is False
     assert barrier.broken is True
 
     # Round 1 waiter must observe the broken barrier error
@@ -767,3 +777,89 @@ async def test_repro_barrier_abort_records_waiter_outcome() -> None:
     await t
     assert len(errors) == 1
     assert "aborted" in str(errors[0])
+
+
+@pytest.mark.asyncio
+async def test_barrier_single_party_fast_path_zero_future_alloc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Barrier(1).wait() and N-th tripping party allocate 0 Futures on fast-path trip."""
+    loop = asyncio.get_running_loop()
+    orig_create_future = loop.create_future
+    future_allocs = 0
+
+    def _counting_create_future(*args: Any, **kwargs: Any) -> asyncio.Future[Any]:
+        nonlocal future_allocs
+        future_allocs += 1
+        return orig_create_future(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "create_future", _counting_create_future)
+
+    single = Barrier(1)
+    for _ in range(100):
+        res = await single.wait()
+        assert res.parties == 1
+        assert res.index == 0
+        assert res.is_leader is True
+    assert future_allocs == 0
+    assert single.n_waiting == 0
+
+    # Also verify the N-th tripping arriver on a multi-party barrier allocates 0 Futures
+    multi = Barrier(3)
+    waiter_results: list[tuple[int, bool]] = []
+
+    async def _waiter() -> None:
+        r = await multi.wait()
+        waiter_results.append((r.index, r.is_leader))
+
+    t1 = asyncio.create_task(_waiter())
+    await wait_all_tasks_blocked()
+    t2 = asyncio.create_task(_waiter())
+    await wait_all_tasks_blocked()
+    assert multi.n_waiting == 2
+
+    future_allocs = 0
+    res3 = await multi.wait()
+    assert future_allocs == 0
+    assert res3.parties == 3
+    assert res3.index == 2
+    assert res3.is_leader is False
+
+    await asyncio.gather(t1, t2)
+    assert waiter_results == [(0, True), (1, False)]
+
+
+@pytest.mark.asyncio
+async def test_barrier_d1_arrival_order_across_multiple_generations() -> None:
+    """Across multiple rounds, arrival indices match 0..parties-1 with index 0 as leader."""
+    parties = 3
+    barrier = Barrier(parties=parties)
+    arrival_orders = [
+        [0, 1, 2],
+        [2, 0, 1],
+        [1, 2, 0],
+    ]
+
+    async def _party(worker_id: int, out: dict[int, tuple[int, bool]]) -> None:
+        res = await barrier.wait()
+        out[worker_id] = (res.index, res.is_leader)
+
+    for order in arrival_orders:
+        round_results: dict[int, tuple[int, bool]] = {}
+
+        tasks: list[asyncio.Task[None]] = []
+        for arrival_idx, worker_id in enumerate(order):
+            t = asyncio.create_task(_party(worker_id, round_results))
+            tasks.append(t)
+            await wait_all_tasks_blocked()
+            if arrival_idx < parties - 1:
+                assert barrier.n_waiting == arrival_idx + 1
+
+        await asyncio.gather(*tasks)
+        assert barrier.n_waiting == 0
+        assert {idx for idx, _ in round_results.values()} == {0, 1, 2}
+
+        first_worker, second_worker, third_worker = order
+        assert round_results[first_worker] == (0, True)
+        assert round_results[second_worker] == (1, False)
+        assert round_results[third_worker] == (2, False)

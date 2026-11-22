@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::pyclass::{PyTraverseError, PyVisit};
 use std::sync::Arc;
 
 use crate::waiter::{wake_pair_outside_lock, WaiterEntry, WaiterId};
@@ -144,5 +145,24 @@ impl RawAsyncWaitGroup {
         let was_present = removed.is_some();
         drop(removed);
         was_present
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        let Some(guard) = self.state.try_lock() else {
+            return Ok(());
+        };
+        for w in &guard.waiters {
+            visit.call(&w.event_loop)?;
+            visit.call(&w.future)?;
+            visit.call(w.channel_token.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&self) {
+        let mut guard = self.state.lock();
+        let waiters = std::mem::take(&mut guard.waiters);
+        drop(guard);
+        drop(waiters);
     }
 }

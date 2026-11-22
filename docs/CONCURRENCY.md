@@ -27,7 +27,7 @@ multiloop operates under **Python 3.14t (free-threaded / no-GIL) true multi-core
 1. **Python 3.14t Free-Threaded True Parallelism**: Bytecode and object operations execute concurrently across CPU cores without a GIL. Any composite cross-thread state transitions (e.g. counter updates + waiter notifications) are enclosed within a single Rust `parking_lot::Mutex` to prevent state tearing and split-brain locking.
 2. **Cross-Thread EventLoop Isolation & Opaque Handles**: `asyncio.Task`, `Future`, `Event`, and `TimerHandle` are strictly bound to a single thread and its event loop. Rust never inspects `.done()` or invokes Python methods while holding a `parking_lot::Mutex`; all cross-thread wakeups go through `loop.call_soon_threadsafe(...)` outside the lock.
 3. **ContextVar Thread/Task Locality**: `contextvars.ContextVar` is strictly local to the active OS thread and task. Cross-thread cancellation (`scope.cancel()`) never reads or modifies `ContextVar` state; it relies exclusively on thread-safe locks and `call_soon_threadsafe`.
-4. **Route 3 Pure Rust Task Cancel Stack (`RawTaskCancelState`)**: `CancelScope`, `fail_after`/`fail_at`, `move_on_after`/`move_on_at`, `sleep`, `wait_cancellable`, and `checkpoint` maintain a per-task Rust `RawTaskCancelState` cancel stack (keyed by task weakref in `_TASK_CANCEL_STATES`) without ever calling `task.cancel()`, `task.uncancel()`, or reading/mutating `task.cancelling()`. Wait points subscribe via `_await_cancellable` (`park_waiter` / `unpark_waiter`), foreign coroutines bridge via `wait_cancellable()`, `shield=True` blocks outer `CancelScope` deadlines/cancellations, and `__aexit__` strictly enforces the three exit modes (`PLAIN` raises `CancelledError`, `MOVE_ON` absorbs with `cancelled_caught=True`, `FAIL_AFTER` converts to `TimeoutError`).
+4. **Pure Rust Task Cancel Stack (`RawTaskCancelState`)**: `CancelScope`, `fail_after`/`fail_at`, `move_on_after`/`move_on_at`, `sleep`, `wait_cancellable`, and `checkpoint` maintain a per-task Rust `RawTaskCancelState` cancel stack (stored directly on the task via `_multiloop_cancel_state`, with `_FALLBACK_STATES` `WeakKeyDictionary` only for slots-only task proxies) without ever calling `task.cancel()`, `task.uncancel()`, or reading/mutating `task.cancelling()`. Wait points subscribe via `_await_cancellable` (`park_waiter` / `unpark_waiter`), foreign coroutines bridge via `wait_cancellable()`, `shield=True` blocks outer `CancelScope` deadlines/cancellations, and `__aexit__` strictly enforces the three exit modes (`PLAIN` raises `CancelledError`, `MOVE_ON` absorbs with `cancelled_caught=True`, `FAIL_AFTER` converts to `TimeoutError`).
 5. **Unified Ticket Waiter Protocol & Anti-Barging FIFO**: Every Rust primitive assigns a monotonic `WaiterId (u64)` ticket (`src/waiter.rs`) instead of raw pointer addresses (`fut.as_ptr()`), eliminating ABA pointer reuse hazards. Channels (`RawAsyncChannel`) enforce anti-barging FIFO ordering and token conservation (`in_flight_putters` reservations) across event loops.
 6. **Structured Concurrency Physical Scope**: A `TaskGroup`'s host context and task-spawning calls (`start_soon` / `start`) are physically scoped to its host `asyncio.AbstractEventLoop` and linked to a host `CancelScope` so child failures or `cancel_all()` immediately interrupt a blocked `async with TaskGroup()` body. When constructed with `TaskGroup(pool=pool)`, child tasks are dispatched across `EventLoopThreadPool` worker loops with per-child `CancelScope`s and shielded remote drain on exit; cross-loop messaging and tree cancellation also coordinate via `Channel` and `AsyncContext`.
 
@@ -70,7 +70,7 @@ multiloop operates under **Python 3.14t (free-threaded / no-GIL) true multi-core
 
 | Component | Mechanism | Key point |
 |---|---|---|
-| `CancelScope` | Route 3 Rust `RawTaskCancelState` stack (`_TASK_CANCEL_STATES` `WeakKeyDictionary`) + `_await_cancellable` (`park_waiter` / `unpark_waiter`) | zero mutation of CPython `task.cancel()` / `uncancel()` / `cancelling()`; `shield=True` blocks outer `CancelScope` entries while leaving external CPython `task.cancelling()` untouched; strict three-mode exit (`PLAIN` / `MOVE_ON` / `FAIL_AFTER`); `sleep()` & `wait_cancellable()` provide Route 3 cancellable suspension (`_cancel.py`, `src/cancel.rs`) |
+| `CancelScope` | Pure Rust `RawTaskCancelState` stack (direct `_multiloop_cancel_state` task attribute, with `_FALLBACK_STATES` `WeakKeyDictionary` only for slots-only task proxies) + `_await_cancellable` (`park_waiter` / `unpark_waiter`) | zero mutation of CPython `task.cancel()` / `uncancel()` / `cancelling()`; `shield=True` blocks outer `CancelScope` entries while leaving external CPython `task.cancelling()` untouched; strict three-mode exit (`PLAIN` / `MOVE_ON` / `FAIL_AFTER`); `sleep()` & `wait_cancellable()` provide cancellable suspension (`_cancel.py`, `src/cancel.rs`) |
 | `TaskGroup` | `_TGState` enum (`IDLE`..`FAILED`) + `_CancelReason` enum + `_children_lock` (`threading.Lock`) + per-child `CancelScope`s (local & pool) + `_wake_fut` (`_await_cancellable`) | host context and spawning calls are bound to `self._loop`; unified per-child `CancelScope` cancellation for both local and `pool=pool` children; shielded `_wait_children` drain with `CancelScope(shield=True)` + external CPython `host_task.cancelling()` preservation (`_taskgroup.py`) |
 | `select_channel` | 2-phase arbiter (Phase 1 fast `try_recv` with round-robin start index, Phase 2 multi-channel registration with `WaiterId` tickets & `weakref.ref(ch)` via `register_select_watcher_ticket`) | readiness is reported via `_await_cancellable(loop, arbiter_fut)` without zero-cycle leaks; winner consumes via `try_recv()` and unregisters all `WaiterId` watcher tickets via `cancel_select_watcher` in `finally` (`primitives.py`, `src/channel.rs`) |
 
@@ -106,11 +106,11 @@ impossible, fall back with try/except.
 **Symptom**: a sender enqueues and wakes a receiver that "no longer exists",
 or a receiver registers its future after the data was already taken — the
 future is never resolved → hang.
-**Root cause**: the lock-free fast path (`try_send`/`try_recv`) and the
-locked waiter list are two different state surfaces; when the fast path wins
-over the slow path, the wakeup signal is lost.
+**Root cause**: the non-blocking fast path (`try_send`/`try_recv` or `is_set()`/`is_zero()`) and the
+locked waiter registration are two separate steps; when a concurrent state transition wins
+between the fast path and registration, the wakeup signal is lost.
 **Correct approach**: after the fast-path attempt, **re-check under the
-lock** before registering the future; registration and wakeup extraction both
+`parking_lot::Mutex`** before registering the future; registration and wakeup extraction both
 happen under the same `parking_lot::Mutex`, and `call_soon_threadsafe` is invoked outside the lock.
 **Examples**: `RawAsyncChannel::send_or_register` / `register_getter_ticket` (`src/channel.rs`),
 `Channel.send` / `Channel.recv` (`primitives.py`).
@@ -206,27 +206,23 @@ wakeup paths (`src/channel.rs`, `src/sync.rs`, `src/rwlock.rs`, `src/waitgroup.r
 
 **Symptom**: Runtime errors, unexpected deadlocks, starvation, or livelocks caused by breaking primitive-specific contracts.
 
-**1. `AsyncWaitGroup.track` coroutine object passed to callable acceptor**:
-- **Trap**: `wg.track(coro)` immediately increments the counter and returns a coroutine object wrapping `finally: self.done()`. Passing it to `TaskGroup.start_soon` (which expects a callable) raises `TypeError`, or creating it without awaiting leaves the counter incremented forever.
+**1. `AsyncWaitGroup.track` unawaited coroutine leak vs. `wrap` lazy increment**:
+- **Trap**: `wg.track(coro)` calls `wg.add(1)` **eagerly** at the call site and returns a tracked coroutine wrapper that calls `wg.done()` in `try/finally` (or on `.close()`). Creating `wg.track(worker())` without awaiting it, passing it to `tg.start_soon(...)` / `pool.submit(...)`, or closing it leaks the counter permanently (emitting a `RuntimeWarning` on GC). Conversely, `wg.wrap(fn)` calls `wg.add(1)` lazily when the task starts executing, which can race with an immediate `await wg.wait()` if the child task has not stepped yet.
 - **Negative example**:
 ```python
 async def worker():
     pass
 
 
-async with TaskGroup() as tg:
-    wg = AsyncWaitGroup()
-    tg.start_soon(wg.track(worker()))  # TypeError! Counter leaked!
+wg = AsyncWaitGroup()
+tracked = wg.track(worker())  # add(1) ran eagerly; discarding `tracked` leaks the counter!
 ```
-- **Correct approach**:
+- **Correct approach**: Pass `wg.track(worker())` directly to `tg.start_soon(...)` or `pool.submit(...)` (both accept coroutine objects and close them on pre-step cancellation), or `await wg.track(worker())` directly:
 ```python
 async with TaskGroup() as tg:
     wg = AsyncWaitGroup()
-
-    async def tracked_worker():
-        await wg.track(worker())
-
-    tg.start_soon(tracked_worker)
+    tg.start_soon(wg.track(worker()))  # add(1) happens-before wait(); done() runs in finally
+    await wg.wait()
 ```
 
 **2. `select_channel` thread-local round-robin index assumptions (no positional priority & lockstep aliasing)**:
@@ -269,14 +265,14 @@ if limiter.available_tokens > 0:  # e.g. 0.5 > 0
 ```
 - **Correct approach**: Always use `async with limiter:`; require `limiter.available_capacity >= 1` (or `available_tokens >= 1.0`) for non-blocking expectations.
 
-**5. Bare `asyncio.*` blocking calls inside Route 3 `CancelScope` / `TaskGroup` / `AsyncContext`**:
-- **Trap**: Route 3 `CancelScope` does not mutate CPython `task.cancel()`, so bare `asyncio.sleep(...)`, `asyncio.Event().wait()`, `asyncio.Queue().get()`, `asyncio.wait_for(...)` / `asyncio.gather(...)` (which spawn detached child `Task`s), and unbridged `await pool.submit(...)` ignore scope cancellation and deadlines.
+**5. Bare `asyncio.*` blocking calls inside `CancelScope` / `TaskGroup` / `AsyncContext`**:
+- **Trap**: `CancelScope` does not mutate CPython `task.cancel()`, so bare `asyncio.sleep(...)`, `asyncio.Event().wait()`, `asyncio.Queue().get()`, `asyncio.wait_for(...)` / `asyncio.gather(...)` (which spawn detached child `Task`s), and unbridged `await pool.submit(...)` ignore scope cancellation and deadlines.
 - **Negative example**:
 ```python
 async with fail_after(0.1):
-    await asyncio.sleep(10)  # Hangs 10s; Route 3 does not wake asyncio.sleep
+    await asyncio.sleep(10)  # Hangs 10s; CancelScope does not wake asyncio.sleep
 ```
-- **Correct approach**: Use Route-3-aware `multiloop` primitives (`multiloop.sleep(...)`, `fail_after(...)`, `TaskGroup`, `multiloop.Event`, `Channel`, `run_in_pool(...)`) directly, and wrap third-party/stdlib awaitables or raw futures in `wait_cancellable(...)`.
+- **Correct approach**: Use `CancelScope`-aware `multiloop` primitives (`multiloop.sleep(...)`, `fail_after(...)`, `TaskGroup`, `multiloop.Event`, `Channel`, `run_in_pool(...)`) directly, and wrap third-party/stdlib awaitables or raw futures in `wait_cancellable(...)`.
 
 ---
 
@@ -288,7 +284,7 @@ if any item is not satisfied, think it through before touching anything.**
 
 - [ ] Does the change add/modify **waiter registration or wakeup paths**? →
       Patterns 2/4: are registration and wakeup under the same lock? Is
-      there a lock-free fast path plus a re-check under the lock?
+      there a fast path plus an atomic re-check under the lock?
 - [ ] Does the change touch the **cancellation/timeout path**? → Patterns
       3/5: is the cleanup-path `await` inside a shield or cancellation-absorbing retry loop? Does waiter removal
       carry a generation/`WaiterId` ticket check?
@@ -322,7 +318,7 @@ if any item is not satisfied, think it through before touching anything.**
 | `RawAsyncWaitGroup` | any thread may add/done/register | single `parking_lot::Mutex<WaitGroupInner>` state machine with `WaiterId` tickets; `done()` drains waiters under the lock and wakes outside via `wake_waiter_outside_lock` (`src/waitgroup.rs`, `src/waiter.rs`, `primitives.py`) |
 | `RawAsyncRWMutex` | any thread may acquire/release reader/writer | writer-preference state machine under `parking_lot::Mutex<RWMutexInner>` with `WaiterId` tickets and out-of-lock wakeups (`src/rwlock.rs`) |
 | `RawAsyncLock` / `Semaphore` / `Event` / `Condition` / `Barrier` / `CapacityLimiter` / `Once` | any thread may acquire/release/notify/wait | unified Rust state machines (`src/sync.rs`) under `parking_lot::Mutex` with `WaiterId (u64)` tickets and out-of-lock wakeups (`src/waiter.rs`) |
-| `RawTaskCancelState` | any thread may call `cancel_scope` / inspect; owner task pushes/pops/parks | Route 3 pure Rust task cancel stack under `parking_lot::Mutex<CancelStateInner>` waking parked `WaiterEntry` outside lock (`src/cancel.rs`, `_cancel.py`) |
+| `RawTaskCancelState` | any thread may call `cancel_scope` / inspect; owner task pushes/pops/parks | pure Rust task cancel stack under `parking_lot::Mutex<TaskCancelInner>` with `AtomicBool` / `AtomicU64` fast-path caches, waking parked `WaiterEntry` outside lock (`src/cancel.rs`, `_cancel.py`) |
 | `AtomicMetrics` | any thread may record/read | 64-byte padded atomic counters per worker to avoid false sharing (`src/metrics.rs`) |
 
 ### 4.2 The soft poller gate (`num_polling`)
@@ -353,12 +349,9 @@ Priority: **private buffer → global batch pull → local channel → single-it
   prevents false sharing. **Keep 64-byte alignment when adding counters**,
   or throughput mysteriously drops on multi-core (`src/metrics.rs:6-7`).
 - Established ordering conventions, follow them in new code:
-  - `is_closed`: `Release` store / `Acquire` load (flag pattern,
-    `src/pool.rs:138, 146`)
-  - `idle_mask`: `Release` bit-ops (`fetch_or`/`fetch_and`) / `Acquire` load
-    (`src/pool.rs:78-104`)
-  - `num_polling`, `rr_index`, and `AtomicMetrics` counters: `Relaxed`
-    (`src/pool.rs:29, 103, 277`, `src/metrics.rs`)
+  - `is_closed` and `RawTaskCancelState` fast-read caches (`effectively_cancelled`, `effective_deadline_bits`, `parked_id`): `Release` store / `Acquire` load (`src/pool.rs`, `src/cancel.rs`)
+  - `idle_mask`: `Release` bit-ops (`fetch_or`/`fetch_and`) / `Acquire` load & `AcqRel` CAS (`src/pool.rs:78-114`)
+  - `num_polling` and `AtomicMetrics` counters: `Relaxed` (`src/pool.rs`, `src/metrics.rs`)
 - flume is lock-free but **not zero-cost**: cross-thread send/recv still has
   atomic ops and memory fences. Don't assume "lock-free = free" on
   performance-sensitive paths.
@@ -389,7 +382,7 @@ uv run pytest --lf
 
 | marker | Purpose | CI behavior |
 |---|---|---|
-| `slow` | performance tests | skipped by default (`addopts = -m "not slow"`) |
+| `slow` | performance tests (`tests/test_perf_regression.py`) | skipped by default (`addopts = -m "not slow"`); run via `pytest -m slow` |
 | `free_threading` | 3.14t free-threaded stress | runs only in free-threaded build jobs |
 | `repeat(n)` | declares stress intent | used with `--count` |
 
@@ -398,8 +391,7 @@ intent with `pytest.mark.repeat` when deterministic.
 
 ### 5.3 Test helpers (`tests/conftest.py`)
 
-- `skip_if_no_rust`: skip when the Rust extension is not compiled (the pure
-  Python parts still run without `make develop`).
+- Compiled `_multiloop_core` required at runtime: all primitives are Rust-backed (no pure-Python fallback exists; run `make develop` before running tests; `multiloop.testing.rust_available()` checks whether `_multiloop_core` is compiled).
 - `yielder` fixture → `wait_all_tasks_blocked()`: wait until all tasks are
   blocked before asserting — eliminates "asserted before it started"
   timing false-positives.

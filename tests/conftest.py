@@ -2,11 +2,7 @@
 
 import pytest
 
-from multiloop.testing import rust_available, wait_all_tasks_blocked
-
-skip_if_no_rust = pytest.mark.skipif(
-    not rust_available(), reason="_multiloop_core rust extension not available"
-)
+from multiloop.testing import wait_all_tasks_blocked
 
 
 @pytest.fixture

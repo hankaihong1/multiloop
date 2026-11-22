@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from multiloop import Event, Lock
+from multiloop._cancel import _task_token
 from multiloop.testing import wait_all_tasks_blocked
 
 # ---------------------------------------------------------------------------
@@ -302,14 +303,14 @@ async def test_event_wait_cancel_cleanup():
 
     task = asyncio.create_task(waiter())
     await wait_all_tasks_blocked()
-    assert len(event._waiters) == 1
+    assert event._raw.waiter_count() == 1
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
     # Waiter must be removed after cancellation.
-    assert len(event._waiters) == 0
+    assert event._raw.waiter_count() == 0
 
     # Subsequent set() and wait() must still work correctly.
     event.set()
@@ -500,12 +501,16 @@ async def test_lock_dead_owner_fifo_recovery() -> None:
     """Lock dead-owner recovery wakes FIFO waiters in order instead of barging."""
     lock = Lock()
     order: list[str] = []
+    acquired = asyncio.Event()
+    exit_without_release = asyncio.Event()
 
     async def doomed_owner() -> None:
         await lock.acquire()
+        acquired.set()
+        await exit_without_release.wait()
 
-    asyncio.create_task(doomed_owner())
-    await asyncio.sleep(0.01)
+    doomed = asyncio.create_task(doomed_owner())
+    await acquired.wait()
     assert lock.locked
 
     async def waiter_1() -> None:
@@ -514,7 +519,7 @@ async def test_lock_dead_owner_fifo_recovery() -> None:
         lock.release()
 
     t_waiter = asyncio.create_task(waiter_1())
-    await asyncio.sleep(0.01)
+    await wait_all_tasks_blocked()
 
     async def new_caller() -> None:
         await lock.acquire()
@@ -522,9 +527,14 @@ async def test_lock_dead_owner_fifo_recovery() -> None:
         lock.release()
 
     t_caller = asyncio.create_task(new_caller())
+    await wait_all_tasks_blocked()
+
+    exit_without_release.set()
+    await doomed
     await asyncio.gather(t_waiter, t_caller)
 
     assert order == ["waiter_1", "new_caller"], f"Expected FIFO order, got {order}"
+    assert not lock.locked
 
 
 @pytest.mark.asyncio
@@ -573,7 +583,7 @@ async def test_lock_reentrant_cancel_no_ownership_theft() -> None:
 
 @pytest.mark.asyncio
 async def test_lock_abandoned_owner_gc_and_locked_state() -> None:
-    """Exiting task holding Lock leaves lock.locked=True, owner=None, and allows GC of dead task."""
+    """D3a: exiting task holding Lock unlocks when waiters are empty and allows GC/re-acquire."""
     lock = Lock()
 
     async def abandoned_worker() -> None:
@@ -586,9 +596,44 @@ async def test_lock_abandoned_owner_gc_and_locked_state() -> None:
     del task
     gc.collect()
 
-    assert lock.locked is True
+    assert lock.locked is False
     assert lock.owner is None
     assert task_ref() is None
+    assert lock.try_acquire() is True
+    lock.release()
+    assert lock.locked is False
+
+    # Also verify dead-weakref reaping via locked() and owner() without calling .done()
+    class _WeakOwner:
+        __slots__ = ("__weakref__",)
+
+        def done(self) -> bool:
+            raise AssertionError("dead-weakref reap must not invoke .done()")
+
+    raw_owner_1: _WeakOwner | None = _WeakOwner()
+    assert raw_owner_1 is not None
+    raw_ref_1 = weakref.ref(raw_owner_1)
+    assert lock._raw.try_acquire(1 << 60, 1, raw_ref_1) is True
+    assert lock.locked is True
+    del raw_owner_1
+    gc.collect()
+    assert raw_ref_1() is None
+    assert lock.locked is False
+    assert lock.owner is None
+    assert lock.try_acquire() is True
+    lock.release()
+
+    raw_owner_2: _WeakOwner | None = _WeakOwner()
+    assert raw_owner_2 is not None
+    raw_ref_2 = weakref.ref(raw_owner_2)
+    assert lock._raw.try_acquire((1 << 60) + 1, 1, raw_ref_2) is True
+    del raw_owner_2
+    gc.collect()
+    assert raw_ref_2() is None
+    assert lock.owner is None
+    assert lock.locked is False
+    assert lock.try_acquire() is True
+    lock.release()
 
 
 @pytest.mark.asyncio
@@ -596,14 +641,56 @@ async def test_lock_stale_ticket_cancel_idempotency() -> None:
     """Stale ticket_id cancellation must not release a Lock held by the same task."""
     task = asyncio.current_task()
     assert task is not None
-    task_id = id(task)
+    task_token = _task_token(task)
 
     lock = Lock()
     async with lock:
         assert lock.locked
-        lock._raw.cancel_waiter(task_id, 999_999)
+        assert lock.owner is task
+        lock._raw.cancel_waiter(task_token, 999_999)
         assert lock.locked
+        assert lock.owner is task
     assert not lock.locked
+    assert lock.owner is None
+
+    # Also verify cancelling a real previously-issued ticket_id after release/re-acquire.
+    held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def holder() -> None:
+        async with lock:
+            held.set()
+            await release.wait()
+
+    h_task = asyncio.create_task(holder())
+    try:
+        await held.wait()
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        stale_ticket = lock._raw.acquire_or_register(
+            task_token, id(loop), weakref.ref(task), loop, fut
+        )
+        assert stale_ticket is not None
+        release.set()
+        await fut
+        assert lock.locked
+        assert lock.owner is task
+        lock._raw.release(task_token)
+        assert not lock.locked
+
+        async with lock:
+            assert lock.locked
+            assert lock.owner is task
+            lock._raw.cancel_waiter(task_token, stale_ticket)
+            assert lock.locked
+            assert lock.owner is task
+        assert not lock.locked
+        assert lock.owner is None
+    finally:
+        release.set()
+        if not h_task.done():
+            h_task.cancel()
+        await asyncio.gather(h_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -625,17 +712,100 @@ async def test_cancellation_storm_lock() -> None:
 
     tasks = [asyncio.create_task(waiter()) for _ in range(500)]
     await asyncio.sleep(0.01)
-    assert len(lock._waiters) == 500
+    assert lock._raw.waiter_count() == 500
 
     for t in tasks:
         t.cancel()
 
     await asyncio.gather(*tasks, return_exceptions=True)
     assert cancelled_count == 500
-    assert len(lock._waiters) == 0
+    assert lock._raw.waiter_count() == 0
 
     lock.release()
     assert not lock.locked
     await lock.acquire()
     assert lock.locked
     lock.release()
+
+
+@pytest.mark.asyncio
+async def test_lock_owner_cross_thread_never_calls_done() -> None:
+    """lock.owner from a foreign loop or non-loop thread must never invoke .done()."""
+    lock = Lock()
+    main_tid = threading.get_ident()
+    acquired_ev = threading.Event()
+    holder_task_box: list[Any] = []
+    foreign_loop_box: list[asyncio.AbstractEventLoop] = []
+    foreign_release_box: list[asyncio.Event] = []
+    foreign_errors: list[BaseException] = []
+    done_call_threads: list[int] = []
+
+    class _TrackingTask(asyncio.Task[Any]):
+        def done(self) -> bool:
+            done_call_threads.append(threading.get_ident())
+            return super().done()
+
+    def _foreign_runner() -> None:
+        foreign_loop = asyncio.new_event_loop()
+        foreign_loop.set_task_factory(lambda lp, coro, **kw: _TrackingTask(coro, loop=lp, **kw))
+        asyncio.set_event_loop(foreign_loop)
+
+        async def _hold_lock() -> None:
+            release_ev = asyncio.Event()
+            foreign_loop_box.append(foreign_loop)
+            foreign_release_box.append(release_ev)
+            holder_task_box.append(asyncio.current_task())
+            await lock.acquire()
+            acquired_ev.set()
+            await release_ev.wait()
+            # Same-loop query is permitted to inspect .done()
+            assert lock.owner is asyncio.current_task()
+            lock.release()
+
+        try:
+            foreign_loop.run_until_complete(_hold_lock())
+        except BaseException as exc:
+            foreign_errors.append(exc)
+        finally:
+            foreign_loop.close()
+
+    foreign_thread = threading.Thread(target=_foreign_runner)
+    foreign_thread.start()
+    try:
+        assert await asyncio.to_thread(acquired_ev.wait, 5.0)
+        holder_task = holder_task_box[0]
+        foreign_tid = foreign_thread.ident
+        assert foreign_tid is not None
+
+        # Foreign event-loop thread calling lock.owner / lock.locked
+        assert lock.owner is holder_task
+        assert lock.locked is True
+        assert main_tid not in done_call_threads
+
+        # Non-event-loop thread (caller_loop_id is None) calling lock.owner / lock.locked
+        sync_results: list[tuple[Any, bool]] = []
+        sync_tid_box: list[int] = []
+
+        def _sync_observer() -> None:
+            sync_tid_box.append(threading.get_ident())
+            sync_results.append((lock.owner, lock.locked))
+
+        sync_thread = threading.Thread(target=_sync_observer)
+        sync_thread.start()
+        await asyncio.to_thread(sync_thread.join, 5.0)
+        assert not sync_thread.is_alive()
+        assert sync_results == [(holder_task, True)]
+        assert sync_tid_box[0] not in done_call_threads
+        assert done_call_threads == []
+    finally:
+        if foreign_loop_box and foreign_release_box:
+            try:
+                foreign_loop_box[0].call_soon_threadsafe(foreign_release_box[0].set)
+            except RuntimeError:
+                pass
+        await asyncio.to_thread(foreign_thread.join, 5.0)
+
+    assert not foreign_thread.is_alive()
+    assert not foreign_errors
+    assert all(tid == foreign_thread.ident for tid in done_call_threads)
+    assert not lock.locked

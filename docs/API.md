@@ -31,6 +31,7 @@ Complete API documentation for `multiloop`: a multi-event-loop engine and concur
 - [Task Management](#task-management)
   - [`TaskGroup`](#taskgroup)
   - [`TaskHandle`](#taskhandle)
+  - [`TaskState`](#taskstate)
   - [`TaskStatus`](#taskstatus)
   - [`CancelScope`](#cancelscope)
 - [Synchronization & Control Primitives](#synchronization--control-primitives)
@@ -344,15 +345,15 @@ EventLoopThreadPool(
 Returns `True` if the pool is actively running worker loops.
 
 ##### `async start()` -> `None`
-Starts all worker threads and their work-stealing queue dispatchers.
+Starts all worker threads and their work-stealing queue dispatchers. Raises `ThreadPoolClosedError` if called after the pool has been closed or aborted.
 
 ##### `async close(timeout: float | None = None)` -> `None`
 Gracefully stops all worker loops, drains pending tasks, and joins worker threads.
 
-Drain timeout is configurable: `close()` waits up to `timeout` seconds (defaults to 5.0 seconds when `None`) for in-flight tasks to finish, then force-stops every worker loop — tasks still running after the timeout are cancelled and are not guaranteed to complete.
+Drain timeout is configurable: `close()` waits up to `timeout` seconds (defaults to 5.0 seconds when `None`; supports `None`, `+inf`, and bounded floats; `NaN` or `-inf` raises `ValueError`) for in-flight and queued tasks to finish, then force-stops every worker loop — tasks still running after the timeout are cancelled and are not guaranteed to complete. Concurrent `close()` and `abort()` callers are serialized and wait until teardown completes; once closed or aborted, the pool cannot be restarted (`start()` and `submit()` raise `ThreadPoolClosedError`).
 
 ##### `async abort()` -> `None`
-Forcefully stops all worker loops without draining pending tasks. Queued but unexecuted work is discarded.
+Forcefully stops all worker loops without draining pending tasks. Queued but unexecuted work fails with `ThreadPoolClosedError`. Concurrent `close()` and `abort()` callers wait until teardown completes, and the pool cannot be restarted afterwards.
 
 ##### `async wait_closed()` -> `None`
 Waits until the pool has been fully stopped. Returns immediately if the pool is not running.
@@ -361,7 +362,7 @@ Waits until the pool has been fully stopped. Returns immediately if the pool is 
 Submits a coroutine function, coroutine object, or callable to the shared work queue. Workers pull tasks as they become idle. Returns an `asyncio.Future` that resolves with the task's result.
 
 - **`pin_to`**: Optionally pins the task to a specific worker loop (an `int` worker index or an `AbstractEventLoop` managed by the pool). When `None`, the task goes to the global shared queue.
-- **`cancel_scope`**: Optionally binds the task to a `CancelScope`; cancelled scopes cancel the returned future (`asyncio.CancelledError`) and interrupt Route 3 wait points (`multiloop.sleep`, `Channel`, `Lock`, `wait_cancellable`, etc.).
+- **`cancel_scope`**: Optionally binds the task to a `CancelScope`; cancelled scopes cancel the returned future (`asyncio.CancelledError`) and interrupt `multiloop` wait points (`multiloop.sleep`, `Channel`, `Lock`, `wait_cancellable`, etc.).
 - **Raises**: `ThreadPoolClosedError` if the pool is closed, `ValueError` for an invalid `pin_to` index, `TypeError` if `target` is an `asyncio.Future` (raw futures are loop-bound) or if arguments are passed to a coroutine object.
 
 ##### `submit_many(targets: Iterable[Callable[..., Any] | Any], cancel_scope: CancelScope | None = None)` -> `list[asyncio.Future]`
@@ -433,9 +434,9 @@ Runs a coroutine in a freshly-created pool (one-shot convenience). Spawns a pool
 async def checkpoint() -> None
 ```
 
-Checks the current task's Route 3 Rust cancel stack (`RawTaskCancelState`) and raises `asyncio.CancelledError` if the current scope, or any unshielded ancestor, has been cancelled. Call periodically inside long-running code that cannot `await` frequently.
+Checks the current task's Rust cancel stack (`RawTaskCancelState`) and raises `asyncio.CancelledError` if the current scope, or any unshielded ancestor, has been cancelled. Call periodically inside long-running code that cannot `await` frequently.
 
-Under Route 3, cancellation checks are **level-triggered** and never read or mutate CPython's `task.cancelling()` counter.
+Cancellation checks are **level-triggered** and never read or mutate CPython's `task.cancelling()` counter.
 
 ### `sleep`
 
@@ -443,7 +444,7 @@ Under Route 3, cancellation checks are **level-triggered** and never read or mut
 async def sleep(delay: float) -> None
 ```
 
-Sleeps for `delay` seconds while subscribing to the current task's Route 3 `CancelScope` stack. Prefer `multiloop.sleep(...)` over `asyncio.sleep(...)` inside `CancelScope`, `fail_after`, `move_on_after`, and `TaskGroup` tasks so scope cancellation interrupts the sleep immediately.
+Sleeps for `delay` seconds while subscribing to the current task's `CancelScope` stack. Prefer `multiloop.sleep(...)` over `asyncio.sleep(...)` inside `CancelScope`, `fail_after`, `move_on_after`, and `TaskGroup` tasks so scope cancellation interrupts the sleep immediately.
 
 - **`delay`** (*float*): Sleep duration in seconds (`delay <= 0` delegates to `checkpoint()`; `NaN` raises `ValueError`).
 
@@ -458,7 +459,7 @@ async with fail_after(0.05):
 async def wait_cancellable(awaitable: Awaitable[_T]) -> _T
 ```
 
-Bridges a foreign asyncio awaitable (e.g., `asyncio.sleep(...)` or third-party async I/O coroutines) so it honors active Route 3 `CancelScope` cancellations and deadlines immediately. If a `CancelScope` cancels while waiting, the underlying task is cancelled cleanly and awaited before `asyncio.CancelledError` propagates.
+Bridges a foreign asyncio awaitable (e.g., `asyncio.sleep(...)` or third-party async I/O coroutines) so it honors active `CancelScope` cancellations and deadlines immediately. If a `CancelScope` cancels while waiting, the underlying task is cancelled cleanly and awaited before `asyncio.CancelledError` propagates.
 
 - **`awaitable`** (*Awaitable[_T]*): Foreign coroutine or awaitable to wrap.
 
@@ -473,7 +474,7 @@ async with fail_after(0.05):
 def fail_after(seconds: float) -> CancelScope
 ```
 
-Returns a `CancelScope` that raises `TimeoutError` when the deadline expires.
+Returns a `CancelScope` that raises `TimeoutError` when the deadline expires (external `task.cancel()` propagates as `asyncio.CancelledError` instead of being converted).
 
 ```python
 async with fail_after(5):
@@ -486,7 +487,7 @@ async with fail_after(5):
 def move_on_after(seconds: float) -> CancelScope
 ```
 
-Returns a `CancelScope` that silently exits when the deadline expires. `scope.cancelled_caught` is `True` after the deadline fires.
+Returns a `CancelScope` that silently exits when the deadline expires (`scope.cancelled_caught` is `True` after the deadline fires; external `task.cancel()` propagates instead of being swallowed).
 
 ```python
 async with move_on_after(5) as scope:
@@ -712,11 +713,11 @@ A handle to a child task spawned inside a `TaskGroup`, returned by `TaskGroup.st
 
 #### Properties
 
-- **`status`** -> `_TaskStatus`: Current lifecycle status — `_TaskStatus.PENDING`, `_TaskStatus.STARTED`, or `_TaskStatus.FINISHED`.
+- **`status`** -> `TaskState`: Current lifecycle state — `TaskState.PENDING`, `TaskState.STARTED`, or `TaskState.FINISHED`.
 - **`result`** -> `Any`: The task's result once finished.
-  - **Raises**: `RuntimeError` if the task is not finished yet.
+  - **Raises**: `RuntimeError` if the task is not finished yet, `asyncio.CancelledError` if the task was cancelled.
 - **`exception`** -> `BaseException | None`: The task's exception, or `None` if it succeeded.
-  - **Raises**: `RuntimeError` if the task is not finished yet.
+  - **Raises**: `RuntimeError` if the task is not finished yet, `asyncio.CancelledError` if the task was cancelled (matching `asyncio.Future.exception()`).
 
 #### Awaitable
 `await handle` returns the task's result and re-raises its exception.
@@ -725,6 +726,14 @@ A handle to a child task spawned inside a `TaskGroup`, returned by `TaskGroup.st
 h = tg.start_soon(worker, "a")
 result = await h
 ```
+
+### `TaskState`
+
+An `enum.Enum` representing the lifecycle state of a child task tracked by a `TaskHandle` (`handle.status`).
+
+- **`TaskState.PENDING`**: The task has been scheduled, or was started via `TaskGroup.start()` and has not yet called `task_status.started()`.
+- **`TaskState.STARTED`**: The task was spawned via `TaskGroup.start()`, has called `task_status.started()`, and is still running.
+- **`TaskState.FINISHED`**: The task has completed (succeeded, failed, or was cancelled).
 
 ### `TaskStatus`
 
@@ -745,14 +754,14 @@ async with TaskGroup() as tg:
 
 ### `CancelScope`
 
-A task-local, single-use cancellation scope backed by Route 3's pure Rust `RawTaskCancelState` cancel stack (never modifying CPython `task.cancel()`, `task.uncancel()`, or `task.cancelling()`).
+A task-local, single-use cancellation scope backed by a pure Rust `RawTaskCancelState` cancel stack (never modifying CPython `task.cancel()`, `task.uncancel()`, or `task.cancelling()`).
 
 ```text
 CancelScope(deadline: float = float("inf"), shield: bool = False)
 ```
 
 - **`deadline`** (*float*): Absolute monotonic deadline. `float("inf")` means no deadline. Mutating `.deadline` reschedules dynamically.
-- **`shield`** (*bool*): Route 3 scope barrier: masks enclosing `CancelScope` cancellations and deadlines on the Rust cancel stack while `shield` is `True` (supporting full async cleanup with `multiloop.sleep`, `Channel`, `Lock`, `wait_cancellable`, etc.), without ever touching CPython's `task.cancelling()`. Note that external CPython `task.cancel()` calls are unaffected.
+- **`shield`** (*bool*): Scope barrier: masks enclosing `CancelScope` cancellations and deadlines on the Rust cancel stack while `shield` is `True` (supporting full async cleanup with `multiloop.sleep`, `Channel`, `Lock`, `wait_cancellable`, etc.), without ever touching CPython's `task.cancelling()`. External CPython `task.cancel()` calls are unaffected.
 
 #### Properties & Methods
 
@@ -760,14 +769,14 @@ CancelScope(deadline: float = float("inf"), shield: bool = False)
 - **`cancelled_caught`** -> `bool`: `True` if a move-on scope (`move_on_after` / `move_on_at`) absorbed its own cancellation.
 - **`deadline`** -> `float`: The absolute monotonic deadline (read/write).
 - **`shield`** -> `bool`: Whether the scope blocks parent `CancelScope` cancellation (read/write).
-- **`cancel()`**: Marks the scope cancelled in Rust and wakes any parked Route 3 waiter via `call_soon_threadsafe`. Idempotent and thread-safe.
+- **`cancel()`**: Marks the scope cancelled in Rust and wakes any parked waiter via `call_soon_threadsafe`. Idempotent and thread-safe.
 
 #### Three-Mode Exit Contract
 
 When `async with scope:` exits `__aexit__`:
 1. **Plain `CancelScope` (`PLAIN`)**: If cancelled and the body exited normally (`exc_type is None`), raises `asyncio.CancelledError()` on exit; non-cancellation body exceptions pass through untouched.
-2. **`move_on_after` / `move_on_at` (`MOVE_ON`)**: Silently absorbs its own cancellation, sets `scope.cancelled_caught = True`, and returns `True` without swallowing external CPython `task.cancel()` or body errors.
-3. **`fail_after` / `fail_at` (`FAIL_AFTER`)**: Converts its own cancellation/expiry (even if inner `CancelledError` was caught in the body) into `multiloop.TimeoutError`.
+2. **`move_on_after` / `move_on_at` (`MOVE_ON`)**: Silently absorbs its own cancellation, sets `scope.cancelled_caught = True`, and returns `True`. External CPython `task.cancel()`, outer `CancelScope` cancellations, and non-cancellation body exceptions are not swallowed and propagate normally.
+3. **`fail_after` / `fail_at` (`FAIL_AFTER`)**: Converts its own cancellation/expiry (even if inner `CancelledError` was caught in the body) into `multiloop.TimeoutError`. External CPython `task.cancel()` is not converted and propagates as `asyncio.CancelledError`.
 
 #### Context Manager
 `async with CancelScope(...) as scope:` pushes the scope onto the current task's Rust cancel stack (`RuntimeError` if shared across tasks or re-entered).
@@ -787,13 +796,13 @@ async with lock:
     critical_section()
 ```
 
-- **`locked`** -> `bool`: `True` if the lock is held.
+- **`locked`** -> `bool`: `True` if the lock is held by a live task.
 - **`owner`** -> `asyncio.Task | None`: The task currently holding the lock, if any.
 
 > **Diagnostic properties** (`locked`/`owner`/`Semaphore.value`/`qsize`/`Event.is_set`/`TaskHandle.status`) are consistent snapshots taken under the relevant internal lock — they are **not** atomic across each other and not a substitute for the actual acquire/wait operations under concurrency.
 - **`acquire()`**: Acquires the lock, suspending until it is free.
 - **`try_acquire()` -> `bool`**: Non-blocking atomic attempt to acquire the lock immediately. Returns `True` if acquired, `False` otherwise.
-- **`release()`**: Releases the lock. Must be called by the owner.
+- **`release()`**: Releases the lock. Must be called by the owner. If the owning task finishes on the same event loop or is garbage-collected without calling `release()`, `Lock` automatically reaps the dead owner — waking the next queued FIFO waiter or transitioning directly to unlocked (`locked == False`, `owner is None`, `try_acquire() == True`).
 
 ### `Semaphore`
 
@@ -817,7 +826,7 @@ A token-bucket style limiter supporting fractional tokens.
 CapacityLimiter(total_tokens: float)
 ```
 
-- **`total_tokens`** -> `float`: Total capacity (readable and writable).
+- **`total_tokens`** -> `float`: Total capacity (readable and writable). Must be a finite positive number (`> 0`, finite); passing `NaN`, `inf`, `-inf`, or `<= 0` to `CapacityLimiter(total_tokens)` or the `total_tokens` setter raises `ValueError`.
 - **`total_capacity`** -> `int`: Integer floor capacity (`int(total_tokens)`).
 - **`available_tokens`** -> `float`: Tokens currently available (`total_tokens - borrowed_tokens`).
 - **`available_capacity`** -> `int`: Discrete integer token capacity currently available (`max(0, int(total_tokens) - borrowed)`).
@@ -866,16 +875,18 @@ Barrier(parties: int)
 ```
 
 - **`parties`** -> `int`: Number of parties required to trip the barrier.
+- **`broken`** -> `bool`: `True` if the barrier is in a broken or aborted state.
 - **`n_waiting`** -> `int`: Number of parties currently waiting.
 - **`wait()`** -> `BarrierWaitResult`: Blocks until all parties arrive.
-- **`abort()`**: Aborts the barrier, waking all waiters.
+- **`abort()`**: Aborts the barrier, waking all waiters with `RuntimeError`.
+- **`reset()`**: Resets the barrier to a healthy initial state for a new generation, waking any current waiters with `RuntimeError`.
 
 ### `BarrierWaitResult`
 
 Result object returned by `Barrier.wait()`.
 
 - **`parties`** -> `int`: Total number of parties in this barrier round.
-- **`index`** -> `int`: Zero-based arrival index (`0` to `parties - 1`) of the calling task.
+- **`index`** -> `int`: Zero-based arrival index (`0` to `parties - 1`) of the calling task, matching `threading.Barrier` (`index == 0` for the first task to arrive in the round; the last arriving task that trips the barrier receives `index == parties - 1`).
 - **`is_leader`** -> `bool`: `True` if this task arrived first in the round (`index == 0`).
 
 ### `AsyncContext`
@@ -907,7 +918,7 @@ await wg.wait()
 
 All `add()` calls with a positive delta must happen-before the first `wait()` on the counter (matches Go `sync.WaitGroup`): a concurrent `add()` racing with `wait()` can lose its wakeup and hang forever. Negative deltas are allowed (Go semantics) but must never drive the counter below zero — doing so raises `RuntimeError`.
 
-Structured RAII tracking is supported via `async with wg.holding():` and `tg.start_soon(wg.wrap(fn))` to guarantee counter balance under exceptions and cancellations.
+Structured RAII tracking is supported via `async with wg.holding():`, `tg.start_soon(wg.track(coro))` (eager `add(1)` before scheduling), and `tg.start_soon(wg.wrap(fn))` to guarantee counter balance under exceptions and cancellations.
 
 ---
 
