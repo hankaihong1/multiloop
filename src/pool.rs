@@ -157,14 +157,23 @@ impl NativeWorkerPool {
     }
 
     pub fn complete_task(&self) {
-        if let Ok(1) =
-            self.outstanding_tasks
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                    cur.checked_sub(1)
-                })
-        {
-            let _guard = self.drain_mutex.lock();
-            self.drain_condvar.notify_all();
+        let mut cur = self.outstanding_tasks.load(Ordering::Acquire);
+        while cur > 0 {
+            match self.outstanding_tasks.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if cur == 1 {
+                        let _guard = self.drain_mutex.lock();
+                        self.drain_condvar.notify_all();
+                    }
+                    return;
+                }
+                Err(actual) => cur = actual,
+            }
         }
     }
 
