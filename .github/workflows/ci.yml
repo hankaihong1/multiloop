@@ -34,7 +34,7 @@ jobs:
     steps:
       - name: Checkout repository (full history for push diffs)
         if: github.event_name == 'push'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -63,7 +63,7 @@ jobs:
     if: needs.changes.outputs.docs == 'true' || needs.changes.result != 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-env
         with:
@@ -88,7 +88,7 @@ jobs:
     if: needs.changes.outputs.code == 'true' || needs.changes.result != 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-env
         with:
@@ -111,7 +111,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-env
         with:
